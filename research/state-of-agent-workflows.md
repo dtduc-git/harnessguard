@@ -49,6 +49,38 @@ Public GitHub Actions workflow files matching known AI-agent actions were sample
 | HG002 | 18 | 5.3% |
 | HG006 | 5 | 1.5% |
 
+<!-- chain-scan:start -->
+
+## Artifact trust chains (pass 2)
+
+_Generated 2026-09-13T14:42:54.958659+00:00 with harnessguard 0.4.0. Raw per-repo results are private; aggregates only._
+
+Pass 1 sampled agent workflow files in isolation. HG007 (the Cordyceps pattern) needs the opposite view: the full `.github/workflows` directory of every repository in the pass-1 corpus, because the attacker-triggered producer and the privileged `workflow_run` consumer usually contain no agent step at all.
+
+### Headline
+
+- Repositories with retrievable workflows: **255** (of 255 in the pass-1 corpus)
+- Workflow files parsed: **3342**
+- **47.5%** upload artifacts from workflows an attacker can trigger (`pull_request`, comments, issues)
+- **5.5%** have the full chain: attacker-triggered producer plus a privileged artifact consumer (**14** repositories, 14 HG007 findings)
+- **100.0%** of the chains run no AI agent on either side — invisible to agent-only scanners and to single-file linters alike
+- The chains collapse into **1 distinct producer→consumer template pair(s)**; the largest family appears in **14 repositories** (fork propagation)
+
+### HG007 findings by severity
+
+| Severity | Findings |
+| --- | --- |
+| high | 14 |
+
+### Caveats
+
+- Same corpus as pass 1 (GitHub code search, best-match, not a uniform random sample); workflow snapshots are from the default branch at scan time.
+- Chain detection is name-based (`workflow_run.workflows` ↔ workflow name or file stem) and conservative on purpose: an unmatched producer name produces no finding.
+- Environment-gated consumers are downgraded one severity level, not cleared; a chain finding is a trust-boundary signal, not a per-repo verdict.
+- The corpus is fork-heavy: a few upstream templates are inherited by many forks, so repository counts overstate the number of independent implementations.
+
+<!-- chain-scan:end -->
+
 ## Caveats
 
 - GitHub code search returns best-match results, not a uniform random sample; popularity and recency skew the corpus.

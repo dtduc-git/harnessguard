@@ -113,6 +113,12 @@ def test_artifact_consumer_with_environment_is_downgraded() -> None:
     assert "environment" in guarded[0].message
 
 
+def test_same_run_artifact_download_not_flagged() -> None:
+    result = _scan("vulnerable-repo")
+    same_run = [f for f in result.findings if f.workflow.name == "artifact-consumer-same-run.yml"]
+    assert not same_run, [f.to_dict() for f in same_run]
+
+
 def test_trusted_artifact_producer_not_flagged() -> None:
     result = _scan("clean-repo")
     assert not [f for f in result.findings if f.rule_id == "HG007"]

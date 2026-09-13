@@ -68,6 +68,28 @@ UNTRUSTED_REF_RE = re.compile(
 
 SECRETS_RE = re.compile(r"secrets\.([A-Za-z0-9_]+)")
 
+#: References to the workflow run that triggered a ``workflow_run`` consumer.
+TRIGGERING_RUN_RE = re.compile(r"github\.event\.workflow_run\b")
+
+
+def _dump(value: Any) -> str:
+    try:
+        return yaml.safe_dump(value, default_flow_style=False)
+    except yaml.YAMLError:  # pragma: no cover - defensive
+        return str(value)
+
+
+def references_triggering_run(step_raw: dict[str, Any], job: dict[str, Any]) -> bool:
+    """True when a step fetches data from the run that triggered this workflow.
+
+    Artifact downloads that do not reference the triggering run (for example
+    ``download-artifact`` by ``artifact-ids`` within the same run) stay inside
+    one trust boundary and are not part of a cross-workflow chain.
+    """
+    if TRIGGERING_RUN_RE.search(_dump(step_raw)):
+        return True
+    return bool(TRIGGERING_RUN_RE.search(_dump(job.get("env", {}))))
+
 
 @dataclass
 class Step:

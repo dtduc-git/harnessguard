@@ -6,11 +6,12 @@ owasp: "ASI04 Agentic Supply Chain Vulnerabilities / ASI03 Identity & Privilege 
 description: >
   Cordyceps (Novee, June 2026): a workflow triggered by attacker-controlled
   input (pull_request, issues, comments) uploads an artifact; a second workflow
-  triggered by workflow_run downloads that artifact while holding secrets,
-  write permissions or OIDC tokens. Neither file is exploitable alone — the
-  risk lives in the composition, which per-file scanners do not see. The
-  original research flagged 654 repositories and confirmed 300+ fully
-  exploitable at Microsoft, Google, Apache, Cloudflare and the PSF.
+  triggered by workflow_run fetches that artifact from the triggering run
+  while holding secrets, write permissions or OIDC tokens. Neither file is
+  exploitable alone — the risk lives in the composition, which per-file
+  scanners do not see. The original research flagged 654 repositories and
+  confirmed 300+ fully exploitable at Microsoft, Google, Apache, Cloudflare
+  and the PSF.
 remediation: >
   Treat artifacts produced by untrusted-triggered workflows as attacker
   content: verify the producing run (actor association, head repository) in a

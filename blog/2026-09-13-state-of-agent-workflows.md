@@ -126,7 +126,27 @@ git clone https://github.com/dtduc-git/harnessguard
 cd harnessguard
 uv sync --all-groups
 uv run python scripts/ecosystem_scan.py --per-query 150
+uv run python scripts/chain_scan.py
 ```
+
+## Update: artifact trust chains (pass 2)
+
+Pass 2 pointed the same corpus at a different question: not "which agent steps
+are exposed" but "where do repositories cross a trust boundary between
+workflows". Re-scanning the **full** workflow directory of all 255 repos for
+the Cordyceps pattern (attacker-triggered producer uploads artifact → a
+privileged `workflow_run` consumer fetches it):
+
+- **47.5%** of repositories upload artifacts from workflows an attacker can
+  trigger (`pull_request`, comments, issues)
+- **5.5%** carry the full chain across two workflows
+- **100% of the chains run no AI agent on either side** — agent-only scanning
+  and per-file linting never look there
+- The findings collapse into a single inherited upstream template — fork
+  propagation keeps the pattern alive at scale
+
+Pass-2 aggregates live in the same report:
+[State of AI-agent workflows](research/state-of-agent-workflows.md).
 
 ---
 

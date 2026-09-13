@@ -37,8 +37,14 @@ search API: **44.2% combine untrusted events with runner secrets or write
 permissions**, and 61% of those carry no actor-association guard in the
 workflow file. Aggregates only — no repo is named.
 
+Pass 2 re-scanned the **full workflow set** of the same 255 repos for
+cross-workflow artifact chains (HG007): **5.5% carry the chain**, and every
+chain detected runs **no agent on either side** — a blind spot for agent-only
+scanners and per-file linters alike.
+
 → [State of AI-agent workflows in the wild](research/state-of-agent-workflows.md)
-· reproduce with `uv run python scripts/ecosystem_scan.py`
+· reproduce with `uv run python scripts/ecosystem_scan.py` and
+`uv run python scripts/chain_scan.py`
 
 ## Install
 

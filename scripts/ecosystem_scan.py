@@ -201,6 +201,15 @@ def build_report(
     for rule_id, paths in sorted(rule_files.items(), key=lambda kv: -len(kv[1])):
         lines.append(f"| {rule_id} | {len(paths)} | {pct(len(paths), files_parsed)} |")
     lines.append("")
+    lines.append("<!-- chain-scan:start -->")
+    lines.append("")
+    lines.append(
+        "_Repository-level artifact trust chains (HG007) are generated separately: "
+        "`uv run python scripts/chain_scan.py`._"
+    )
+    lines.append("")
+    lines.append("<!-- chain-scan:end -->")
+    lines.append("")
     lines.append("## Caveats")
     lines.append("")
     lines.append(

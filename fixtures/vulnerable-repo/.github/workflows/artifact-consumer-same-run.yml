@@ -1,0 +1,21 @@
+name: artifact-consumer-same-run
+on:
+  workflow_run:
+    workflows: [artifact-producer]
+    types: [completed]
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download this run's own report
+        uses: actions/download-artifact@v4
+        with:
+          name: internal-report
+      - name: Comment
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "comment on PR"

@@ -13,6 +13,7 @@ from .facts import (
     UNTRUSTED_EVENTS,
     Workflow,
     job_guards,
+    references_triggering_run,
     secrets_in_scope,
     steps_using,
     untrusted_context_hits,
@@ -269,7 +270,11 @@ def check_artifact_trust_chain(ctx: RepoContext, rule: Rule) -> list[Finding]:
         source = matches[0]
         events = ", ".join(sorted(source.events & ARTIFACT_SOURCE_EVENTS))
         for job_name, job in workflow.jobs.items():
-            downloads = steps_using(job, DOWNLOAD_ARTIFACT)
+            downloads = [
+                step
+                for step in steps_using(job, DOWNLOAD_ARTIFACT)
+                if references_triggering_run(step.raw, job)
+            ]
             if not downloads:
                 continue
             secrets = secrets_in_scope(workflow.raw, job)
@@ -286,13 +291,14 @@ def check_artifact_trust_chain(ctx: RepoContext, rule: Rule) -> list[Finding]:
                     "but do not remove exposure."
                 )
             message = (
-                f"Privileged workflow_run job downloads artifacts from "
+                f"Privileged workflow_run job fetches artifacts from the run of "
                 f"untrusted-triggered workflow {source.path.name!r} ({events}) "
                 f"while {', '.join(signals)} is in scope. Artifact content is "
                 "attacker-influenced; a poisoned artifact turns the low-privilege "
                 "run into code or data consumed here (Cordyceps artifact chain). "
-                "Treat artifacts as untrusted data: pin the producing run, verify "
-                "digests, and never execute artifact code with secrets in scope."
+                "Treat artifacts as untrusted data: validate the producing run "
+                "(actor association, head repository), verify digests, and never "
+                "execute artifact code with secrets in scope."
                 + note
             )
             findings.append(
