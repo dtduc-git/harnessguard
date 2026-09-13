@@ -12,7 +12,13 @@ from .rules.model import Rule
 
 
 def scan(paths: list[Path], rules: list[Rule]) -> ScanResult:
-    workflow_paths = discover(paths)
+    return scan_workflow_files(discover(paths), rules, root=root_of(paths))
+
+
+def scan_workflow_files(
+    workflow_paths: list[Path], rules: list[Rule], root: Path | None = None
+) -> ScanResult:
+    """Scan already-resolved workflow files (used by the CLI and the research scripts)."""
     findings = []
     scanned = 0
     for path in workflow_paths:
@@ -35,4 +41,4 @@ def scan(paths: list[Path], rules: list[Rule]) -> ScanResult:
                 findings.extend(check(ctx, rule))
 
     findings.sort(key=lambda f: (f.severity.rank, f.rule_id, str(f.workflow), f.job))
-    return ScanResult(root=root_of(paths), findings=findings, workflows_scanned=scanned)
+    return ScanResult(root=root or Path.cwd(), findings=findings, workflows_scanned=scanned)

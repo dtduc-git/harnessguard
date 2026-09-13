@@ -30,6 +30,16 @@ Real incidents, all from 2026:
 Existing Actions linters (`zizmor`, `actionlint`, `poutine`…) are excellent
 but agent-blind: they don't model "this step is an LLM that will obey text."
 
+## Research
+
+We sampled **337 public agent workflow files** (255 repos) via the GitHub code
+search API: **44.2% combine untrusted events with runner secrets or write
+permissions**, and 61% of those carry no actor-association guard in the
+workflow file. Aggregates only — no repo is named.
+
+→ [State of AI-agent workflows in the wild](research/state-of-agent-workflows.md)
+· reproduce with `uv run python scripts/ecosystem_scan.py`
+
 ## Install
 
 ```bash
