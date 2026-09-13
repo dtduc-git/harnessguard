@@ -81,7 +81,7 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtduc-git/harnessguard@main
+      - uses: dtduc-git/harnessguard@v0.4.0
         with:
           fail-on: high
 ```
@@ -96,6 +96,7 @@ jobs:
 | HG004 | high | Agent step in a `pull_request_target` workflow |
 | HG005 | medium | Agent step with shell/network tool grants or egress commands |
 | HG006 | high | Agent job checks out an attacker-controlled ref |
+| HG007 | high | Privileged `workflow_run` job consumes artifacts from untrusted-triggered workflows (Cordyceps chain) |
 
 Findings map to the OWASP Top 10 for Agentic Applications (ASI01–ASI03).
 Jobs whose `if:` restricts triggering via `github.actor` / `author_association`

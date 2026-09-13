@@ -1,0 +1,19 @@
+name: artifact-producer
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build report
+        run: mkdir -p dist && echo "built from PR" > dist/report.txt
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist/

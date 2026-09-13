@@ -8,7 +8,7 @@ from harnessguard.rules import load_rules
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
-EXPECTED_VULNERABLE = {"HG001", "HG002", "HG003", "HG004", "HG005", "HG006"}
+EXPECTED_VULNERABLE = {"HG001", "HG002", "HG003", "HG004", "HG005", "HG006", "HG007"}
 
 
 def _scan(name: str):
@@ -47,7 +47,7 @@ def test_pull_request_target_finding_reported() -> None:
 
 def test_clean_fixture_still_scans_workflows() -> None:
     result = _scan("clean-repo")
-    assert result.workflows_scanned == 1
+    assert result.workflows_scanned == 3
 
 
 def test_guarded_job_downgrades_privilege_findings() -> None:
@@ -83,6 +83,39 @@ def test_untrusted_checkout_ref_finding_reported() -> None:
     ]
     assert refs
     assert "github.event.pull_request.head.ref" in refs[0].message
+
+
+def test_artifact_trust_chain_flagged() -> None:
+    result = _scan("vulnerable-repo")
+    consumers = [
+        f
+        for f in result.findings
+        if f.rule_id == "HG007" and f.workflow.name == "artifact-consumer.yml"
+    ]
+    assert consumers
+    finding = consumers[0]
+    assert finding.severity == Severity.HIGH
+    assert "artifact-producer" in finding.message
+    assert "pull_request" in finding.message
+    assert "secrets.DEPLOY_KEY" in finding.message
+    assert "contents: write" in finding.message
+
+
+def test_artifact_consumer_with_environment_is_downgraded() -> None:
+    result = _scan("vulnerable-repo")
+    guarded = [
+        f
+        for f in result.findings
+        if f.rule_id == "HG007" and f.workflow.name == "artifact-consumer-guarded.yml"
+    ]
+    assert guarded
+    assert guarded[0].severity == Severity.MEDIUM
+    assert "environment" in guarded[0].message
+
+
+def test_trusted_artifact_producer_not_flagged() -> None:
+    result = _scan("clean-repo")
+    assert not [f for f in result.findings if f.rule_id == "HG007"]
 
 
 def test_sarif_contains_rules_and_results() -> None:

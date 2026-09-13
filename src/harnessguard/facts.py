@@ -19,6 +19,9 @@ UNTRUSTED_EVENTS = frozenset(
     {"issues", "issue_comment", "pull_request_target", "discussion", "discussion_comment"}
 )
 
+#: Events that let an attacker influence the content of an uploaded artifact.
+ARTIFACT_SOURCE_EVENTS = UNTRUSTED_EVENTS | {"pull_request"}
+
 #: ``uses:`` values that identify an AI agent / AI review action.
 AGENT_ACTION_PATTERNS = (
     r"anthropics/claude-code-action",
@@ -108,6 +111,11 @@ class Workflow:
         return bool(self.events & UNTRUSTED_EVENTS)
 
     @property
+    def untrusted_artifact_source(self) -> bool:
+        """True when an attacker can influence what this workflow uploads."""
+        return bool(self.events & ARTIFACT_SOURCE_EVENTS)
+
+    @property
     def jobs(self) -> dict[str, dict[str, Any]]:
         jobs = self.raw.get("jobs")
         return jobs if isinstance(jobs, dict) else {}
@@ -148,6 +156,30 @@ def all_steps(job: dict[str, Any]) -> list[Step]:
 
 def agent_steps(job: dict[str, Any]) -> list[Step]:
     return [step for step in all_steps(job) if is_agent_step(step)]
+
+
+def steps_using(job: dict[str, Any], action: str) -> list[Step]:
+    """Steps that invoke a given action (matched by ``uses:`` prefix)."""
+    return [step for step in all_steps(job) if step.uses.startswith(action)]
+
+
+def workflow_run_filters(raw: dict[str, Any]) -> list[str] | None:
+    """Workflow names a ``workflow_run`` trigger listens to.
+
+    Returns ``None`` when the workflow has no ``workflow_run`` trigger and an
+    empty list when it listens without a ``workflows`` filter.
+    """
+    on_block = raw.get("on", raw.get(True))
+    if not isinstance(on_block, dict):
+        return None
+    trigger = on_block.get("workflow_run")
+    if trigger is None:
+        return None
+    if isinstance(trigger, dict):
+        names = trigger.get("workflows")
+        if isinstance(names, list):
+            return [str(name) for name in names]
+    return []
 
 
 def secrets_in_job(job: dict[str, Any]) -> set[str]:

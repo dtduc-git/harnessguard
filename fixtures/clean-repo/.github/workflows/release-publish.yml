@@ -1,0 +1,20 @@
+name: release-publish
+on:
+  workflow_run:
+    workflows: [release-build]
+    types: [completed]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+      - name: Publish
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: echo "publish release"

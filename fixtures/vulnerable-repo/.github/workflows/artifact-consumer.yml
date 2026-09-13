@@ -1,0 +1,21 @@
+name: artifact-consumer
+on:
+  workflow_run:
+    workflows: [artifact-producer]
+    types: [completed]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download build output
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+      - name: Publish
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: bash scripts/publish.sh
