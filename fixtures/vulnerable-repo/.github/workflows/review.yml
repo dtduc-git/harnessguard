@@ -1,0 +1,12 @@
+name: PR review agent
+on: pull_request_target
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+      - name: Gemini review
+        run: npx @google/gemini-cli --prompt "Review the diff in this pull request"

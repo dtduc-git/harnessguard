@@ -1,0 +1,25 @@
+id: HG005
+title: Agent step with shell or network tool grants
+severity: medium
+check: egress_tool_grants
+owasp: "ASI02 Tool Misuse & Exploitation"
+description: >
+  Shell, write-file and network tools are the third leg of the Rule of Two:
+  they give a hijacked agent an egress channel (curl, git push, gh api) or the
+  ability to modify the workspace and runner state.
+remediation: >
+  Use a narrow tool allowlist (read-only tools for review jobs). If shell
+  access is required, drop secrets from the job and keep permissions
+  read-only so the blast radius stays local.
+params:
+  patterns:
+    - name: shell tool grant
+      regex: '(?i)allowed.?tools?[^\n]*(bash|shell|execute|terminal)'
+    - name: write/edit tool grant
+      regex: '(?i)allowed.?tools?[^\n]*(write|edit|str_replace)'
+    - name: network tool grant
+      regex: '(?i)allowed.?tools?[^\n]*(webfetch|web.?search|fetch|network|computer)'
+    - name: egress command
+      regex: '(?i)\b(curl|wget|nc|netcat|scp)\b'
+    - name: git/gh write command
+      regex: '(?i)\b(git\s+push|gh\s+(pr|issue|api)\s+(create|comment|edit))\b'

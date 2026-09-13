@@ -1,0 +1,15 @@
+id: HG004
+title: Agent step in a pull_request_target workflow
+severity: high
+check: pull_request_target_agent
+owasp: "ASI03 Identity & Privilege Abuse"
+description: >
+  pull_request_target runs in the base repository context: secrets and
+  read/write tokens are available even for fork pull requests. Running an
+  agent there gives an untrusted contributor a path from their PR content to a
+  privileged process — the classic pwn-request pattern, now amplified by
+  prompt injection.
+remediation: >
+  Do not run agents on pull_request_target. Use pull_request for untrusted
+  code, then hand off privileged follow-up (labeling, pushing) to a
+  workflow_run job that acts on verified artifacts only.

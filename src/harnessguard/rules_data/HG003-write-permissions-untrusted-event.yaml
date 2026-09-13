@@ -1,0 +1,13 @@
+id: HG003
+title: Agent step on untrusted events with write permissions
+severity: high
+check: write_permissions_untrusted_event
+owasp: "ASI02 Tool Misuse & Exploitation / ASI03 Identity & Privilege Abuse"
+description: >
+  GitHub tokens with write scopes let a hijacked agent push commits, edit
+  issues, post comments or cut releases. Combined with attacker-controlled
+  triggers this is the second leg of the Rule of Two.
+remediation: >
+  Default to read-only permissions on agent jobs triggered by issues,
+  comments or fork PRs (permissions: contents: read). Escalate in a separate
+  trusted workflow after human review.

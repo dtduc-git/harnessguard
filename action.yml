@@ -1,0 +1,41 @@
+name: harnessguard
+description: Static hardening linter for GitHub Actions workflows that run AI agents. Never executes anything.
+author: dtduc-git
+branding:
+  icon: shield
+  color: red
+
+inputs:
+  paths:
+    description: Files or directories to scan
+    required: false
+    default: "."
+  fail-on:
+    description: "Exit 1 at this severity or above: critical | high | medium | low | info | none"
+    required: false
+    default: "high"
+  sarif-file:
+    description: SARIF output path
+    required: false
+    default: "harnessguard.sarif"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install harnessguard
+      shell: bash
+      run: pip install harnessguard || pip install "git+https://github.com/dtduc-git/harnessguard"
+    - name: Scan
+      shell: bash
+      run: |
+        harnessguard scan ${{ inputs.paths }} \
+          --fail-on ${{ inputs.fail-on }} \
+          --sarif ${{ inputs.sarif-file }}
+    - name: Upload SARIF
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.sarif-file }}

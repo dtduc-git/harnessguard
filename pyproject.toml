@@ -1,0 +1,75 @@
+[project]
+name = "harnessguard"
+dynamic = ["version"]
+description = "Static hardening linter for GitHub Actions workflows that run AI agents — Agent Rule of Two, OWASP ASI mapping. Never executes anything."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Duke - Duc Dinh", email = "dtduc.contact@gmail.com" }]
+keywords = [
+  "github-actions",
+  "cicd",
+  "security",
+  "ai-agents",
+  "prompt-injection",
+  "owasp",
+  "supply-chain",
+  "sarif",
+  "sast",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+  "pydantic>=2.7",
+  "pyyaml>=6.0",
+  "rich>=13.7",
+  "typer>=0.12",
+]
+
+[project.scripts]
+harnessguard = "harnessguard.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dtduc-git/harnessguard"
+Issues = "https://github.com/dtduc-git/harnessguard/issues"
+Changelog = "https://github.com/dtduc-git/harnessguard/releases"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/harnessguard/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harnessguard"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/harnessguard/cli.py" = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

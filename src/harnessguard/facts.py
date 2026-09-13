@@ -1,0 +1,166 @@
+"""Extract security-relevant facts from GitHub Actions workflow YAML.
+
+The vocabulary lives here: what counts as an agent step, which events carry
+attacker-controlled content, how interpolated untrusted context looks.
+Rules combine these facts through named checks. Nothing is ever executed.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+#: Events whose payload is (partly) attacker-controlled on public repos.
+UNTRUSTED_EVENTS = frozenset(
+    {"issues", "issue_comment", "pull_request_target", "discussion", "discussion_comment"}
+)
+
+#: ``uses:`` values that identify an AI agent / AI review action.
+AGENT_ACTION_PATTERNS = (
+    r"anthropics/claude-code-action",
+    r"google-github-actions/run-gemini-cli",
+    r"openai/codex-action",
+    r"github/copilot",
+    r"copilot-coding-agent",
+    r"coderabbitai/",
+    r"graphite-app/",
+)
+
+#: Shell invocations that identify an AI agent CLI step.
+AGENT_RUN_PATTERNS = (
+    r"(?i)\bnpx\b[^\n]*(@anthropic-ai/claude-code|@google/gemini-cli|@openai/codex)",
+    r"(?i)\b(claude|gemini|codex)\b[^\n]{0,60}(--print|--prompt|--dangerously-skip-permissions|-p\b)",
+    r"(?i)\bopencode\b[^\n]*\brun\b",
+    r"(?i)\baider\b",
+)
+
+#: Attacker-controllable event fields interpolated via expressions.
+UNTRUSTED_CONTEXT_RE = re.compile(
+    r"github\.(?:"
+    r"event\.(?:issue|comment|discussion|review|pull_request)[\w.]*\.(?:body|title)"
+    r"|head_ref"
+    r")\b",
+    re.IGNORECASE,
+)
+
+SECRETS_RE = re.compile(r"secrets\.([A-Za-z0-9_]+)")
+
+
+@dataclass
+class Step:
+    """A single workflow step."""
+
+    name: str
+    raw: dict[str, Any]
+
+    @property
+    def uses(self) -> str:
+        return str(self.raw.get("uses", ""))
+
+    @property
+    def run(self) -> str:
+        return str(self.raw.get("run", ""))
+
+    @property
+    def text(self) -> str:
+        """Everything in the step an agent could read or obey."""
+        with_block = self.raw.get("with", {})
+        try:
+            with_text = yaml.safe_dump(with_block, default_flow_style=False)
+        except yaml.YAMLError:  # pragma: no cover - defensive
+            with_text = str(with_block)
+        return "\n".join([self.uses, self.run, with_text])
+
+
+@dataclass
+class Workflow:
+    """A parsed workflow file."""
+
+    path: Path
+    raw: dict[str, Any]
+
+    @property
+    def events(self) -> frozenset[str]:
+        return parse_events(self.raw)
+
+    @property
+    def untrusted(self) -> bool:
+        return bool(self.events & UNTRUSTED_EVENTS)
+
+    @property
+    def jobs(self) -> dict[str, dict[str, Any]]:
+        jobs = self.raw.get("jobs")
+        return jobs if isinstance(jobs, dict) else {}
+
+
+def parse_events(raw: dict[str, Any]) -> frozenset[str]:
+    """Normalize the ``on:`` block. PyYAML may parse the key as boolean True."""
+    on_block = raw.get("on", raw.get(True))
+    if on_block is None:
+        return frozenset()
+    if isinstance(on_block, str):
+        return frozenset({on_block})
+    if isinstance(on_block, list):
+        return frozenset(str(item) for item in on_block)
+    if isinstance(on_block, dict):
+        return frozenset(str(key) for key in on_block)
+    return frozenset()
+
+
+def is_agent_step(step: Step) -> bool:
+    if any(re.search(pattern, step.uses, re.IGNORECASE) for pattern in AGENT_ACTION_PATTERNS):
+        return True
+    return any(re.search(pattern, step.run) for pattern in AGENT_RUN_PATTERNS)
+
+
+def agent_steps(job: dict[str, Any]) -> list[Step]:
+    steps = job.get("steps") if isinstance(job, dict) else None
+    if not isinstance(steps, list):
+        return []
+    result: list[Step] = []
+    for item in steps:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("name") or item.get("uses") or "step")
+        step = Step(name=label, raw=item)
+        if is_agent_step(step):
+            result.append(step)
+    return result
+
+
+def secrets_in_job(job: dict[str, Any]) -> set[str]:
+    try:
+        text = yaml.safe_dump(job, default_flow_style=False)
+    except yaml.YAMLError:  # pragma: no cover - defensive
+        text = str(job)
+    return set(SECRETS_RE.findall(text))
+
+
+def write_scopes(workflow_raw: dict[str, Any], job: dict[str, Any]) -> list[str]:
+    """Return explicitly granted ``write`` permission scopes (job over workflow)."""
+    perms = job.get("permissions", workflow_raw.get("permissions"))
+    if perms is None:
+        return []
+    if isinstance(perms, str):
+        return ["write-all"] if perms.strip() == "write-all" else []
+    if isinstance(perms, dict):
+        return sorted(str(key) for key, value in perms.items() if str(value).lower() == "write")
+    return []
+
+
+def untrusted_context_hits(text: str) -> list[str]:
+    return sorted({match.group(0) for match in UNTRUSTED_CONTEXT_RE.finditer(text)})
+
+
+def load_workflow(path: Path) -> Workflow | None:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return Workflow(path=path, raw=data)

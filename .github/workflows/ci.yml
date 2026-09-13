@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-groups
+      - name: Lint
+        run: uv run ruff check .
+      - name: Tests
+        run: uv run pytest
+      - name: Self-scan (vulnerable fixture; report only)
+        run: uv run harnessguard scan fixtures/vulnerable-repo --fail-on none --sarif harnessguard-vulnerable.sarif
+      - name: Self-scan (clean fixture; must pass)
+        run: uv run harnessguard scan fixtures/clean-repo --fail-on low

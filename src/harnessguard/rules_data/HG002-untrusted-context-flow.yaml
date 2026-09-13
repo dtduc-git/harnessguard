@@ -1,0 +1,14 @@
+id: HG002
+title: Attacker-controlled event data interpolated into an agent step
+severity: high
+check: untrusted_context_flow
+owasp: "ASI01 Agent Goal Hijack"
+description: >
+  Issue bodies, PR titles and comment text are attacker-controlled on public
+  repositories. Interpolating them into an agent prompt wires the exact
+  injection path used in the Comment and Control (April 2026) and Black Hat
+  USA 2026 disclosures: a public comment becomes instructions the agent obeys.
+remediation: >
+  Pass event text only as labeled data, keep the job secret-free and
+  read-only, cap tools with a narrow allowlist, and never let event content
+  masquerade as instructions. Verify mitigations with the Rule of Two.
