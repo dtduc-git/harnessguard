@@ -97,6 +97,9 @@ jobs:
 | HG005 | medium | Agent step with shell/network tool grants or egress commands |
 
 Findings map to the OWASP Top 10 for Agentic Applications (ASI01–ASI03).
+Jobs whose `if:` restricts triggering via `github.actor` / `author_association`
+guards get HG001/HG003 downgraded one level — reduced exposure is still
+flagged, just at lower severity.
 Rules are data — YAML in `src/harnessguard/rules_data/` — and checks are small
 named functions in `checks.py`. Add your own with `--rules-dir`.
 

@@ -47,6 +47,13 @@ UNTRUSTED_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Job-level ``if:`` conditions that restrict who can trigger the job.
+GUARD_PATTERNS = (
+    ("author association check", re.compile(r"author_association", re.IGNORECASE)),
+    ("actor allowlist", re.compile(r"github\.actor\b")),
+    ("JSON allowlist condition", re.compile(r"fromJSON\(")),
+)
+
 SECRETS_RE = re.compile(r"secrets\.([A-Za-z0-9_]+)")
 
 
@@ -154,6 +161,14 @@ def write_scopes(workflow_raw: dict[str, Any], job: dict[str, Any]) -> list[str]
 
 def untrusted_context_hits(text: str) -> list[str]:
     return sorted({match.group(0) for match in UNTRUSTED_CONTEXT_RE.finditer(text)})
+
+
+def job_guards(job: dict[str, Any]) -> list[str]:
+    """Job-level ``if:`` guards that restrict who can trigger the job."""
+    condition = str(job.get("if", ""))
+    if not condition:
+        return []
+    return [label for label, pattern in GUARD_PATTERNS if pattern.search(condition)]
 
 
 def load_workflow(path: Path) -> Workflow | None:

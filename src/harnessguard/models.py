@@ -18,6 +18,19 @@ class Severity(StrEnum):
     def rank(self) -> int:
         return _SEVERITY_RANK[self]
 
+    def weaken(self) -> Severity:
+        """One level less severe (INFO stays INFO)."""
+        return _SEVERITY_ORDER[min(self.rank + 1, len(_SEVERITY_ORDER) - 1)]
+
+
+_SEVERITY_ORDER: tuple[Severity, ...] = (
+    Severity.CRITICAL,
+    Severity.HIGH,
+    Severity.MEDIUM,
+    Severity.LOW,
+    Severity.INFO,
+)
+
 
 _SEVERITY_RANK: dict[Severity, int] = {
     Severity.CRITICAL: 0,

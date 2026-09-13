@@ -11,3 +11,5 @@ remediation: >
   Default to read-only permissions on agent jobs triggered by issues,
   comments or fork PRs (permissions: contents: read). Escalate in a separate
   trusted workflow after human review.
+params:
+  guard_downgrade: true

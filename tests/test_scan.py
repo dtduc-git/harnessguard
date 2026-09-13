@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from harnessguard.engine import scan
+from harnessguard.models import Severity
 from harnessguard.report import to_sarif
 from harnessguard.rules import load_rules
 
@@ -47,6 +48,19 @@ def test_pull_request_target_finding_reported() -> None:
 def test_clean_fixture_still_scans_workflows() -> None:
     result = _scan("clean-repo")
     assert result.workflows_scanned == 1
+
+
+def test_guarded_job_downgrades_privilege_findings() -> None:
+    result = _scan("vulnerable-repo")
+    guarded = [f for f in result.findings if f.workflow.name == "guarded.yml"]
+    by_rule = {f.rule_id: f.severity for f in guarded}
+    assert by_rule["HG001"] == Severity.HIGH  # critical, downgraded one level
+    assert by_rule["HG003"] == Severity.MEDIUM  # high, downgraded one level
+    assert "guard" in next(f for f in guarded if f.rule_id == "HG001").message
+    unguarded = [
+        f for f in result.findings if f.workflow.name == "triage.yml" and f.rule_id == "HG001"
+    ]
+    assert unguarded[0].severity == Severity.CRITICAL
 
 
 def test_sarif_contains_rules_and_results() -> None:

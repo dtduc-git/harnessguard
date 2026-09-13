@@ -10,11 +10,12 @@ from typing import TYPE_CHECKING
 from .facts import (
     UNTRUSTED_EVENTS,
     Workflow,
+    job_guards,
     secrets_in_job,
     untrusted_context_hits,
     write_scopes,
 )
-from .models import Finding
+from .models import Finding, Severity
 from .rules.model import Rule
 
 if TYPE_CHECKING:
@@ -30,16 +31,35 @@ class JobContext:
     job: dict
     agent_steps: list[Step]
 
-    def finding(self, rule: Rule, message: str, step: Step | None = None) -> Finding:
+    def finding(
+        self,
+        rule: Rule,
+        message: str,
+        step: Step | None = None,
+        severity: Severity | None = None,
+    ) -> Finding:
         return Finding(
             rule_id=rule.id,
-            severity=rule.severity,
+            severity=severity or rule.severity,
             title=rule.title,
             message=message,
             workflow=self.workflow.path,
             job=self.name,
             step=step.name if step is not None else "",
         )
+
+
+def _guard_note(ctx: JobContext, rule: Rule) -> str | None:
+    """Note when a job restricts triggering via ``if:`` guards (opt-in per rule)."""
+    if not rule.params.get("guard_downgrade"):
+        return None
+    guards = job_guards(ctx.job)
+    if not guards:
+        return None
+    return (
+        f"Job-level `if:` guard restricts triggering ({', '.join(guards)}); "
+        "exposure is reduced but not eliminated (compromised accounts, indirect injection)."
+    )
 
 
 def _untrusted_events(ctx: JobContext) -> str:
@@ -54,12 +74,19 @@ def check_secrets_untrusted_event(ctx: JobContext, rule: Rule) -> list[Finding]:
     if not secrets:
         return []
     names = ", ".join(f"secrets.{name}" for name in sorted(secrets))
+    note = _guard_note(ctx, rule)
+    message = (
+        f"Agent step runs on untrusted events ({_untrusted_events(ctx)}) while "
+        f"{names} is in scope. Injected instructions in the event payload can "
+        "read and exfiltrate these credentials."
+    )
+    if note:
+        message = f"{message} {note}"
     return [
         ctx.finding(
             rule,
-            f"Agent step runs on untrusted events ({_untrusted_events(ctx)}) while "
-            f"{names} is in scope. Injected instructions in the event payload can "
-            "read and exfiltrate these credentials.",
+            message,
+            severity=rule.severity.weaken() if note else None,
         )
     ]
 
@@ -91,12 +118,19 @@ def check_write_permissions_untrusted_event(ctx: JobContext, rule: Rule) -> list
     scopes = write_scopes(ctx.workflow.raw, ctx.job)
     if not scopes:
         return []
+    note = _guard_note(ctx, rule)
+    message = (
+        f"Agent step runs on untrusted events ({_untrusted_events(ctx)}) with write "
+        f"permissions: {', '.join(scopes)}. A hijacked agent can push commits, "
+        "comments or releases with the workflow token."
+    )
+    if note:
+        message = f"{message} {note}"
     return [
         ctx.finding(
             rule,
-            f"Agent step runs on untrusted events ({_untrusted_events(ctx)}) with write "
-            f"permissions: {', '.join(scopes)}. A hijacked agent can push commits, "
-            "comments or releases with the workflow token.",
+            message,
+            severity=rule.severity.weaken() if note else None,
         )
     ]
 
