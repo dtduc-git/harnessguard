@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from harnessguard import __version__
 from harnessguard.engine import scan_workflow_files
 from harnessguard.facts import UNTRUSTED_EVENTS, agent_steps, job_guards, load_workflow
 from harnessguard.rules import load_rules
@@ -133,7 +134,7 @@ def build_report(
     lines: list[str] = []
     lines.append("# State of AI-agent workflows in the wild")
     lines.append("")
-    lines.append(f"_Generated {generated_at} with harnessguard 0.1.0._")
+    lines.append(f"_Generated {generated_at} with harnessguard {__version__}._")
     lines.append("")
     lines.append("## Methodology")
     lines.append("")
@@ -219,9 +220,10 @@ def build_report(
         "custom or renamed integrations are not counted."
     )
     lines.append(
-        "- Job-level guards (e.g. actor allowlists in `if:` conditions) are not "
-        "evaluated; some flagged workflows restrict who can trigger them, which "
-        "reduces but does not eliminate the injection surface."
+        "- Job-level guards (actor allowlists, author-association checks) are "
+        "recognized for HG001/HG003 and downgrade those findings one level; other "
+        "rules do not consider guards, and a guard still leaves compromised-account "
+        "and indirect-injection risk."
     )
     lines.append("")
     return "\n".join(lines)

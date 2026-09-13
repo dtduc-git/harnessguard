@@ -1,6 +1,6 @@
 # State of AI-agent workflows in the wild
 
-_Generated 2026-09-13T06:48:43.615997+00:00 with harnessguard 0.1.0._
+_Generated 2026-09-13T07:19:21.192910+00:00 with harnessguard 0.3.0._
 
 ## Methodology
 
@@ -16,12 +16,12 @@ Public GitHub Actions workflow files matching known AI-agent actions were sample
 ## Headline
 
 - Agent workflow files analyzed: **337** from **255** repos
-- **51.6%** have at least one rule-of-two finding
+- **51.9%** have at least one rule-of-two finding
 - **44.2%** combine untrusted events with runner secrets or write permissions (HG001/HG003)
 - **5.3%** interpolate attacker-controlled event data into agent steps (HG002)
 - **5.3%** run an agent on `pull_request_target` (HG004)
 - **44.2%** are triggered by at least one event carrying attacker-controlled content
-- Of the privilege-combining files, **38.9%** restrict triggering with `github.actor` / `author_association` guards — reduced, not eliminated, exposure
+- Of the privilege-combining files, **33.6%** restrict triggering with `github.actor` / `author_association` guards — reduced, not eliminated, exposure
 
 ## Sample
 
@@ -47,6 +47,7 @@ Public GitHub Actions workflow files matching known AI-agent actions were sample
 | HG005 | 52 | 15.4% |
 | HG004 | 18 | 5.3% |
 | HG002 | 18 | 5.3% |
+| HG006 | 5 | 1.5% |
 
 ## Caveats
 
@@ -54,5 +55,5 @@ Public GitHub Actions workflow files matching known AI-agent actions were sample
 - Workflows are point-in-time snapshots; a repo can fix a finding later.
 - Heuristic rules trade precision for recall; counts are a lower bound on real risk signals, not a per-repo verdict, and not every flagged workflow is exploitable (mitigations may exist outside the file).
 - Agent detection is pattern-based (known actions and CLI invocations); custom or renamed integrations are not counted.
-- Job-level guards (e.g. actor allowlists in `if:` conditions) are not evaluated; some flagged workflows restrict who can trigger them, which reduces but does not eliminate the injection surface.
+- Job-level guards (actor allowlists, author-association checks) are recognized for HG001/HG003 and downgrade those findings one level; other rules do not consider guards, and a guard still leaves compromised-account and indirect-injection risk.
 
