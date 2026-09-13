@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 import time
@@ -25,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from harnessguard.engine import scan_workflow_files
-from harnessguard.facts import UNTRUSTED_EVENTS, agent_steps, load_workflow
+from harnessguard.facts import UNTRUSTED_EVENTS, agent_steps, job_guards, load_workflow
 from harnessguard.rules import load_rules
 
 QUERIES: list[str] = [
@@ -39,9 +38,6 @@ MAX_FILE_BYTES = 200_000
 SEARCH_SLEEP_SECONDS = 7.0
 FETCH_SLEEP_SECONDS = 0.05
 OWN_REPO = "dtduc-git/harnessguard"
-
-#: Job-level trigger restrictions: actor allowlists and author-association checks.
-GUARD_RE = re.compile(r"github\.actor|author_association|fromJSON\(")
 
 
 def is_workflow_path(path: str) -> bool:
@@ -90,17 +86,13 @@ def classify(workflow_path: Path, findings: list[dict[str, Any]]) -> dict[str, A
     workflow = load_workflow(workflow_path)
     if workflow is None:
         return {}
-    try:
-        text = workflow_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        text = ""
     rules = {finding["rule"] for finding in findings}
     return {
         "name": str(workflow.raw.get("name", "")),
         "events": sorted(workflow.events),
         "untrustedEvents": sorted(workflow.events & UNTRUSTED_EVENTS),
         "hasAgent": any(agent_steps(job) for job in workflow.jobs.values()),
-        "guarded": bool(GUARD_RE.search(text)),
+        "guarded": any(job_guards(job) for job in workflow.jobs.values()),
         "rules": sorted(rules),
         "findings": findings,
     }

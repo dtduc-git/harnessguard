@@ -54,6 +54,15 @@ GUARD_PATTERNS = (
     ("JSON allowlist condition", re.compile(r"fromJSON\(")),
 )
 
+#: Attacker-controllable refs used as checkout targets.
+UNTRUSTED_REF_RE = re.compile(
+    r"github\.(?:"
+    r"head_ref"
+    r"|event\.(?:pull_request|pull_request_target)[\w.]*\.head[\w.]*"
+    r")\b",
+    re.IGNORECASE,
+)
+
 SECRETS_RE = re.compile(r"secrets\.([A-Za-z0-9_]+)")
 
 
@@ -124,7 +133,7 @@ def is_agent_step(step: Step) -> bool:
     return any(re.search(pattern, step.run) for pattern in AGENT_RUN_PATTERNS)
 
 
-def agent_steps(job: dict[str, Any]) -> list[Step]:
+def all_steps(job: dict[str, Any]) -> list[Step]:
     steps = job.get("steps") if isinstance(job, dict) else None
     if not isinstance(steps, list):
         return []
@@ -133,10 +142,12 @@ def agent_steps(job: dict[str, Any]) -> list[Step]:
         if not isinstance(item, dict):
             continue
         label = str(item.get("name") or item.get("uses") or "step")
-        step = Step(name=label, raw=item)
-        if is_agent_step(step):
-            result.append(step)
+        result.append(Step(name=label, raw=item))
     return result
+
+
+def agent_steps(job: dict[str, Any]) -> list[Step]:
+    return [step for step in all_steps(job) if is_agent_step(step)]
 
 
 def secrets_in_job(job: dict[str, Any]) -> set[str]:
@@ -145,6 +156,21 @@ def secrets_in_job(job: dict[str, Any]) -> set[str]:
     except yaml.YAMLError:  # pragma: no cover - defensive
         text = str(job)
     return set(SECRETS_RE.findall(text))
+
+
+def secrets_in_scope(workflow_raw: dict[str, Any], job: dict[str, Any]) -> set[str]:
+    """Secrets reachable by the job: job/step scope plus workflow-level ``env:``."""
+    names = secrets_in_job(job)
+    try:
+        env_text = yaml.safe_dump(workflow_raw.get("env", {}), default_flow_style=False)
+    except yaml.YAMLError:  # pragma: no cover - defensive
+        env_text = str(workflow_raw.get("env", {}))
+    names |= set(SECRETS_RE.findall(env_text))
+    return names
+
+
+def untrusted_ref_hits(text: str) -> list[str]:
+    return sorted({match.group(0) for match in UNTRUSTED_REF_RE.finditer(text)})
 
 
 def write_scopes(workflow_raw: dict[str, Any], job: dict[str, Any]) -> list[str]:

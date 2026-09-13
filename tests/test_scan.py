@@ -8,7 +8,7 @@ from harnessguard.rules import load_rules
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
-EXPECTED_VULNERABLE = {"HG001", "HG002", "HG003", "HG004", "HG005"}
+EXPECTED_VULNERABLE = {"HG001", "HG002", "HG003", "HG004", "HG005", "HG006"}
 
 
 def _scan(name: str):
@@ -61,6 +61,28 @@ def test_guarded_job_downgrades_privilege_findings() -> None:
         f for f in result.findings if f.workflow.name == "triage.yml" and f.rule_id == "HG001"
     ]
     assert unguarded[0].severity == Severity.CRITICAL
+
+
+def test_workflow_level_env_secret_detected() -> None:
+    result = _scan("vulnerable-repo")
+    env_findings = [
+        f
+        for f in result.findings
+        if f.workflow.name == "workflow-env.yml" and f.rule_id == "HG001"
+    ]
+    assert env_findings, "workflow-level env secret not detected"
+    assert "secrets.AGENT_API_KEY" in env_findings[0].message
+
+
+def test_untrusted_checkout_ref_finding_reported() -> None:
+    result = _scan("vulnerable-repo")
+    refs = [
+        f
+        for f in result.findings
+        if f.rule_id == "HG006" and f.workflow.name == "checkout-ref.yml"
+    ]
+    assert refs
+    assert "github.event.pull_request.head.ref" in refs[0].message
 
 
 def test_sarif_contains_rules_and_results() -> None:

@@ -90,11 +90,12 @@ jobs:
 
 | Rule  | Severity | What it catches |
 |-------|----------|-----------------|
-| HG001 | critical | Agent step on untrusted events with secrets in scope |
+| HG001 | critical | Agent step on untrusted events with secrets in scope (job or workflow env) |
 | HG002 | high | Attacker-controlled event data interpolated into an agent step |
 | HG003 | high | Agent step on untrusted events with write permissions |
 | HG004 | high | Agent step in a `pull_request_target` workflow |
 | HG005 | medium | Agent step with shell/network tool grants or egress commands |
+| HG006 | high | Agent job checks out an attacker-controlled ref |
 
 Findings map to the OWASP Top 10 for Agentic Applications (ASI01–ASI03).
 Jobs whose `if:` restricts triggering via `github.actor` / `author_association`

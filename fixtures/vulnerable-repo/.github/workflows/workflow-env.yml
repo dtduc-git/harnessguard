@@ -1,0 +1,14 @@
+name: Issue bot
+on: issues
+env:
+  AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
+
+jobs:
+  reply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Codex reply
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ env.AGENT_API_KEY }}
+          prompt: "Draft a reply for this issue"

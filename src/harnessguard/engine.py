@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .checks import CHECKS, JobContext
 from .discovery import discover, root_of
-from .facts import agent_steps, load_workflow
+from .facts import all_steps, is_agent_step, load_workflow
 from .models import ScanResult
 from .rules.model import Rule
 
@@ -27,10 +27,13 @@ def scan_workflow_files(
             continue
         scanned += 1
         for job_name, job in workflow.jobs.items():
-            steps = agent_steps(job)
-            if not steps:
+            steps = all_steps(job)
+            agent = [step for step in steps if is_agent_step(step)]
+            if not agent:
                 continue
-            ctx = JobContext(workflow=workflow, name=job_name, job=job, agent_steps=steps)
+            ctx = JobContext(
+                workflow=workflow, name=job_name, job=job, steps=steps, agent_steps=agent
+            )
             for rule in rules:
                 check = CHECKS.get(rule.check)
                 if check is None:

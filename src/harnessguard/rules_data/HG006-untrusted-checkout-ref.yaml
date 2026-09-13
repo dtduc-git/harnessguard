@@ -1,0 +1,15 @@
+id: HG006
+title: Agent job checks out an attacker-controlled ref
+severity: high
+check: untrusted_checkout_ref
+owasp: "ASI01 Agent Goal Hijack / ASI05 Unexpected Code Execution"
+description: >
+  actions/checkout with a ref taken from event data (github.head_ref,
+  pull_request.head.*) mounts fork code into the runner workspace the agent
+  operates on. The agent can then read, summarize or execute that code — and
+  any secrets or write tokens in the job apply to an attacker-influenced
+  checkout.
+remediation: >
+  Check out the base ref and inspect the diff (git fetch origin ${{ github.base_ref }}),
+  or keep the job secret-free, read-only and sandboxed when fork code must
+  be present. Never combine an untrusted checkout with secrets or write scopes.

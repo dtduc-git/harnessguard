@@ -11,8 +11,9 @@ from .facts import (
     UNTRUSTED_EVENTS,
     Workflow,
     job_guards,
-    secrets_in_job,
+    secrets_in_scope,
     untrusted_context_hits,
+    untrusted_ref_hits,
     write_scopes,
 )
 from .models import Finding, Severity
@@ -29,6 +30,7 @@ class JobContext:
     workflow: Workflow
     name: str
     job: dict
+    steps: list[Step]
     agent_steps: list[Step]
 
     def finding(
@@ -70,7 +72,7 @@ def check_secrets_untrusted_event(ctx: JobContext, rule: Rule) -> list[Finding]:
     """Agent step + untrusted trigger + runner secrets in scope."""
     if not ctx.workflow.untrusted:
         return []
-    secrets = secrets_in_job(ctx.job)
+    secrets = secrets_in_scope(ctx.workflow.raw, ctx.job)
     if not secrets:
         return []
     names = ", ".join(f"secrets.{name}" for name in sorted(secrets))
@@ -176,10 +178,35 @@ def check_egress_tool_grants(ctx: JobContext, rule: Rule) -> list[Finding]:
     return findings
 
 
+def check_untrusted_checkout_ref(ctx: JobContext, rule: Rule) -> list[Finding]:
+    """Agent job checks out an attacker-controlled ref."""
+    findings: list[Finding] = []
+    for step in ctx.steps:
+        if not step.uses.startswith("actions/checkout"):
+            continue
+        with_block = step.raw.get("with", {})
+        ref = str(with_block.get("ref", "")) if isinstance(with_block, dict) else ""
+        hits = untrusted_ref_hits(ref)
+        if hits:
+            findings.append(
+                ctx.finding(
+                    rule,
+                    "Agent job checks out an attacker-controlled ref ("
+                    + ", ".join(hits)
+                    + "). Fork code enters the workspace the agent operates on; "
+                    "keep the job secret-free and read-only, or check out the "
+                    "base ref and fetch the diff instead.",
+                    step=step,
+                )
+            )
+    return findings
+
+
 CHECKS: dict[str, Callable[[JobContext, Rule], list[Finding]]] = {
     "secrets_untrusted_event": check_secrets_untrusted_event,
     "untrusted_context_flow": check_untrusted_context_flow,
     "write_permissions_untrusted_event": check_write_permissions_untrusted_event,
     "pull_request_target_agent": check_pull_request_target,
     "egress_tool_grants": check_egress_tool_grants,
+    "untrusted_checkout_ref": check_untrusted_checkout_ref,
 }
