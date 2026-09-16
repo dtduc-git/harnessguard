@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
 
 from . import __version__
-from .models import ScanResult, Severity
+from .models import Finding, ScanResult, Severity
 
 SARIF_LEVEL = {
     Severity.CRITICAL: "error",
@@ -51,6 +52,14 @@ def _relative(path: Path, root: Path) -> str:
         return str(path)
 
 
+def fingerprint(finding: Finding, root: Path) -> str:
+    """Stable identity of a finding, independent of message wording."""
+    seed = "|".join(
+        (finding.rule_id, _relative(finding.workflow, root), finding.job, finding.step)
+    )
+    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+
+
 def to_json(result: ScanResult) -> dict:
     return {
         "tool": "harnessguard",
@@ -58,7 +67,10 @@ def to_json(result: ScanResult) -> dict:
         "root": str(result.root),
         "workflows_scanned": result.workflows_scanned,
         "counts": result.by_severity(),
-        "findings": [finding.to_dict() for finding in result.findings],
+        "findings": [
+            {**finding.to_dict(), "fingerprint": fingerprint(finding, result.root)}
+            for finding in result.findings
+        ],
     }
 
 
@@ -90,6 +102,9 @@ def to_sarif(result: ScanResult) -> dict:
                         "ruleId": finding.rule_id,
                         "level": SARIF_LEVEL[finding.severity],
                         "message": {"text": finding.message},
+                        "partialFingerprints": {
+                            "harnessguardFingerprint/v1": fingerprint(finding, result.root)
+                        },
                         "locations": [
                             {
                                 "physicalLocation": {

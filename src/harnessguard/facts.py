@@ -71,6 +71,18 @@ SECRETS_RE = re.compile(r"secrets\.([A-Za-z0-9_]+)")
 #: References to the workflow run that triggered a ``workflow_run`` consumer.
 TRIGGERING_RUN_RE = re.compile(r"github\.event\.workflow_run\b")
 
+#: MCP server launchers inside an agent step (npx/uvx/bunx style).
+MCP_LAUNCH_RE = re.compile(r"(?i)\b(?:npx|uvx|bunx|pnpx)\b[^\n]{0,160}")
+
+#: A package argument lives inside one command/array; cut fragments there.
+MCP_FRAGMENT_SPLIT_RE = re.compile(r"[\]}|;]")
+
+#: Candidate package tokens in a launcher segment.
+MCP_TOKEN_RE = re.compile(r"[@A-Za-z0-9][\w@./-]*")
+
+#: Plaintext HTTP endpoint that is not loopback.
+PLAINTEXT_URL_RE = re.compile(r"http://(?!localhost\b|127\.0\.0\.1\b|\[::1\])", re.IGNORECASE)
+
 
 def _dump(value: Any) -> str:
     try:
@@ -250,6 +262,41 @@ def untrusted_context_hits_in(value: Any) -> list[str]:
     except yaml.YAMLError:  # pragma: no cover - defensive
         text = str(value)
     return untrusted_context_hits(text)
+
+
+def mcp_launch_packages(text: str) -> list[str]:
+    """MCP server packages launched by a step (npx/uvx/bunx @scope/name@ver)."""
+    flat = text.replace("\n", " ")
+    packages: set[str] = set()
+    for fragment in MCP_FRAGMENT_SPLIT_RE.split(flat):
+        for match in MCP_LAUNCH_RE.finditer(fragment):
+            for raw in MCP_TOKEN_RE.findall(match.group(0)):
+                token = raw.strip("'\"`,;:()[]{}<>")
+                lowered = token.lower()
+                if "://" in token or token.endswith((".json", ".yaml", ".yml")):
+                    continue
+                if not any(char.islower() for char in token):
+                    continue
+                if token.startswith("@"):
+                    if "mcp" in lowered:
+                        packages.add(token)
+                elif "/" not in token and "mcp" in lowered:
+                    packages.add(token)
+    return sorted(packages)
+
+
+def mcp_unpinned(package: str) -> bool:
+    """True when an MCP package has no immutable version pin."""
+    name = package[1:] if package.startswith("@") else package
+    if "@" not in name:
+        return True
+    version = name.split("@", 1)[1].strip().lower()
+    return version in {"", "latest", "*"} or "$" in version or "{" in version
+
+
+def mcp_plaintext_endpoint(text: str) -> bool:
+    """True when an MCP-flavoured step references a non-loopback http:// URL."""
+    return "mcp" in text.lower() and bool(PLAINTEXT_URL_RE.search(text))
 
 
 def job_guards(job: dict[str, Any]) -> list[str]:

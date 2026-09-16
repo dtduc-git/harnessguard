@@ -69,12 +69,29 @@ harnessguard scan . --fail-on high --sarif harnessguard.sarif
 # machine-readable output
 harnessguard scan . --format json
 
+# adopt on an existing repo: record current findings, then only fail on new ones
+harnessguard scan . --format json > baseline.json
+harnessguard scan . --baseline baseline.json --fail-on high
+
+# let coding agents lint the workflows they generate (stdio MCP server)
+harnessguard mcp
+
 # list rules
 harnessguard rules list
 ```
 
 Exit code is 1 when findings at or above `--fail-on` exist. `--fail-on none`
 reports without failing.
+
+### MCP server
+
+`harnessguard mcp` serves the scanner over stdio MCP (read-only, no network):
+`scan_repository`, `scan_workflow` (lint YAML before writing it) and
+`list_rules`. Wire it into any MCP client:
+
+```json
+{ "mcpServers": { "harnessguard": { "command": "uvx", "args": ["harnessguard", "mcp"] } } }
+```
 
 ### GitHub Action
 
@@ -108,6 +125,7 @@ jobs:
 | HG007 | high | Privileged `workflow_run` job consumes artifacts from untrusted-triggered workflows (Cordyceps chain) |
 | HG008 | high | Untrusted-triggered workflow passes secrets into an agent-bearing reusable workflow |
 | HG009 | high | Agent step consumes artifacts from an untrusted-triggered workflow |
+| HG010 | medium | Agent step launches unpinned MCP servers or plaintext MCP endpoints |
 
 Findings map to the OWASP Top 10 for Agentic Applications (ASI01–ASI05).
 Jobs whose `if:` restricts triggering via `github.actor` / `author_association`

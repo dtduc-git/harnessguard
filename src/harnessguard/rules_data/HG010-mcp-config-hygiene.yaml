@@ -1,0 +1,18 @@
+id: HG010
+title: Agent step launches unpinned MCP servers or plaintext MCP endpoints
+severity: medium
+check: mcp_config_hygiene
+owasp: "MCP04:2025 Software Supply Chain Attacks & Dependency Tampering / ASI04 Agentic Supply Chain Vulnerabilities"
+description: >
+  MCP servers extend the agent with tools, and agent workflows often spawn
+  them from the network: ``npx -y mcp-remote``, ``uvx some-mcp``, or inline
+  ``mcpServers`` config. Without a version pin the server code can change
+  between runs (OWASP MCP Top 10 MCP04 supply chain), and plaintext ``http://``
+  endpoints expose MCP traffic to interception. Lockfile-style discipline
+  applies to MCP like any other dependency.
+remediation: >
+  Pin MCP server packages to immutable versions (``pkg@1.2.3``, not
+  ``@latest`` or a moving tag), prefer vetted registries, and treat remote MCP
+  endpoints like any other network trust boundary: TLS or loopback only, never
+  a plaintext ``http://`` host. Review MCP server configuration with mcplint
+  (OWASP MCP Top 10 rules) before wiring it into CI.

@@ -1,0 +1,21 @@
+name: mcp-agent
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Review with MCP tools
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: "Review the diff using the MCP tools"
+          claude_args: >-
+            --mcp-config '{"mcpServers": {"ols": {"command": "uvx", "args": ["ols-mcp"]},
+            "legacy": {"command": "npx", "args": ["-y", "mcp-remote",
+            "http://mcp.internal.example:8080/sse"]}}}'

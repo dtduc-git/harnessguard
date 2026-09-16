@@ -30,15 +30,24 @@ def scan_workflow_files(
 ) -> ScanResult:
     """Scan already-resolved workflow files (used by the CLI and the research scripts)."""
     _validate_rules(rules)
+    workflows = [
+        workflow for path in workflow_paths if (workflow := load_workflow(path)) is not None
+    ]
+    return run_checks(workflows, rules, root or Path.cwd())
+
+
+def scan_workflow(
+    raw: dict, rules: list[Rule], name: str = "workflow.yml", root: Path | None = None
+) -> ScanResult:
+    """Scan one workflow mapping (used by the MCP server for generated YAML)."""
+    _validate_rules(rules)
+    workflow = Workflow(path=Path(name), raw=raw)
+    return run_checks([workflow], rules, root or Path.cwd())
+
+
+def run_checks(workflows: list[Workflow], rules: list[Rule], root: Path) -> ScanResult:
     findings = []
-    workflows: list[Workflow] = []
-    scanned = 0
-    for path in workflow_paths:
-        workflow = load_workflow(path)
-        if workflow is None:
-            continue
-        scanned += 1
-        workflows.append(workflow)
+    for workflow in workflows:
         for job_name, job in workflow.jobs.items():
             steps = all_steps(job)
             agent = [step for step in steps if is_agent_step(step)]
@@ -54,9 +63,9 @@ def scan_workflow_files(
 
     repo_rules = [rule for rule in rules if rule.check in REPO_CHECKS]
     if repo_rules:
-        repo_ctx = RepoContext(workflows=workflows, root=root or Path.cwd())
+        repo_ctx = RepoContext(workflows=workflows, root=root)
         for rule in repo_rules:
             findings.extend(REPO_CHECKS[rule.check](repo_ctx, rule))
 
     findings.sort(key=lambda f: (f.severity.rank, f.rule_id, str(f.workflow), f.job))
-    return ScanResult(root=root or Path.cwd(), findings=findings, workflows_scanned=scanned)
+    return ScanResult(root=root, findings=findings, workflows_scanned=len(workflows))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import typer
@@ -12,7 +13,7 @@ from rich.table import Table
 from . import __version__
 from .engine import scan as run_scan
 from .models import severity_from
-from .report import render_text, to_json, to_sarif
+from .report import fingerprint, render_text, to_json, to_sarif
 from .rules import load_rules
 
 app = typer.Typer(
@@ -49,6 +50,17 @@ def _root(
     """Guard the agent harness in your CI."""
 
 
+def load_baseline(path: Path) -> set[str]:
+    """Finding fingerprints from a previous ``--format json`` run."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    entries = data.get("findings", []) if isinstance(data, dict) else data
+    return {
+        str(entry["fingerprint"])
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("fingerprint")
+    }
+
+
 @app.command()
 def scan(
     paths: list[Path] = typer.Argument(
@@ -59,6 +71,11 @@ def scan(
     ),
     format: str = typer.Option("text", "--format", help=f"{' | '.join(FORMAT_CHOICES)}"),
     sarif: Path | None = typer.Option(None, "--sarif", help="Write SARIF results to this path."),
+    baseline: Path | None = typer.Option(
+        None,
+        "--baseline",
+        help="JSON from a previous --format json run; only new findings are reported and fail CI.",
+    ),
     rules_dir: list[Path] = typer.Option(
         None, "--rules-dir", help="Extra rule directories to overlay on the builtin rules."
     ),
@@ -75,12 +92,28 @@ def scan(
     rules = load_rules(list(rules_dir) if rules_dir else None)
     result = run_scan(target_paths, rules)
 
+    suppressed = 0
+    if baseline is not None:
+        known = load_baseline(baseline)
+        kept = []
+        for finding in result.findings:
+            if fingerprint(finding, result.root) in known:
+                suppressed += 1
+            else:
+                kept.append(finding)
+        result = replace(result, findings=kept)
+
     if sarif is not None:
         sarif.write_text(json.dumps(to_sarif(result), indent=2) + "\n", encoding="utf-8")
 
     if format == "json":
-        console.print_json(json.dumps(to_json(result)))
+        document = to_json(result)
+        if baseline is not None:
+            document["baseline_suppressed"] = suppressed
+        console.print_json(json.dumps(document))
     else:
+        if suppressed:
+            err_console.print(f"baseline: suppressed {suppressed} pre-existing finding(s)")
         render_text(result, console)
 
     if fail_on != "none" and result.has_at_or_above(severity_from(fail_on)):
@@ -104,6 +137,14 @@ def rules_list(
     for rule in rules:
         table.add_row(rule.id, str(rule.severity), rule.owasp, rule.title)
     console.print(table)
+
+
+@app.command()
+def mcp() -> None:
+    """Serve harnessguard over stdio MCP so coding agents can self-lint workflows."""
+    from .mcp_server import serve
+
+    serve()
 
 
 def main() -> None:

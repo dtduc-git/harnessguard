@@ -1,9 +1,13 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
+from typer.testing import CliRunner
+
+from harnessguard.cli import app, load_baseline
 from harnessguard.engine import scan
 from harnessguard.models import Severity
-from harnessguard.report import to_sarif
+from harnessguard.report import fingerprint, to_json, to_sarif
 from harnessguard.rules import load_rules
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
@@ -18,6 +22,7 @@ EXPECTED_VULNERABLE = {
     "HG007",
     "HG008",
     "HG009",
+    "HG010",
 }
 
 
@@ -69,7 +74,7 @@ def test_pull_request_target_finding_reported() -> None:
 
 def test_clean_fixture_still_scans_workflows() -> None:
     result = _scan("clean-repo")
-    assert result.workflows_scanned == 7
+    assert result.workflows_scanned == 8
 
 
 def test_guarded_job_downgrades_privilege_findings() -> None:
@@ -199,6 +204,21 @@ def test_indirectly_guarded_reusable_caller_downgraded() -> None:
     assert "needs: gate" in chains[0].message
 
 
+def test_unpinned_mcp_servers_flagged() -> None:
+    result = _scan("vulnerable-repo")
+    mcp = [f for f in result.findings if f.rule_id == "HG010"]
+    assert mcp, "unpinned MCP server not detected"
+    message = mcp[0].message
+    assert "ols-mcp" in message
+    assert "mcp-remote" in message
+    assert "plaintext HTTP MCP endpoint" in message
+
+
+def test_pinned_and_loopback_mcp_not_flagged() -> None:
+    result = _scan("clean-repo")
+    assert not [f for f in result.findings if f.rule_id == "HG010"]
+
+
 def test_secretless_agent_callee_not_flagged() -> None:
     result = _scan("clean-repo")
     chains = [f for f in result.findings if f.workflow.name == "reusable-open-caller.yml"]
@@ -214,3 +234,36 @@ def test_sarif_contains_rules_and_results() -> None:
     assert EXPECTED_VULNERABLE <= rule_ids
     assert run["results"]
     assert all(result_["level"] in {"error", "warning", "note"} for result_ in run["results"])
+    assert all("partialFingerprints" in result_ for result_ in run["results"])
+
+
+def test_fingerprint_ignores_message_wording() -> None:
+    result = _scan("vulnerable-repo")
+    finding = result.findings[0]
+    clone = replace(finding, message="rewritten", severity=Severity.LOW)
+    assert fingerprint(clone, result.root) == fingerprint(finding, result.root)
+
+
+def test_baseline_json_roundtrip(tmp_path) -> None:
+    result = _scan("vulnerable-repo")
+    document = to_json(result)
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(document), encoding="utf-8")
+    known = load_baseline(baseline)
+    assert known == {entry["fingerprint"] for entry in document["findings"]}
+    assert all(fingerprint(finding, result.root) in known for finding in result.findings)
+
+
+def test_cli_baseline_suppresses_existing_findings(tmp_path) -> None:
+    runner = CliRunner()
+    fixture = str(FIXTURES / "vulnerable-repo")
+    args = ["scan", fixture, "--fail-on", "none", "--format", "json"]
+    first = runner.invoke(app, args, env={"COLUMNS": "400"})
+    assert first.exit_code == 0
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(first.stdout, encoding="utf-8")
+    second = runner.invoke(app, [*args, "--baseline", str(baseline)], env={"COLUMNS": "400"})
+    assert second.exit_code == 0
+    document = json.loads(second.stdout)
+    assert document["findings"] == []
+    assert document["baseline_suppressed"] > 0

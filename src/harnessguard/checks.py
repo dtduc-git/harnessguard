@@ -15,6 +15,9 @@ from .facts import (
     agent_steps,
     job_guards,
     load_workflow,
+    mcp_launch_packages,
+    mcp_plaintext_endpoint,
+    mcp_unpinned,
     references_triggering_run,
     secrets_in_scope,
     steps_using,
@@ -493,6 +496,31 @@ def check_reusable_workflow_chain(ctx: RepoContext, rule: Rule) -> list[Finding]
     return findings
 
 
+def check_mcp_config_hygiene(ctx: JobContext, rule: Rule) -> list[Finding]:
+    """Agent step launches unpinned MCP servers or plaintext MCP endpoints."""
+    findings: list[Finding] = []
+    for step in ctx.agent_steps:
+        problems: list[str] = []
+        for package in mcp_launch_packages(step.text):
+            if mcp_unpinned(package):
+                problems.append(f"unpinned MCP server package {package!r}")
+        if mcp_plaintext_endpoint(step.text):
+            problems.append("plaintext HTTP MCP endpoint")
+        if not problems:
+            continue
+        findings.append(
+            ctx.finding(
+                rule,
+                "Agent step configures MCP servers insecurely: "
+                + "; ".join(problems)
+                + ". Pin MCP server packages to immutable versions (OWASP MCP04 "
+                "supply chain) and use TLS or loopback endpoints for MCP traffic.",
+                step=step,
+            )
+        )
+    return findings
+
+
 CHECKS: dict[str, Callable[[JobContext, Rule], list[Finding]]] = {
     "secrets_untrusted_event": check_secrets_untrusted_event,
     "untrusted_context_flow": check_untrusted_context_flow,
@@ -500,6 +528,7 @@ CHECKS: dict[str, Callable[[JobContext, Rule], list[Finding]]] = {
     "pull_request_target_agent": check_pull_request_target,
     "egress_tool_grants": check_egress_tool_grants,
     "untrusted_checkout_ref": check_untrusted_checkout_ref,
+    "mcp_config_hygiene": check_mcp_config_hygiene,
 }
 
 REPO_CHECKS: dict[str, Callable[[RepoContext, Rule], list[Finding]]] = {

@@ -1,0 +1,19 @@
+name: mcp-agent-pinned
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Review with MCP tools
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: "Review the diff using the MCP tools"
+          claude_args: >-
+            --mcp-config '{"mcpServers": {"fs": {"command": "npx", "args": ["-y",
+            "@modelcontextprotocol/server-filesystem@0.6.2"]},
+            "local": {"url": "http://localhost:3000/sse"}}}'
