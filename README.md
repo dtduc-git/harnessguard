@@ -45,9 +45,13 @@ scanners and per-file linters alike.
 Pass 2.5 looked for the mirror pattern (HG008): untrusted-triggered workflows
 that pass secrets into an agent-bearing reusable workflow. **20 repos** carry
 the chain; **17 of 20** come from the Gemini CLI Action dispatch template.
+MCP hygiene (HG010): **5 unpinned MCP server configurations**, none pinned.
+
+Pass 3 re-fetched the pass-1 corpus with the same engine three days later:
+**97% of files are byte-identical** — zero findings fixed, zero introduced.
 → [State of AI-agent workflows in the wild](research/state-of-agent-workflows.md)
-· reproduce with `uv run python scripts/ecosystem_scan.py` and
-`uv run python scripts/chain_scan.py`
+· reproduce with `uv run python scripts/ecosystem_scan.py`,
+`scripts/chain_scan.py` and `scripts/remediation_scan.py`
 
 ## Install
 

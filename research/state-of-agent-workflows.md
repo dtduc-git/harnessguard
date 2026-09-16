@@ -102,12 +102,50 @@ The inverse of pass 2: instead of asking whether a privileged job consumes untru
 | high | 2 |
 | medium (indirect `needs:` guard upstream) | 52 |
 
+### MCP configuration (HG010)
+
+- **5 agent workflow files** launch MCP servers without an immutable version pin (`uvx ols-mcp`, `npx -y mcp-remote`, `@upstash/context7-mcp`); none of the observed MCP configurations pin a version
+- No plaintext non-loopback MCP endpoints were observed in this corpus
+
 ### Caveats
 
 - Caller→callee resolution is name-based and conservative: an unresolvable or non-local `uses:` target produces no finding.
 - The corpus is fork-heavy; **17 of 20** caller files descend from a single upstream template, so repository counts overstate independent implementations.
 - The indirect-guard downgrade is a one-hop heuristic: upstream jobs guarded in scripts rather than `if:` conditions are not detected, and an upstream guard does not necessarily cover every event path.
 - Agent detection is pattern-based; renamed or wrapped agent invocations inside callees are not counted.
+
+<!-- remediation-scan:start -->
+
+## Re-scan after publication (pass 3)
+
+_Generated 2026-09-16T14:34:22.623413+00:00 with harnessguard 0.6.0. Same corpus as pass 1 (agent-bearing workflow files); each file re-fetched from its repository and compared against the 2026-09-13 snapshot with the same engine._
+
+### Headline
+
+- Files re-checked: **336** of 337 (1 no longer retrievable at the same path)
+- **326** files byte-identical to the 2026-09-13 snapshot (97.0%) — the corpus is largely static
+- **0** files fixed every finding they previously had; **0** gained at least one new finding
+- Files carrying at least one finding: **176 → 176** against the same rule set
+
+### Findings by rule, before → after
+
+| Rule | Files (snapshot) | Files (today) |
+| --- | --- | --- |
+| HG001 | 148 | 148 |
+| HG002 | 20 | 20 |
+| HG003 | 124 | 124 |
+| HG004 | 18 | 18 |
+| HG005 | 52 | 52 |
+| HG006 | 5 | 5 |
+| HG010 | 1 | 1 |
+
+### Caveats
+
+- The window between snapshot and re-scan is three days; a low change rate is expected and does not measure the blog's effect.
+- Files live on default branches; edits can be unrelated to security (dependency bumps, renames, refactors), and repositories can be archived.
+- Repo-level chain rules (HG007–HG009) cannot be evaluated per file and are excluded from this comparison; HG010 is included.
+
+<!-- remediation-scan:end -->
 
 ## Caveats
 

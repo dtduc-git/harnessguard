@@ -127,6 +127,7 @@ cd harnessguard
 uv sync --all-groups
 uv run python scripts/ecosystem_scan.py --per-query 150
 uv run python scripts/chain_scan.py
+uv run python scripts/remediation_scan.py
 ```
 
 ## Update: artifact trust chains (pass 2)
@@ -147,6 +148,33 @@ privileged `workflow_run` consumer fetches it):
 
 Pass-2 aggregates live in the same report:
 [State of AI-agent workflows](research/state-of-agent-workflows.md).
+
+## Update: reusable workflow chains, MCP hygiene, and a 3-day re-scan (v0.6)
+
+Three more questions against the same corpus, with three new rules:
+
+- **Reusable workflow chains (HG008)** — untrusted-triggered workflows that pass
+  secrets into an agent-bearing local reusable workflow. **20 repositories**
+  carry the chain; **17 of 20** descend from a single dispatch template
+  (`secrets: inherit` into `gemini-*.yml` callees). An upstream
+  author-association guard downgrades 52 of 54 findings to medium; the two
+  remaining high findings (a `pull_request_target` review chain and an
+  issue-comment engineer chain) were hand-validated.
+- **MCP hygiene (HG010)** — agent steps launching MCP servers from unpinned
+  packages (`uvx ols-mcp`, `npx -y mcp-remote`) or pointing at plaintext
+  `http://` endpoints. Small but real: five configurations in the agent corpus,
+  all unpinned packages, no pins anywhere.
+- **Pass 3: re-scan after publication** — the 2026-09-13 corpus was re-fetched
+  and re-scanned with the same engine: **336 of 337 files still exist, 97%
+  are byte-identical, zero findings were fixed and zero introduced in three
+  days.** Publication alone does not move a corpus; we will re-run this
+  monthly (the corpus is private, so it runs locally) and report the numbers
+  as they move.
+
+Two adoption features ship alongside: `--baseline` (record today's findings,
+fail CI only on new ones — for repos with existing debt) and `harnessguard mcp`
+(a local stdio MCP server so coding agents can lint the workflows they
+generate before writing them).
 
 ---
 
