@@ -1,0 +1,9 @@
+name: reusable-caller
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  triage:
+    uses: ./.github/workflows/reusable-agent.yml
+    secrets: inherit

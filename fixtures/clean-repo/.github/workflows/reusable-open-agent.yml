@@ -1,0 +1,16 @@
+name: reusable-open-agent
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Draft reply with the agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: "Draft a generic reply for the maintainer to review"
+          claude_args: '--allowedTools "Read"'

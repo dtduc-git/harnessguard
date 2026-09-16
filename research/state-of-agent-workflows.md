@@ -81,6 +81,34 @@ Pass 1 sampled agent workflow files in isolation. HG007 (the Cordyceps pattern) 
 
 <!-- chain-scan:end -->
 
+## Reusable workflow chains (pass 2.5)
+
+_Generated 2026-09-16 with harnessguard 0.5.0, HG008 applied to the same 255-repo corpus as pass 2._
+
+The inverse of pass 2: instead of asking whether a privileged job consumes untrusted artifacts, ask whether an untrusted-triggered workflow passes secrets into an agent-bearing local reusable workflow (`./` or `$/` reference). Per-file scanners see two innocuous files; the Rule of Two violation is the composition.
+
+### Headline
+
+- **20 caller files across 20 repositories** pass secrets from an untrusted trigger into a reusable workflow that runs an agent
+- **1 dominant template**: the Gemini CLI Action dispatch workflow (`gemini-dispatch.yml` and variants) accounts for **17 of 20** — comments or issues dispatch into `gemini-*.yml` callees with `secrets: inherit`
+- **2 remain high** after guard analysis: one `pull_request_target` Codex review chain and one issue-comment Codex engineer chain; both pass an explicit secrets mapping with no visible trigger guard
+- The remaining high finding uses the newer `$/.github/workflows/` self-reference syntax, which static tooling that only understands `./` will not resolve
+- **100%** of chains contain the agent on the callee side — the opposite of pass 2, where every artifact chain was agent-free
+
+### HG008 findings by severity
+
+| Severity | Findings |
+| --- | --- |
+| high | 2 |
+| medium (indirect `needs:` guard upstream) | 52 |
+
+### Caveats
+
+- Caller→callee resolution is name-based and conservative: an unresolvable or non-local `uses:` target produces no finding.
+- The corpus is fork-heavy; **17 of 20** caller files descend from a single upstream template, so repository counts overstate independent implementations.
+- The indirect-guard downgrade is a one-hop heuristic: upstream jobs guarded in scripts rather than `if:` conditions are not detected, and an upstream guard does not necessarily cover every event path.
+- Agent detection is pattern-based; renamed or wrapped agent invocations inside callees are not counted.
+
 ## Caveats
 
 - GitHub code search returns best-match results, not a uniform random sample; popularity and recency skew the corpus.

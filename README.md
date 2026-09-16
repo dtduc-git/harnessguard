@@ -42,6 +42,9 @@ cross-workflow artifact chains (HG007): **5.5% carry the chain**, and every
 chain detected runs **no agent on either side** — a blind spot for agent-only
 scanners and per-file linters alike.
 
+Pass 2.5 looked for the mirror pattern (HG008): untrusted-triggered workflows
+that pass secrets into an agent-bearing reusable workflow. **20 repos** carry
+the chain; **17 of 20** come from the Gemini CLI Action dispatch template.
 → [State of AI-agent workflows in the wild](research/state-of-agent-workflows.md)
 · reproduce with `uv run python scripts/ecosystem_scan.py` and
 `uv run python scripts/chain_scan.py`
@@ -103,8 +106,10 @@ jobs:
 | HG005 | medium | Agent step with shell/network tool grants or egress commands |
 | HG006 | high | Agent job checks out an attacker-controlled ref |
 | HG007 | high | Privileged `workflow_run` job consumes artifacts from untrusted-triggered workflows (Cordyceps chain) |
+| HG008 | high | Untrusted-triggered workflow passes secrets into an agent-bearing reusable workflow |
+| HG009 | high | Agent step consumes artifacts from an untrusted-triggered workflow |
 
-Findings map to the OWASP Top 10 for Agentic Applications (ASI01–ASI03).
+Findings map to the OWASP Top 10 for Agentic Applications (ASI01–ASI05).
 Jobs whose `if:` restricts triggering via `github.actor` / `author_association`
 guards get HG001/HG003 downgraded one level — reduced exposure is still
 flagged, just at lower severity.

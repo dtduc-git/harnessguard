@@ -1,0 +1,20 @@
+name: reusable-notes-agent
+on:
+  workflow_call:
+    secrets:
+      NOTES_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Draft release notes
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.NOTES_KEY }}
+          prompt: "Draft release notes for the maintainer to review"
+          claude_args: '--allowedTools "Read"'

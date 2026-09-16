@@ -8,7 +8,17 @@ from harnessguard.rules import load_rules
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
-EXPECTED_VULNERABLE = {"HG001", "HG002", "HG003", "HG004", "HG005", "HG006", "HG007"}
+EXPECTED_VULNERABLE = {
+    "HG001",
+    "HG002",
+    "HG003",
+    "HG004",
+    "HG005",
+    "HG006",
+    "HG007",
+    "HG008",
+    "HG009",
+}
 
 
 def _scan(name: str):
@@ -40,6 +50,18 @@ def test_untrusted_context_finding_lists_fields() -> None:
     assert any("github.event.issue.body" in f.message for f in contexts)
 
 
+def test_untrusted_context_via_job_env_detected() -> None:
+    result = _scan("vulnerable-repo")
+    env_findings = [
+        f
+        for f in result.findings
+        if f.rule_id == "HG002" and f.workflow.name == "env-scope.yml"
+    ]
+    assert env_findings, "job-level env untrusted context not detected"
+    assert "job-level env" in env_findings[0].message
+    assert "github.event.issue.title" in env_findings[0].message
+
+
 def test_pull_request_target_finding_reported() -> None:
     result = _scan("vulnerable-repo")
     assert any(f.rule_id == "HG004" for f in result.findings)
@@ -47,7 +69,7 @@ def test_pull_request_target_finding_reported() -> None:
 
 def test_clean_fixture_still_scans_workflows() -> None:
     result = _scan("clean-repo")
-    assert result.workflows_scanned == 3
+    assert result.workflows_scanned == 7
 
 
 def test_guarded_job_downgrades_privilege_findings() -> None:
@@ -122,6 +144,65 @@ def test_same_run_artifact_download_not_flagged() -> None:
 def test_trusted_artifact_producer_not_flagged() -> None:
     result = _scan("clean-repo")
     assert not [f for f in result.findings if f.rule_id == "HG007"]
+
+
+def test_agent_consuming_untrusted_artifact_flagged() -> None:
+    result = _scan("vulnerable-repo")
+    consumers = [
+        f
+        for f in result.findings
+        if f.rule_id == "HG009" and f.workflow.name == "artifact-agent-consumer.yml"
+    ]
+    assert consumers, "agent consuming untrusted artifact not detected"
+    assert "artifact-producer" in consumers[0].message
+    assert "pull_request" in consumers[0].message
+
+
+def test_reusable_workflow_secret_chain_flagged() -> None:
+    result = _scan("vulnerable-repo")
+    chains = [
+        f
+        for f in result.findings
+        if f.rule_id == "HG008" and f.workflow.name == "reusable-caller.yml"
+    ]
+    assert chains, "untrusted caller passing secrets into agent callee not detected"
+    assert chains[0].severity == Severity.HIGH
+    assert "secrets: inherit" in chains[0].message
+    assert "reusable-agent.yml" in chains[0].message
+
+
+def test_trusted_reusable_caller_not_flagged() -> None:
+    result = _scan("clean-repo")
+    assert not [f for f in result.findings if f.rule_id == "HG008"]
+
+
+def test_dollar_prefix_reusable_caller_flagged() -> None:
+    result = _scan("vulnerable-repo")
+    chains = [
+        f
+        for f in result.findings
+        if f.rule_id == "HG008" and f.workflow.name == "reusable-dollar-caller.yml"
+    ]
+    assert chains, "$/ reusable workflow reference not resolved"
+    assert "reusable-agent.yml" in chains[0].message
+
+
+def test_indirectly_guarded_reusable_caller_downgraded() -> None:
+    result = _scan("vulnerable-repo")
+    chains = [
+        f
+        for f in result.findings
+        if f.rule_id == "HG008" and f.workflow.name == "reusable-guarded-caller.yml"
+    ]
+    assert chains, "guarded reusable chain not detected"
+    assert chains[0].severity == Severity.MEDIUM
+    assert "needs: gate" in chains[0].message
+
+
+def test_secretless_agent_callee_not_flagged() -> None:
+    result = _scan("clean-repo")
+    chains = [f for f in result.findings if f.workflow.name == "reusable-open-caller.yml"]
+    assert not chains, [f.to_dict() for f in chains]
 
 
 def test_sarif_contains_rules_and_results() -> None:

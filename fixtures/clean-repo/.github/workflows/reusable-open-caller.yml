@@ -1,0 +1,9 @@
+name: reusable-open-caller
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  reply:
+    uses: ./.github/workflows/reusable-open-agent.yml
+    secrets: inherit

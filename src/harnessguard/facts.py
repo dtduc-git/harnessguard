@@ -243,6 +243,15 @@ def untrusted_context_hits(text: str) -> list[str]:
     return sorted({match.group(0) for match in UNTRUSTED_CONTEXT_RE.finditer(text)})
 
 
+def untrusted_context_hits_in(value: Any) -> list[str]:
+    """Untrusted event references nested inside a mapping (``env:`` blocks)."""
+    try:
+        text = yaml.safe_dump(value, default_flow_style=False)
+    except yaml.YAMLError:  # pragma: no cover - defensive
+        text = str(value)
+    return untrusted_context_hits(text)
+
+
 def job_guards(job: dict[str, Any]) -> list[str]:
     """Job-level ``if:`` guards that restrict who can trigger the job."""
     condition = str(job.get("if", ""))

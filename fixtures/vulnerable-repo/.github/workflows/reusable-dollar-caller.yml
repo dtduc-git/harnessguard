@@ -1,0 +1,9 @@
+name: reusable-dollar-caller
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  triage:
+    uses: $/.github/workflows/reusable-agent.yml
+    secrets: inherit

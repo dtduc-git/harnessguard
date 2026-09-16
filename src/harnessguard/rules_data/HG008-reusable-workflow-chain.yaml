@@ -1,0 +1,21 @@
+id: HG008
+title: Untrusted-triggered workflow passes secrets into an agent-bearing reusable workflow
+severity: high
+check: reusable_workflow_chain
+owasp: "ASI03 Identity & Privilege Abuse / ASI04 Agentic Supply Chain Vulnerabilities"
+description: >
+  A workflow triggered by attacker-controlled input (issues, comments,
+  pull_request_target) calls a local reusable workflow (``./.github/workflows/``
+  or the newer ``$/.github/workflows/`` self-reference) with ``secrets:
+  inherit`` or an explicit secrets mapping, and the callee runs an AI agent.
+  Each file is reasonable in isolation; the Rule of Two violation lives in the
+  composition, so per-file scanners see nothing. The agent receives
+  attacker-influenced input while the caller's full secret set is in scope.
+remediation: >
+  Do not pass secrets to agent-bearing reusable workflows from untrusted
+  triggers. Split the flow: an unprivileged agent workflow on untrusted events,
+  then a separate privileged workflow (workflow_run or dispatch after review)
+  that receives nothing attacker-controllable. If secrets must flow, gate the
+  calling job and keep the callee agent tooling read-only.
+params:
+  guard_downgrade: true

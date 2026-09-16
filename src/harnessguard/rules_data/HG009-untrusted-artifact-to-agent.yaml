@@ -1,0 +1,17 @@
+id: HG009
+title: Agent step consumes artifacts from an untrusted-triggered workflow
+severity: high
+check: untrusted_artifact_to_agent
+owasp: "ASI01 Agent Goal Hijack / ASI04 Agentic Supply Chain Vulnerabilities"
+description: >
+  The mirror image of the Cordyceps chain (HG007): instead of a privileged
+  job, the consumer of an attacker-influenced artifact is the agent itself. A
+  workflow triggered by pull_request, issues or comments uploads an artifact;
+  a workflow_run consumer downloads that artifact from the triggering run and
+  feeds it to an agent. Poisoned files become instructions or tool input the
+  agent obeys — untrusted input meeting an agent, composed across two files.
+remediation: >
+  Treat artifacts from untrusted-triggered runs as attacker content: verify the
+  producing run (actor association, head repository) before fetching, treat the
+  content as data rather than instructions, and keep the consuming agent job
+  secret-free and read-only so a poisoned artifact cannot escalate.

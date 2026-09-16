@@ -1,0 +1,9 @@
+name: reusable-notes-caller
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notes:
+    uses: ./.github/workflows/reusable-notes-agent.yml
+    secrets: inherit

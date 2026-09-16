@@ -1,0 +1,20 @@
+name: artifact-agent-consumer
+on:
+  workflow_run:
+    workflows: [artifact-producer]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build output from the triggering run
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Summarize with the Claude CLI
+        run: claude -p "Summarize the report in build-output/"

@@ -12,11 +12,14 @@ from .facts import (
     ARTIFACT_SOURCE_EVENTS,
     UNTRUSTED_EVENTS,
     Workflow,
+    agent_steps,
     job_guards,
+    load_workflow,
     references_triggering_run,
     secrets_in_scope,
     steps_using,
     untrusted_context_hits,
+    untrusted_context_hits_in,
     untrusted_ref_hits,
     workflow_run_filters,
     write_scopes,
@@ -129,8 +132,23 @@ def check_secrets_untrusted_event(ctx: JobContext, rule: Rule) -> list[Finding]:
 
 
 def check_untrusted_context_flow(ctx: JobContext, rule: Rule) -> list[Finding]:
-    """Attacker-controlled event fields interpolated into an agent step."""
+    """Attacker-controlled event fields reaching the agent, directly or via env."""
     findings: list[Finding] = []
+    for label, value in (
+        ("job-level env", ctx.job.get("env", {})),
+        ("workflow-level env", ctx.workflow.raw.get("env", {})),
+    ):
+        hits = untrusted_context_hits_in(value)
+        if hits:
+            findings.append(
+                ctx.finding(
+                    rule,
+                    f"Agent job reads attacker-controlled event data via {label}: "
+                    + ", ".join(hits)
+                    + ". Treat event text as data, not instructions; keep this job "
+                    "unprivileged and secret-free (Rule of Two).",
+                )
+            )
     for step in ctx.agent_steps:
         hits = untrusted_context_hits(step.text)
         if not hits:
@@ -237,6 +255,30 @@ def check_untrusted_checkout_ref(ctx: JobContext, rule: Rule) -> list[Finding]:
     return findings
 
 
+def _untrusted_artifact_producers(workflows: list[Workflow]) -> dict[str, Workflow]:
+    """Workflows an attacker can trigger that upload an artifact, keyed by name."""
+    producers: dict[str, Workflow] = {}
+    for workflow in workflows:
+        if not workflow.untrusted_artifact_source:
+            continue
+        if not any(steps_using(job, UPLOAD_ARTIFACT) for job in workflow.jobs.values()):
+            continue
+        for key in {str(workflow.raw.get("name", "")), workflow.path.stem}:
+            if key:
+                producers.setdefault(key, workflow)
+    return producers
+
+
+def _match_producers(workflow: Workflow, producers: dict[str, Workflow]) -> list[Workflow]:
+    """Untrusted producers a ``workflow_run`` consumer listens to ([] if none)."""
+    filters = workflow_run_filters(workflow.raw)
+    if filters is None:
+        return []
+    if filters:
+        return [producers[name] for name in filters if name in producers]
+    return list(dict.fromkeys(producers.values()))
+
+
 def check_artifact_trust_chain(ctx: RepoContext, rule: Rule) -> list[Finding]:
     """Privileged ``workflow_run`` job consumes artifacts from untrusted runs.
 
@@ -245,26 +287,11 @@ def check_artifact_trust_chain(ctx: RepoContext, rule: Rule) -> list[Finding]:
     ``workflow_run``. Neither file is exploitable alone — the risk lives in the
     composition, which per-file scanners do not see.
     """
-    producers: dict[str, Workflow] = {}
-    for workflow in ctx.workflows:
-        if not workflow.untrusted_artifact_source:
-            continue
-        if not any(steps_using(job, UPLOAD_ARTIFACT) for job in workflow.jobs.values()):
-            continue
-        for key in {str(workflow.raw.get("name", "")), workflow.path.stem}:
-            if key:
-                producers.setdefault(key, workflow)
+    producers = _untrusted_artifact_producers(ctx.workflows)
 
     findings: list[Finding] = []
     for workflow in ctx.workflows:
-        filters = workflow_run_filters(workflow.raw)
-        if filters is None:
-            continue
-        matches = (
-            [producers[name] for name in filters if name in producers]
-            if filters
-            else list(dict.fromkeys(producers.values()))
-        )
+        matches = _match_producers(workflow, producers)
         if not matches:
             continue
         source = matches[0]
@@ -314,6 +341,158 @@ def check_artifact_trust_chain(ctx: RepoContext, rule: Rule) -> list[Finding]:
     return findings
 
 
+def check_untrusted_artifact_to_agent(ctx: RepoContext, rule: Rule) -> list[Finding]:
+    """Agent step consumes artifacts produced by an untrusted-triggered run.
+
+    The mirror image of HG007: instead of a privileged job, the consumer is the
+    agent itself. Poisoned artifact content reaches the agent as instructions
+    or tool input — untrusted input meeting an agent, the first two legs of the
+    Rule of Two, composed across two files.
+    """
+    producers = _untrusted_artifact_producers(ctx.workflows)
+    if not producers:
+        return []
+    findings: list[Finding] = []
+    for workflow in ctx.workflows:
+        matches = _match_producers(workflow, producers)
+        if not matches:
+            continue
+        source = matches[0]
+        events = ", ".join(sorted(source.events & ARTIFACT_SOURCE_EVENTS))
+        for job_name, job in workflow.jobs.items():
+            agent = agent_steps(job)
+            if not agent:
+                continue
+            fetches = [
+                step
+                for step in steps_using(job, DOWNLOAD_ARTIFACT)
+                if references_triggering_run(step.raw, job)
+            ]
+            if not fetches:
+                continue
+            message = (
+                f"Agent step consumes artifacts from the run of untrusted-triggered "
+                f"workflow {source.path.name!r} ({events}). Artifact content is "
+                "attacker-influenced: poisoned files become instructions or tool "
+                "input the agent obeys (Rule of Two leg one reaches the agent). "
+                "Validate the producing run (actor association, head repository) "
+                "and treat artifact content as untrusted data, not instructions."
+            )
+            findings.append(
+                ctx.finding(
+                    rule,
+                    message,
+                    workflow=workflow,
+                    job=job_name,
+                    step=agent[0].name,
+                )
+            )
+    return findings
+
+
+REUSABLE_WORKFLOW_PREFIXES = ("./.github/workflows/", "$/.github/workflows/")
+
+
+def _repo_root(workflow: Workflow, fallback: Path) -> Path:
+    path = workflow.path.resolve()
+    if path.parent.name == "workflows" and path.parent.parent.name == ".github":
+        return path.parent.parent.parent
+    return fallback
+
+
+def _resolve_callee(workflow: Workflow, root: Path, target: str) -> Path | None:
+    relative = target.removeprefix("./").removeprefix("$/")
+    candidates = [
+        _repo_root(workflow, root) / relative,
+        workflow.path.parent / Path(relative).name,
+    ]
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _caller_guard_note(workflow_raw: dict, job: dict, rule: Rule) -> str | None:
+    if not rule.params.get("guard_downgrade"):
+        return None
+    guards = job_guards(job)
+    if guards:
+        return (
+            f" Calling job has an `if:` guard ({', '.join(guards)}); exposure is "
+            "reduced but not eliminated."
+        )
+    if "needs." not in str(job.get("if", "")):
+        return None
+    needs = job.get("needs")
+    needed = [needs] if isinstance(needs, str) else needs if isinstance(needs, list) else []
+    upstream_jobs = workflow_raw.get("jobs", {})
+    for name in needed:
+        upstream = upstream_jobs.get(name) if isinstance(upstream_jobs, dict) else None
+        upstream_guards = job_guards(upstream) if isinstance(upstream, dict) else []
+        if upstream_guards:
+            return (
+                f" Calling job is gated indirectly via `needs: {name}`, whose `if:` "
+                f"restricts triggering ({', '.join(upstream_guards)}); exposure is "
+                "reduced but not eliminated (other event paths may bypass the guard)."
+            )
+    return None
+
+
+def check_reusable_workflow_chain(ctx: RepoContext, rule: Rule) -> list[Finding]:
+    """Untrusted caller passes secrets to an agent-bearing reusable workflow.
+
+    HG001 split across two files: the caller is triggered by issues, comments
+    or similar, and hands its secrets to a ``workflow_call`` workflow that runs
+    an agent. Each file looks harmless alone; per-file scanners miss the chain.
+    """
+    findings: list[Finding] = []
+    for workflow in ctx.workflows:
+        if not workflow.untrusted:
+            continue
+        events = ", ".join(sorted(workflow.events & UNTRUSTED_EVENTS))
+        for job_name, job in workflow.jobs.items():
+            target = str(job.get("uses", ""))
+            if not target.startswith(REUSABLE_WORKFLOW_PREFIXES):
+                continue
+            if not job.get("secrets"):
+                continue
+            callee_path = _resolve_callee(workflow, ctx.root, target)
+            callee = load_workflow(callee_path) if callee_path is not None else None
+            if callee is None:
+                continue
+            agent_jobs = {
+                name: agent_steps(job_raw)
+                for name, job_raw in callee.jobs.items()
+                if agent_steps(job_raw) and secrets_in_scope(callee.raw, job_raw)
+            }
+            if not agent_jobs:
+                continue
+            callee_job = next(iter(agent_jobs))
+            agent = agent_jobs[callee_job][0]
+            passed = (
+                "`secrets: inherit`"
+                if job.get("secrets") == "inherit"
+                else "an explicit secrets mapping"
+            )
+            note = _caller_guard_note(workflow.raw, job, rule)
+            message = (
+                f"Untrusted-triggered workflow ({events}) calls reusable workflow "
+                f"{target!r} with {passed}, and that workflow runs an agent "
+                f"({agent.name!r} in job {callee_job!r}). Attacker-influenced input "
+                "passes into an agent-bearing workflow with the caller's secrets in "
+                "scope, and no single file shows the violation. Keep agent workflows "
+                "secret-free; pass secrets only to non-agent jobs after validation."
+                + (note or "")
+            )
+            findings.append(
+                ctx.finding(
+                    rule,
+                    message,
+                    workflow=workflow,
+                    job=job_name,
+                    severity=rule.severity.weaken() if note else None,
+                )
+            )
+    return findings
+
+
 CHECKS: dict[str, Callable[[JobContext, Rule], list[Finding]]] = {
     "secrets_untrusted_event": check_secrets_untrusted_event,
     "untrusted_context_flow": check_untrusted_context_flow,
@@ -325,4 +504,6 @@ CHECKS: dict[str, Callable[[JobContext, Rule], list[Finding]]] = {
 
 REPO_CHECKS: dict[str, Callable[[RepoContext, Rule], list[Finding]]] = {
     "artifact_trust_chain": check_artifact_trust_chain,
+    "untrusted_artifact_to_agent": check_untrusted_artifact_to_agent,
+    "reusable_workflow_chain": check_reusable_workflow_chain,
 }
