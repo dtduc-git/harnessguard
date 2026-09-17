@@ -1,6 +1,6 @@
 {
   "sample": {
-    "generatedAt": "2026-09-17T11:22:27.712047+00:00",
+    "generatedAt": "2026-09-17T11:27:14.600200+00:00",
     "perQuery": {
       "mcpServers path:.github/workflows": 85,
       "mcp-config path:.github/workflows": 61,
@@ -5754,7 +5754,7 @@
           "severity": "medium",
           "job": "assess-deployment-risk",
           "step": "Run Claude Code Risk Assessment",
-          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package 'mcp-remote@latest'; unpinned MCP server package 'secrets.mcpUrl'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package 'mcp-remote@latest'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },

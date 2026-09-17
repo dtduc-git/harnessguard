@@ -31,6 +31,7 @@ AGENT_ACTION_PATTERNS = (
     r"copilot-coding-agent",
     r"coderabbitai/",
     r"graphite-app/",
+    r"qwenlm/qwen-code-action",
 )
 
 #: Shell invocations that identify an AI agent CLI step.

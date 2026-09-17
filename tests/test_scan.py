@@ -226,6 +226,13 @@ def test_cursor_agent_cli_detected() -> None:
     assert not is_agent_step(Step(name="run", raw={"run": "cursor-agent models"}))
 
 
+def test_qwen_code_action_detected() -> None:
+    from harnessguard.facts import Step, is_agent_step
+
+    step = Step(name="qwen", raw={"uses": "QwenLM/qwen-code-action@v1"})
+    assert is_agent_step(step)
+
+
 def test_scoped_mcp_packages_detected_with_pin_state() -> None:
     from harnessguard.facts import mcp_launch_packages, mcp_unpinned
 

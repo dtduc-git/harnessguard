@@ -151,7 +151,7 @@ _Generated 2026-09-16T14:34:22.623413+00:00 with harnessguard 0.6.0. Same corpus
 
 ## Fresh sample (pass 4)
 
-_Generated 2026-09-17T11:22:27.712047+00:00 with harnessguard 0.6.2. New code-search queries targeting MCP configuration, agentic-workflow surfacing and newer agent CLIs. Per-file rules only; repository-level chain rules (HG007–HG009) are measured by the scans above._
+_Generated 2026-09-17T11:27:14.600200+00:00 with harnessguard 0.6.3. New code-search queries targeting MCP configuration, agentic-workflow surfacing and newer agent CLIs. Per-file rules only; repository-level chain rules (HG007–HG009) are measured by the scans above._
 
 | Query | Candidates selected |
 | --- | --- |
@@ -187,6 +187,7 @@ _Generated 2026-09-17T11:22:27.712047+00:00 with harnessguard 0.6.2. New code-se
 ### Caveats
 
 - New queries change what the sample selects; percentages are not directly comparable with pass 1 — compare rule shares, not absolute counts.
+- The MCP queries deliberately over-sample agent workflows that configure MCP servers: the HG010 share describes this query-selected sample, not the population of agent workflows.
 - The MCP queries select files that *mention* MCP configuration even when no agent runs in them; only files with a detected agent step are counted.
 - HG010 fires on unpinned packages and non-loopback plaintext endpoints; pinned servers and loopback endpoints are not counted.
 - Best-match sampling; the corpus is fork-heavy, so repository counts overstate independent implementations.
