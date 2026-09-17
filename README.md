@@ -49,6 +49,12 @@ MCP hygiene (HG010): **5 unpinned MCP server configurations**, none pinned.
 
 Pass 3 re-fetched the pass-1 corpus with the same engine three days later:
 **97% of files are byte-identical** — zero findings fixed, zero introduced.
+
+Pass 4 re-ran the pipeline with new queries (MCP configuration, agentic
+workflows, newer agent CLIs): **108 agent files from 87 repos**, ~90% new
+material. **21% launch unpinned MCP servers** (query-biased sample; see the
+report caveats). Validating the sample caught three HG010 false-positive
+classes and a missing agent action, fixed in 0.6.2–0.6.4.
 → [State of AI-agent workflows in the wild](research/state-of-agent-workflows.md)
 · reproduce with `uv run python scripts/ecosystem_scan.py`,
 `scripts/chain_scan.py` and `scripts/remediation_scan.py`

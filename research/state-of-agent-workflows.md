@@ -151,7 +151,7 @@ _Generated 2026-09-16T14:34:22.623413+00:00 with harnessguard 0.6.0. Same corpus
 
 ## Fresh sample (pass 4)
 
-_Generated 2026-09-17T11:27:14.600200+00:00 with harnessguard 0.6.3. New code-search queries targeting MCP configuration, agentic-workflow surfacing and newer agent CLIs. Per-file rules only; repository-level chain rules (HG007–HG009) are measured by the scans above._
+_Generated 2026-09-17T11:31:26.801756+00:00 with harnessguard 0.6.4. New code-search queries targeting MCP configuration, agentic-workflow surfacing and newer agent CLIs. Per-file rules only; repository-level chain rules (HG007–HG009) are measured by the scans above._
 
 | Query | Candidates selected |
 | --- | --- |
@@ -165,24 +165,24 @@ _Generated 2026-09-17T11:27:14.600200+00:00 with harnessguard 0.6.3. New code-se
 
 ### Headline
 
-- Agent workflow files: **96** from **81** repos — **11** already present in the pass-1 corpus
-- **61.5%** have at least one rule-of-two finding
-- **41.7%** combine untrusted events with runner secrets or write permissions (HG001/HG003)
-- **3.1%** interpolate attacker-controlled event data into agent steps (HG002)
-- **3.1%** run an agent on `pull_request_target` (HG004)
-- **24.0%** launch unpinned MCP servers or plaintext MCP endpoints (HG010)
+- Agent workflow files: **108** from **87** repos — **11** already present in the pass-1 corpus
+- **59.3%** have at least one rule-of-two finding
+- **40.7%** combine untrusted events with runner secrets or write permissions (HG001/HG003)
+- **2.8%** interpolate attacker-controlled event data into agent steps (HG002)
+- **5.6%** run an agent on `pull_request_target` (HG004)
+- **21.3%** launch unpinned MCP servers or plaintext MCP endpoints (HG010)
 
 ### Findings by rule
 
 | Rule | Files affected | Share of agent files |
 | --- | --- | --- |
-| HG001 | 40 | 41.7% |
-| HG005 | 40 | 41.7% |
-| HG003 | 37 | 38.5% |
-| HG010 | 23 | 24.0% |
-| HG006 | 5 | 5.2% |
-| HG004 | 3 | 3.1% |
-| HG002 | 3 | 3.1% |
+| HG001 | 44 | 40.7% |
+| HG005 | 44 | 40.7% |
+| HG003 | 41 | 38.0% |
+| HG010 | 23 | 21.3% |
+| HG004 | 6 | 5.6% |
+| HG006 | 5 | 4.6% |
+| HG002 | 3 | 2.8% |
 
 ### Caveats
 

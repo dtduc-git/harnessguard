@@ -1,6 +1,6 @@
 {
   "sample": {
-    "generatedAt": "2026-09-17T11:27:14.600200+00:00",
+    "generatedAt": "2026-09-17T11:31:26.801756+00:00",
     "perQuery": {
       "mcpServers path:.github/workflows": 85,
       "mcp-config path:.github/workflows": 61,
@@ -11,7 +11,7 @@
       "cursor-agent path:.github/workflows": 63
     },
     "filesParsed": 492,
-    "agentFiles": 96,
+    "agentFiles": 108,
     "failures": 12
   },
   "records": [
@@ -7911,7 +7911,7 @@
         "workflow_dispatch"
       ],
       "untrustedEvents": [],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": false,
       "rules": [],
       "findings": []
@@ -8054,10 +8054,20 @@
         "workflow_dispatch"
       ],
       "untrustedEvents": [],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": false,
-      "rules": [],
-      "findings": []
+      "rules": [
+        "HG005"
+      ],
+      "findings": [
+        {
+          "rule": "HG005",
+          "severity": "medium",
+          "job": "follow-up-issues",
+          "step": "Run Qwen issue follow-up",
+          "message": "Agent step can execute commands or reach the network (git/gh write command). Prefer a narrow tool allowlist; egress is the third leg of the Rule of Two."
+        }
+      ]
     },
     {
       "repo": "QwenLM/qwen-code",
@@ -8253,10 +8263,44 @@
       "untrustedEvents": [
         "pull_request_target"
       ],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": true,
-      "rules": [],
-      "findings": []
+      "rules": [
+        "HG001",
+        "HG003",
+        "HG004",
+        "HG005"
+      ],
+      "findings": [
+        {
+          "rule": "HG001",
+          "severity": "high",
+          "job": "review-pr",
+          "step": "",
+          "message": "Agent step runs on untrusted events (pull_request_target) while secrets.GITHUB_TOKEN, secrets.OPENAI_API_KEY, secrets.OPENAI_BASE_URL, secrets.OPENAI_MODEL is in scope. Injected instructions in the event payload can read and exfiltrate these credentials. Job-level `if:` guard restricts triggering (author association check); exposure is reduced but not eliminated (compromised accounts, indirect injection)."
+        },
+        {
+          "rule": "HG004",
+          "severity": "high",
+          "job": "review-pr",
+          "step": "",
+          "message": "Agent step runs in a pull_request_target workflow, which exposes secrets and write tokens to fork pull requests. Do not run agents on this trigger; use pull_request and isolate privileged follow-up in workflow_run."
+        },
+        {
+          "rule": "HG003",
+          "severity": "medium",
+          "job": "review-pr",
+          "step": "",
+          "message": "Agent step runs on untrusted events (pull_request_target) with write permissions: id-token, issues, pull-requests. A hijacked agent can push commits, comments or releases with the workflow token. Job-level `if:` guard restricts triggering (author association check); exposure is reduced but not eliminated (compromised accounts, indirect injection)."
+        },
+        {
+          "rule": "HG005",
+          "severity": "medium",
+          "job": "review-pr",
+          "step": "Run Qwen PR Review",
+          "message": "Agent step can execute commands or reach the network (git/gh write command). Prefer a narrow tool allowlist; egress is the third leg of the Rule of Two."
+        }
+      ]
     },
     {
       "repo": "rullerzhou-afk/clawd-on-desk",
@@ -8380,10 +8424,44 @@
       "untrustedEvents": [
         "pull_request_target"
       ],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": true,
-      "rules": [],
-      "findings": []
+      "rules": [
+        "HG001",
+        "HG003",
+        "HG004",
+        "HG005"
+      ],
+      "findings": [
+        {
+          "rule": "HG001",
+          "severity": "high",
+          "job": "review-pr",
+          "step": "",
+          "message": "Agent step runs on untrusted events (pull_request_target) while secrets.GITHUB_TOKEN, secrets.OPENAI_API_KEY, secrets.OPENAI_BASE_URL, secrets.OPENAI_MODEL is in scope. Injected instructions in the event payload can read and exfiltrate these credentials. Job-level `if:` guard restricts triggering (author association check); exposure is reduced but not eliminated (compromised accounts, indirect injection)."
+        },
+        {
+          "rule": "HG004",
+          "severity": "high",
+          "job": "review-pr",
+          "step": "",
+          "message": "Agent step runs in a pull_request_target workflow, which exposes secrets and write tokens to fork pull requests. Do not run agents on this trigger; use pull_request and isolate privileged follow-up in workflow_run."
+        },
+        {
+          "rule": "HG003",
+          "severity": "medium",
+          "job": "review-pr",
+          "step": "",
+          "message": "Agent step runs on untrusted events (pull_request_target) with write permissions: id-token, issues, pull-requests. A hijacked agent can push commits, comments or releases with the workflow token. Job-level `if:` guard restricts triggering (author association check); exposure is reduced but not eliminated (compromised accounts, indirect injection)."
+        },
+        {
+          "rule": "HG005",
+          "severity": "medium",
+          "job": "review-pr",
+          "step": "Run Qwen PR Review",
+          "message": "Agent step can execute commands or reach the network (git/gh write command). Prefer a narrow tool allowlist; egress is the third leg of the Rule of Two."
+        }
+      ]
     },
     {
       "repo": "Tram-ai/tram",
@@ -8400,10 +8478,44 @@
       "untrustedEvents": [
         "pull_request_target"
       ],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": true,
-      "rules": [],
-      "findings": []
+      "rules": [
+        "HG001",
+        "HG003",
+        "HG004",
+        "HG005"
+      ],
+      "findings": [
+        {
+          "rule": "HG001",
+          "severity": "high",
+          "job": "review-pr",
+          "step": "",
+          "message": "Agent step runs on untrusted events (pull_request_target) while secrets.GITHUB_TOKEN, secrets.OPENAI_API_KEY, secrets.OPENAI_BASE_URL, secrets.OPENAI_MODEL is in scope. Injected instructions in the event payload can read and exfiltrate these credentials. Job-level `if:` guard restricts triggering (author association check); exposure is reduced but not eliminated (compromised accounts, indirect injection)."
+        },
+        {
+          "rule": "HG004",
+          "severity": "high",
+          "job": "review-pr",
+          "step": "",
+          "message": "Agent step runs in a pull_request_target workflow, which exposes secrets and write tokens to fork pull requests. Do not run agents on this trigger; use pull_request and isolate privileged follow-up in workflow_run."
+        },
+        {
+          "rule": "HG003",
+          "severity": "medium",
+          "job": "review-pr",
+          "step": "",
+          "message": "Agent step runs on untrusted events (pull_request_target) with write permissions: id-token, issues, pull-requests. A hijacked agent can push commits, comments or releases with the workflow token. Job-level `if:` guard restricts triggering (author association check); exposure is reduced but not eliminated (compromised accounts, indirect injection)."
+        },
+        {
+          "rule": "HG005",
+          "severity": "medium",
+          "job": "review-pr",
+          "step": "Run Qwen PR Review",
+          "message": "Agent step can execute commands or reach the network (git/gh write command). Prefer a narrow tool allowlist; egress is the third leg of the Rule of Two."
+        }
+      ]
     },
     {
       "repo": "alibaba/skill-up",
@@ -8656,7 +8768,7 @@
         "workflow_call"
       ],
       "untrustedEvents": [],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": false,
       "rules": [],
       "findings": []
@@ -8688,7 +8800,7 @@
         "workflow_call"
       ],
       "untrustedEvents": [],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": false,
       "rules": [],
       "findings": []
@@ -8789,7 +8901,7 @@
         "workflow_call"
       ],
       "untrustedEvents": [],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": false,
       "rules": [],
       "findings": []
@@ -8913,10 +9025,28 @@
       "untrustedEvents": [
         "issues"
       ],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": false,
-      "rules": [],
-      "findings": []
+      "rules": [
+        "HG001",
+        "HG003"
+      ],
+      "findings": [
+        {
+          "rule": "HG001",
+          "severity": "critical",
+          "job": "triage",
+          "step": "",
+          "message": "Agent step runs on untrusted events (issues) while secrets.QWEN_API_KEY is in scope. Injected instructions in the event payload can read and exfiltrate these credentials."
+        },
+        {
+          "rule": "HG003",
+          "severity": "high",
+          "job": "triage",
+          "step": "",
+          "message": "Agent step runs on untrusted events (issues) with write permissions: issues. A hijacked agent can push commits, comments or releases with the workflow token."
+        }
+      ]
     },
     {
       "repo": "ariffazil/AAA",
@@ -8929,7 +9059,7 @@
         "workflow_dispatch"
       ],
       "untrustedEvents": [],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": false,
       "rules": [],
       "findings": []
@@ -8998,7 +9128,7 @@
         "workflow_dispatch"
       ],
       "untrustedEvents": [],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": false,
       "rules": [],
       "findings": []
@@ -9032,7 +9162,7 @@
         "workflow_dispatch"
       ],
       "untrustedEvents": [],
-      "hasAgent": false,
+      "hasAgent": true,
       "guarded": false,
       "rules": [],
       "findings": []

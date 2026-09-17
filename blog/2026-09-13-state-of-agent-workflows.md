@@ -176,6 +176,23 @@ fail CI only on new ones — for repos with existing debt) and `harnessguard mcp
 (a local stdio MCP server so coding agents can lint the workflows they
 generate before writing them).
 
+### Pass 4: fresh queries, newer agents
+
+Re-running the pipeline with queries aimed at MCP configuration, "agentic
+workflow" surfacing and newer agent CLIs (Qwen, Cursor) picked up **108 agent
+files from 87 repos — 90% of them new to the corpus**:
+
+- **41%** still combine untrusted events with secrets or write permissions;
+  **6%** run an agent on `pull_request_target`
+- **21%** of the sample launches unpinned MCP servers (`mcp-remote`,
+  `@modelcontextprotocol/*`, `uvx ols-mcp`) — that share is query-selected, not
+  a population estimate
+- Validating the sample the way we validate a dataset caught **three
+  false-positive classes in the new HG010 rule** (`@modelcontextprotocol/*`
+  scopes were invisible, Claude Code `mcp__server__tool` permission names and
+  `${{ secrets.* }}` expressions parsed as packages) plus a missing agent
+  action (`QwenLM/qwen-code-action`), all fixed before publishing the numbers.
+
 ---
 
 harnessguard is Apache-2.0. Rules are YAML; PRs welcome:
