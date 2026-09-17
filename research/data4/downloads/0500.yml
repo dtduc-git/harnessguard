@@ -1,0 +1,128 @@
+name: Secrets canary
+
+# Catches rotted machinery BEFORE a real workflow trips over it. Every 6
+# hours, validate the secrets and auth the SEO pipeline lives on - the exact
+# failure modes that have burned mornings before:
+# - CLAUDE_CODE_OAUTH_TOKEN missing, line-wrapped, or the wrong paste
+#   (2026-07-17 and 2026-07-20 daily-builder failures)
+# - the backend rejecting a valid SEO_MCP_API_KEY (2026-07-19 auto-merge
+#   failures after the setup-wizard deploy)
+# - CRON_SECRET itself no longer accepted
+# A bad secret saved at 2pm gets flagged by the next canary pass, hours
+# before the 04:00-05:30 UTC builders would have died on it. Outcomes report
+# to the DispatchSEO dashboard banner + alert email, same rails as the crons.
+
+on:
+  schedule:
+    - cron: "43 */6 * * *" # offset off the top-of-the-hour rush
+  workflow_dispatch:
+
+concurrency:
+  group: secrets-canary
+  cancel-in-progress: true
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    # continue-on-error at JOB level: failures report to the dashboard rails
+    # via deploy-check's report mode, so the RUN concluding green here just
+    # stops GitHub from also emailing "Run failed".
+    continue-on-error: true
+    timeout-minutes: 5
+    steps:
+      - name: Validate secrets and backend auth
+        env:
+          CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          SEO_MCP_API_KEY: ${{ secrets.SEO_MCP_API_KEY }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          URL: ${{ vars.BACKEND_URL || 'https://dispatchseo.com' }}
+        run: |
+          # CRON_SECRET first - reporting depends on it. If it's rejected we
+          # can't phone home, so the workflow just goes red (GitHub email).
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "$URL/api/cron/deploy-check?expect=canary-probe") || code=000
+          if [ "$code" != "202" ]; then
+            echo "::error::backend rejected CRON_SECRET (deploy-check probe HTTP $code) - every scheduled cron will fail"
+            exit 1
+          fi
+
+          fail() {
+            echo "::error::$1"
+            curl -sG --max-time 30 -H "Authorization: Bearer $CRON_SECRET" \
+              --data-urlencode "job=secrets-canary" --data-urlencode "fail=$1" \
+              "$URL/api/cron/deploy-check" || true
+            exit 1
+          }
+
+          # Claude token shape. The classic breakage is a paste with a real
+          # newline in it (VS Code terminal line-wrap), which either shifts
+          # the sk-ant-oat prefix or leaves trailing whitespace - both kill
+          # every builder run.
+          if [ -z "$CLAUDE_TOKEN" ]; then
+            fail "CLAUDE_CODE_OAUTH_TOKEN is missing or empty - the SEO builders will fail on their next run. Rerun the setup command from the dashboard."
+          fi
+          if [ "$CLAUDE_TOKEN" != "$(printf %s "$CLAUDE_TOKEN" | tr -d '[:space:]')" ]; then
+            fail "CLAUDE_CODE_OAUTH_TOKEN contains whitespace/newlines (line-wrapped paste) - re-save it piped through tr -d '[:space:]'."
+          fi
+          case "$CLAUDE_TOKEN" in
+            sk-ant-oat*) : ;;
+            *) fail "CLAUDE_CODE_OAUTH_TOKEN does not start with sk-ant-oat (wrong text pasted?) - rerun the setup command from the dashboard." ;;
+          esac
+
+          # Codex key shape - but only when one is set at all. This repo can
+          # build with either agent (projects.agent decides per run), so an
+          # absent OPENAI_API_KEY just means Claude-only; a PRESENT one that is
+          # line-wrapped or the wrong text would kill every Codex run, and
+          # until now nothing checked it (Claude's shape was guarded here since
+          # day one - the asymmetry was the gap).
+          if [ -n "$OPENAI_API_KEY" ]; then
+            if [ "$OPENAI_API_KEY" != "$(printf %s "$OPENAI_API_KEY" | tr -d '[:space:]')" ]; then
+              fail "OPENAI_API_KEY contains whitespace/newlines (line-wrapped paste) - re-save it piped through tr -d '[:space:]'."
+            fi
+            case "$OPENAI_API_KEY" in
+              sk-ant-*) fail "OPENAI_API_KEY starts with sk-ant- - that is a Claude credential pasted into the wrong secret. Create a real OpenAI key at platform.openai.com/api-keys." ;;
+              sk-*) : ;;
+              *) fail "OPENAI_API_KEY does not start with sk- (wrong text pasted?) - create a fresh key at platform.openai.com/api-keys and set it again." ;;
+            esac
+          fi
+
+          # Cursor key shape, same if-present rule as Codex above. Two
+          # differences worth knowing before anyone "tightens" this:
+          #
+          # - There is NO prefix to assert. No real Cursor key has been
+          #   observed here, so demanding one would reject every valid key on a
+          #   guess. What IS checked is what is safely knowable: no whitespace,
+          #   long enough to be a credential, and not one of the OTHER agents'
+          #   secrets pasted into the wrong slot - the cross-paste that has
+          #   already bitten this repo twice.
+          # - Liveness is deliberately NOT checked here. `cursor-agent models`
+          #   exits 0 on an invalid key and `cursor-agent status` ignores the
+          #   env var entirely, so a check would have to install the CLI and
+          #   parse text - which seo-token-check already does per project.
+          if [ -n "$CURSOR_API_KEY" ]; then
+            if [ "$CURSOR_API_KEY" != "$(printf %s "$CURSOR_API_KEY" | tr -d '[:space:]')" ]; then
+              fail "CURSOR_API_KEY contains whitespace/newlines (line-wrapped paste) - re-save it piped through tr -d '[:space:]'."
+            fi
+            case "$CURSOR_API_KEY" in
+              sk-ant-*) fail "CURSOR_API_KEY starts with sk-ant- - that is a Claude credential in the wrong secret. Cursor keys come from the Cursor dashboard on a paid plan." ;;
+              sk-*) fail "CURSOR_API_KEY starts with sk- - that is an OpenAI key in the wrong secret. Cursor keys come from the Cursor dashboard on a paid plan." ;;
+              ?????????????????????*) : ;;
+              *) fail "CURSOR_API_KEY is too short to be a real key (wrong text pasted?) - create a fresh one in your Cursor dashboard and set it again." ;;
+            esac
+          fi
+
+          # The backend must accept the MCP key - this is the exact call
+          # every agent workflow opens with.
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+            -H "Authorization: Bearer $SEO_MCP_API_KEY" "$URL/api/project-mode") || code=000
+          if [ "$code" != "200" ]; then
+            fail "backend rejected SEO_MCP_API_KEY (project-mode HTTP $code) - every agent workflow will fail"
+          fi
+
+          curl -sG --max-time 30 -H "Authorization: Bearer $CRON_SECRET" \
+            --data-urlencode "job=secrets-canary" --data-urlencode "ok=1" \
+            "$URL/api/cron/deploy-check" || true
+          echo "Canary green: CRON_SECRET accepted, Claude token well-formed, MCP key accepted."

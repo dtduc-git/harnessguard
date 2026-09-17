@@ -1,0 +1,434 @@
+name: Build and Release
+
+on:
+  push:
+    # Branches trigger builds only (no release)
+    # - main: production builds
+    # - beta: beta channel builds
+    branches: [main, beta]
+    # Tags trigger full release workflow
+    # - v1.2.3: stable release
+    # - v1.2.3-beta.1: beta/prerelease
+    tags: ["v*"]
+  # pull_request:
+  #   branches: [main, beta]
+
+permissions:
+  contents: write
+  discussions: write
+  pull-requests: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: stakpak
+
+jobs:
+  # Determine release type once, other jobs reference this
+  setup:
+    runs-on: ubuntu-22.04
+    outputs:
+      is_beta: ${{ steps.check.outputs.is_beta }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Check release type
+        id: check
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          # Remove 'v' prefix if present
+          VERSION=${TAG#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [[ "$TAG" == *"-beta"* ]]; then
+            echo "is_beta=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_beta=false" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact_name: stakpak-linux-x86_64
+            features: --features jemalloc
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact_name: stakpak-linux-aarch64
+            features: --features jemalloc
+            docker: rust:1.94-alpine3.21
+          - os: macos-15
+            target: x86_64-apple-darwin
+            artifact_name: stakpak-darwin-x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact_name: stakpak-darwin-aarch64
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            artifact_name: stakpak-windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        if: ${{ !matrix.docker }}
+        uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        if: ${{ !matrix.docker }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}
+
+      - name: Install MUSL tools
+        if: endsWith(matrix.target, 'linux-musl') && !matrix.docker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Docker cargo cache
+        if: matrix.docker
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo-docker/registry
+            ~/.cargo-docker/git
+          key: docker-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: docker-cargo-${{ matrix.target }}-
+
+      - name: Docker build cache (target dir)
+        if: matrix.docker
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: docker-target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: docker-target-${{ matrix.target }}-
+
+      # Alpine is required for aarch64-musl: Ubuntu's musl-gcc wrapper lacks
+      # C11 atomics support needed by jemalloc and libsql-ffi on ARM.
+      - name: Build and test in Alpine container
+        if: matrix.docker
+        run: |
+          mkdir -p ~/.cargo-docker/registry ~/.cargo-docker/git
+          docker run --rm \
+            --user 0:0 \
+            -v "${{ github.workspace }}:/build" \
+            -w /build \
+            -v "$HOME/.cargo-docker/registry:/usr/local/cargo/registry" \
+            -v "$HOME/.cargo-docker/git:/usr/local/cargo/git" \
+            -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+            ${{ matrix.docker }} sh -c '
+              set -euo pipefail
+              apk add --no-cache gcc musl-dev make binutils pkgconfig openssl-dev openssl-libs-static ca-certificates vim
+              cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+              cargo test --target ${{ matrix.target }} ${{ matrix.features }}
+
+              # Verify jemalloc overrides musl malloc
+              BINARY="target/${{ matrix.target }}/release/stakpak"
+              if nm "$BINARY" 2>/dev/null | grep -q " W malloc$"; then
+                echo "FAIL: jemalloc not overriding musl malloc — SQLite will SIGSEGV"
+                exit 1
+              fi
+              echo "OK: jemalloc override verified"
+            '
+
+      - name: Fix Docker cache permissions
+        if: matrix.docker
+        run: sudo chown -R $(id -u):$(id -g) ~/.cargo-docker
+
+      - name: Build
+        if: ${{ !matrix.docker }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+
+      - name: Run tests
+        if: ${{ !matrix.docker }}
+        run: cargo test --target ${{ matrix.target }} ${{ matrix.features }}
+
+      - name: Verify jemalloc overrides musl malloc
+        if: endsWith(matrix.target, 'linux-musl') && !matrix.docker
+        run: |
+          BINARY="target/${{ matrix.target }}/release/stakpak"
+          if nm "$BINARY" 2>/dev/null | grep -q " W malloc$"; then
+            echo "FAIL: jemalloc not overriding musl malloc — SQLite will SIGSEGV"
+            exit 1
+          fi
+          echo "OK: jemalloc override verified"
+
+      - name: Prepare binary
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            7z a ../../../${{ matrix.artifact_name }}.zip ${{ env.BINARY_NAME }}.exe
+          else
+            tar czf ../../../${{ matrix.artifact_name }}.tar.gz ${{ env.BINARY_NAME }}
+          fi
+
+      - name: Upload artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.*
+          retention-days: 1
+
+  release:
+    needs: [setup, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            stakpak-linux-x86_64/stakpak-linux-x86_64.tar.gz
+            stakpak-linux-aarch64/stakpak-linux-aarch64.tar.gz
+            stakpak-darwin-x86_64/stakpak-darwin-x86_64.tar.gz
+            stakpak-darwin-aarch64/stakpak-darwin-aarch64.tar.gz
+            stakpak-windows-x86_64/stakpak-windows-x86_64.zip
+          draft: false
+          prerelease: ${{ needs.setup.outputs.is_beta == 'true' }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish_crates_io:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Extract version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          # Remove 'v' prefix if present
+          VERSION=${VERSION#v}
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Tag version: $VERSION"
+
+          # Verify version matches Cargo.toml
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "Cargo.toml version: $CARGO_VERSION"
+
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "Warning: Tag version ($VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            echo "Updating Cargo.toml to match tag version"
+            sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          fi
+
+      - name: Login to crates.io
+        run: echo "$CRATES_IO_TOKEN" | cargo login
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Publish workspace members to crates.io
+        run: |
+          set -e
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+
+          echo "Publishing workspace members to crates.io version $VERSION"
+
+          # Function to publish a package, skip if already published
+          publish_package() {
+            local pkg=$1
+            echo "Publishing $pkg..."
+            # Capture output and exit code
+            set +e
+            OUTPUT=$(cargo publish -p "$pkg" --no-verify 2>&1)
+            EXIT_CODE=$?
+            set -e
+
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "$pkg published successfully"
+              echo "Waiting 15s for index propagation..."
+              sleep 15
+            elif echo "$OUTPUT" | grep -q "already uploaded"; then
+              echo "$pkg version $VERSION already published, skipping"
+            else
+              echo "Error publishing $pkg:"
+              echo "$OUTPUT"
+              exit 1
+            fi
+          }
+
+          # Publish dependencies first, then the main crate
+          # Order matters: publish dependencies before dependents
+          publish_package stakai
+          publish_package stakpak-shared
+          publish_package stakpak-api
+          publish_package stakpak-mcp-config
+          publish_package stakpak-mcp-client
+          publish_package stakpak-mcp-server
+          publish_package stakpak-mcp-proxy
+          publish_package stakpak-shell-tool-approvals
+          publish_package stakpak-ak
+          publish_package stakpak-agent-core
+          publish_package stakpak-gateway
+          publish_package stakpak-server
+          publish_package stakpak-tui
+          # Finally publish the main CLI crate
+          publish_package stakpak
+
+          echo "All packages published successfully!"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  docker:
+    needs: [setup, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:v${{ needs.setup.outputs.version }}
+            ${{ needs.setup.outputs.is_beta != 'true' && format('ghcr.io/{0}:latest', github.repository) || '' }}
+
+  update-release-notes:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Need full history for git-cliff
+
+      - name: Install git-cliff
+        run: cargo install git-cliff
+
+      - name: Generate release notes with git-cliff
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          # Get the previous tag to generate notes between tags
+          PREV_TAG=$(git describe --tags --abbrev=0 "$VERSION^" 2>/dev/null || echo "")
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found, skipping release notes generation"
+            exit 0
+          fi
+
+          # Generate notes between previous and current tag
+          git-cliff "$PREV_TAG..$VERSION" --strip all > release_notes.md
+
+          # Check if release notes are empty
+          if [ ! -s release_notes.md ]; then
+            echo "No commits found between $PREV_TAG and $VERSION"
+            exit 0
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update GitHub Release
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+
+          # Check if release notes file exists and has content
+          if [ ! -f release_notes.md ]; then
+            echo "Release notes file not found, skipping update"
+            exit 0
+          fi
+
+          # Check if file is empty or only contains whitespace
+          if [ ! -s release_notes.md ] || ! grep -q '[^[:space:]]' release_notes.md; then
+            echo "Release notes file is empty, skipping update"
+            exit 0
+          fi
+
+          echo "Updating release notes for $VERSION"
+          gh release edit "$VERSION" --notes-file release_notes.md || echo "Failed to update release notes, continuing anyway"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    needs: [setup, release]
+    # Only update homebrew for stable releases (not beta)
+    if: startsWith(github.ref, 'refs/tags/') && needs.setup.outputs.is_beta == 'false'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: stakpak/homebrew-stakpak
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      - name: Update Homebrew formula
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+
+          curl -L "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/stakpak-darwin-x86_64.tar.gz" -o stakpak-darwin-x86_64.tar.gz
+          curl -L "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/stakpak-darwin-aarch64.tar.gz" -o stakpak-darwin-aarch64.tar.gz
+          curl -L "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/stakpak-linux-x86_64.tar.gz" -o stakpak-linux-x86_64.tar.gz
+          curl -L "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/stakpak-linux-aarch64.tar.gz" -o stakpak-linux-aarch64.tar.gz
+
+          SHA256_DARWIN_X64=$(sha256sum stakpak-darwin-x86_64.tar.gz | cut -d ' ' -f 1)
+          SHA256_DARWIN_ARM=$(sha256sum stakpak-darwin-aarch64.tar.gz | cut -d ' ' -f 1)
+          SHA256_LINUX_X64=$(sha256sum stakpak-linux-x86_64.tar.gz | cut -d ' ' -f 1)
+          SHA256_LINUX_ARM=$(sha256sum stakpak-linux-aarch64.tar.gz | cut -d ' ' -f 1)
+
+          cat > stakpak.rb << EOF
+          class Stakpak < Formula
+            desc "Stakpak CLI tool"
+            homepage "https://github.com/stakpak/stakpak"
+            version "${VERSION}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/stakpak-darwin-aarch64.tar.gz"
+                sha256 "${SHA256_DARWIN_ARM}"
+              else
+                url "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/stakpak-darwin-x86_64.tar.gz"
+                sha256 "${SHA256_DARWIN_X64}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/stakpak-linux-aarch64.tar.gz"
+                sha256 "${SHA256_LINUX_ARM}"
+              else
+                url "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/stakpak-linux-x86_64.tar.gz"
+                sha256 "${SHA256_LINUX_X64}"
+              end
+            end
+
+            def install
+              bin.install "stakpak"
+            end
+          end
+          EOF
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add stakpak.rb
+          git commit -m "Update stakpak to v${VERSION}"
+          git push

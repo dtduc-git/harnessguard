@@ -1,0 +1,49 @@
+name: Claude Code Assistants
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt to send to Claude Code Base Action"
+        required: false
+        default: "Audit repository health and summarize open work."
+      allowed_tools:
+        description: "Tools Claude Code Base Action can use"
+        required: false
+        default: "View,GlobTool,GrepTool,Bash(git:*)"
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  claude-code-action:
+    name: Claude Code Action Official
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch'
+    steps:
+      - name: Claude Code Action Official
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+  claude-code-base:
+    name: Claude Code Base Action (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Claude Code Base Action
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          prompt: ${{ github.event.inputs.prompt }}
+          allowed_tools: ${{ github.event.inputs.allowed_tools }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}

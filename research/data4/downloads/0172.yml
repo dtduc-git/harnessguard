@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly: local server still builds; hosted endpoint still answers.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Local server + hosted endpoint smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate manifests
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('server.json','utf8'))"
+          node -e "const g=JSON.parse(require('fs').readFileSync('glama.json','utf8')); if(!Array.isArray(g.maintainers)||!g.maintainers.length) process.exit(1)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Local server, Docker image (initialize -> tools/list -> search)
+        run: |
+          docker build -t vascue-public-knowledge-search .
+          SMOKE_CALL_QUERY="insurance claims automation" node scripts/smoke.mjs docker run -i --rm -e SMOKE_CALL_QUERY vascue-public-knowledge-search
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Local server, bare Python
+        run: |
+          pip install -q -r requirements.txt
+          SMOKE_CALL_QUERY="Cliniko integration" node scripts/smoke.mjs python server.py
+
+      - name: Hosted endpoint health (via mcp-remote bridge)
+        run: node scripts/smoke.mjs npx -y mcp-remote@0.1.38 https://www.vascue.io/mcp/search --transport http-only

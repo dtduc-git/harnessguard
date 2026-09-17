@@ -1,0 +1,63 @@
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read # Required for Claude to read CI results on PRs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # This is an optional setting that allows Claude to read CI results on PRs
+          additional_permissions: |
+            actions: read
+
+          # Claude arguments including MCP config and allowed tools
+          claude_args: |
+            --model claude-opus-4-1-20250805
+            --mcp-config .github/mcp-config.json
+            --allowedTools Bash(pnpm:*)
+            --allowedTools mcp__serena__*
+            --allowedTools mcp__context7__*
+            --allowedTools mcp__sequential-thinking__*
+            --system-prompt "You are operating in remote agent mode with full MCP server access. Use serena MCP for semantic code analysis and project understanding. Use context7 MCP for up-to-date library documentation. Use sequential-thinking MCP for complex problem breakdown and structured analysis. Always leverage these MCP tools to provide deeper insights."
+
+          # Custom environment variables for MCP servers
+          settings: |
+            {
+              "env": {
+                "CONTEXT7_API_KEY": "${{ secrets.CONTEXT7_API_KEY }}"
+              }
+            }

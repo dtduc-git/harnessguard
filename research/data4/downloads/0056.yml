@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run tests and build
+        run: npm run ci
+
+      - name: Create package
+        id: package
+        run: |
+          PACKAGE_FILE=$(npm pack --silent | tail -n1)
+          echo "package-file=$PACKAGE_FILE" >> $GITHUB_OUTPUT
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./${{ steps.package.outputs.package-file }}
+          body: |
+            ## Installation
+
+            ```bash
+            npm install -g olx-mcp
+            ```
+
+            ## Claude Desktop Configuration
+
+            Add to your `claude_desktop_config.json`:
+
+            ```json
+            {
+              "mcpServers": {
+                "olx-mcp": {
+                  "command": "olx-mcp"
+                }
+              }
+            }
+            ```
+
+            ## What's Changed
+
+            - See commit history for detailed changes
+            - Fully compatible with Claude Desktop
+            - Supports all 5 OLX domains (PT, PL, BG, RO, UA)
+
+  # Run package locally before publishing
+  test-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Build and pack
+        run: |
+          npm run ci
+          npm pack
+
+      - name: Test global installation
+        run: |
+          npm install -g ./olx-mcp-*.tgz
+          which olx-mcp
+          olx-mcp --version || echo "Binary installed successfully"

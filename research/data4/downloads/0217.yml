@@ -1,0 +1,245 @@
+name: Mutation Testing
+
+on:
+  # Nightly schedule re-enabled (task #252) after sharding the workflow across
+  # parallel jobs. Pre-sharding, a full run was ~6h09m which exceeded the 6h
+  # GH Actions ceiling on default runners; sharded runs target ~1h30m–2h per
+  # shard with all shards running in parallel. The api/mcp split (5 shards)
+  # followed after the combined api-mcp shard hit the 300-min ceiling.
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save runner minutes when a new
+# commit lands or the workflow is re-dispatched — EXCEPT for scheduled nightly
+# runs. A nightly is the only run we get per day; cancelling it (which happened
+# whenever main re-triggered the group, see task #823) means the break gate
+# never executes. `schedule` runs are therefore never cancelled in-flight; PR /
+# dispatch runs still supersede their own earlier attempts.
+concurrency:
+  group: mutation-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  shard:
+    # Only run on PRs that carry the "mutation" label; always run on schedule
+    # and manual dispatch.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+        contains(github.event.pull_request.labels.*.name, 'mutation'))
+    runs-on: ubuntu-latest
+    # Each shard is a disjoint subset of src/ — see the matrix below for the
+    # exact partitioning. MCP and misc-core are split further after reaching
+    # the 300-minute cap; the first full run (task #823) measured api-routes and
+    # services+db+repos needing ~7h / ~5.5h as single shards, so both are split
+    # so the heaviest job is now ~165 min (api-core / slack).
+    timeout-minutes: 300
+    strategy:
+      # Don't kill sibling shards if one fails — we still want partial reports
+      # for the aggregator and the HTML artifact upload.
+      fail-fast: false
+      matrix:
+        # Shard wall time tracks MUTANT count and the per-mutant test cost, which
+        # varies a LOT by area: the first end-to-end run (task #823, 2026-06-07)
+        # measured ~0.24 min/mutant for api-routes (handler tests boot Fastify)
+        # vs ~0.105 min/mutant for services/db/repos (fast in-memory-DB unit
+        # tests). That run proved the two original mega-shards can't fit the
+        # 300-min GH job ceiling: api-routes (1735 mutants) needs ~7h, and
+        # services+db+repos (3999 mutants) needs ~5.5h. Both are split here so
+        # every shard sits ~120–155 min (est. mutant count + minutes in
+        # comments, derived from the measured rates above).
+        #
+        # Directory globs stay directory-level so new files can't silently fall
+        # out of coverage. Where a directory is split (api/routes, services),
+        # the LAST sub-shard is a CATCH-ALL: it mutates the whole directory glob
+        # minus its siblings via STRYKER_MUTATE_EXCLUDE (negation globs), so a
+        # newly added file in that directory always lands in exactly one shard.
+        shard:
+          - id: 0
+            name: cli
+            globs: 'src/cli/**/*.ts'
+          - id: 1
+            name: api-routes-auth # ~633 mutants, ~152 min
+            globs: 'src/api/routes/auth/**/*.ts'
+          - id: 2
+            name: api-routes-resources # projects+tasks, ~515 mutants, ~124 min
+            globs: 'src/api/routes/projects/**/*.ts src/api/routes/tasks/**/*.ts'
+          - id: 3
+            name: api-routes-rest # CATCH-ALL: routes minus auth/projects/tasks, ~587 mutants, ~141 min
+            globs: 'src/api/routes/**/*.ts'
+            globsExclude: '!src/api/routes/auth/**/*.ts !src/api/routes/projects/**/*.ts !src/api/routes/tasks/**/*.ts'
+          - id: 4
+            name: api-core # plugins+hooks+top-level, ~695 mutants, ~165 min
+            globs: 'src/api/plugins/**/*.ts src/api/hooks/**/*.ts src/api/*.ts'
+          - id: 5
+            name: mcp-task-tools
+            globs: 'src/mcp/tools/task-tools.ts'
+          - id: 6
+            name: services-wsjf-task # wsjf*+task.service, ~1449 mutants, ~152 min
+            globs: 'src/services/wsjf*.ts src/services/task.service.ts'
+          - id: 7
+            name: services-rest # CATCH-ALL: services minus wsjf*/task.service, ~1220 mutants, ~128 min
+            globs: 'src/services/**/*.ts'
+            globsExclude: '!src/services/wsjf*.ts !src/services/task.service.ts'
+          - id: 8
+            name: db-repos # ~1330 mutants, ~140 min
+            globs: 'src/db/**/*.ts src/repositories/**/*.ts'
+          - id: 9
+            name: slack # ~1019 mutants, ~166 min
+            globs: 'src/slack/**/*.ts'
+          - id: 10
+            name: schemas
+            globs: 'src/schemas/**/*.ts'
+          - id: 11
+            name: mcp-other-tools
+            globs: 'src/mcp/tools/**/*.ts'
+            globsExclude: '!src/mcp/tools/task-tools.ts'
+          - id: 12
+            name: mcp-remote
+            globs: 'src/mcp/remote/**/*.ts'
+          - id: 13
+            name: mcp-core
+            globs: 'src/mcp/**/*.ts'
+            globsExclude: '!src/mcp/tools/**/*.ts !src/mcp/remote/**/*.ts'
+          - id: 14
+            name: config
+            globs: 'src/config/**/*.ts'
+          - id: 15
+            name: utils
+            globs: 'src/utils/**/*.ts'
+          - id: 16
+            name: events-types-index
+            globs: 'src/events/**/*.ts src/types/**/*.ts src/index.ts'
+    name: shard-${{ matrix.shard.id }}-${{ matrix.shard.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      # postinstall.cjs is intentionally side-effect-free (#752), so `npm ci`
+      # never produces dist/. Stryker copies the project into its sandbox and
+      # runs the FULL vitest suite as a dry run before mutating; some tests read
+      # packaged build artifacts (e.g. setup.test.ts -> dist/skills/tasks). Build
+      # here so those artifacts exist in the sandbox and the dry run passes —
+      # without this the dry run ENOENTs and every shard fails (task #823).
+      - run: npm run build
+      - name: Run Stryker (shard ${{ matrix.shard.id }} / ${{ matrix.shard.name }})
+        # Shard partitioning is driven by STRYKER_MUTATE_GLOBS — see
+        # stryker.config.js. The CLI --mutate flag does NOT accumulate
+        # (later --mutate overrides earlier ones), so passing per-shard
+        # globs via env is the only reliable approach. Exclusions stay in
+        # stryker.config.js.
+        # --reporters json,clear-text,progress ensures a JSON report is
+        # written at reports/mutation/mutation.json for the aggregator.
+        # STRYKER_DISABLE_BREAK_THRESHOLD=1 tells stryker.config.js to skip
+        # the per-shard break check (a single shard's score is meaningless;
+        # the unified break is enforced by the aggregator job below).
+        # STRYKER_MUTATE_EXCLUDE carries the catch-all negation globs for split
+        # directories (empty for non-split shards) — see stryker.config.js.
+        env:
+          STRYKER_MUTATE_GLOBS: ${{ matrix.shard.globs }}
+          STRYKER_MUTATE_EXCLUDE: ${{ matrix.shard.globsExclude }}
+          STRYKER_DISABLE_BREAK_THRESHOLD: '1'
+        run: |
+          set -euo pipefail
+          npx stryker run --reporters json,clear-text,progress
+      - name: Upload shard JSON report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-shard-${{ matrix.shard.id }}-json
+          path: reports/mutation/mutation.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload shard HTML report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-shard-${{ matrix.shard.id }}-html
+          path: reports/mutation/
+          if-no-files-found: warn
+          retention-days: 30
+
+  aggregate:
+    name: aggregate-and-enforce-threshold
+    needs: shard
+    if: always() && needs.shard.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Require every mutation shard to succeed
+        env:
+          SHARD_RESULT: ${{ needs.shard.result }}
+        run: |
+          if [ "$SHARD_RESULT" != "success" ]; then
+            echo "Mutation coverage is incomplete: shard result=$SHARD_RESULT" >&2
+            exit 1
+          fi
+      - name: Download all shard JSON reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mutation-shard-*-json
+          path: shard-reports/
+      - name: List downloaded shard reports
+        run: ls -lR shard-reports/
+      - name: Aggregate shard reports and enforce break threshold
+        # pipefail is essential: without it the `tee` swallows a non-zero
+        # exit from the aggregator and the workflow silently passes when
+        # the unified score is below threshold.
+        #
+        # Threshold calibration (task #823): this gate had NEVER executed before
+        # this PR (every prior nightly died in Stryker's dry run), so the real
+        # unified mutation score was unknown and the original 75% was a guess. We
+        # set a deliberately conservative initial floor of 50% so the first-ever
+        # green baseline run is not gated on an unverified number — yet the gate
+        # is NOT disabled (a run where half the mutants survive still fails, and
+        # the aggregator hard-fails on zero-covered as a broken-pipeline guard).
+        # The aggregator PRINTS the real score and writes aggregate.json BEFORE
+        # this check, and both are uploaded `if: always()`, so the first run
+        # records the true score. RATCHET PLAN: once that score is observed,
+        # raise this floor toward stryker.config.js `low: 60` / `high: 80` in a
+        # follow-up PR (or add tests to lift the score), never lowering it.
+        run: |
+          set -euo pipefail
+          mkdir -p reports/mutation
+          npx tsx scripts/aggregate-mutation-reports.ts \
+            --threshold 50 --expected-reports 17 \
+            --output reports/mutation/aggregate.json \
+            shard-reports/*/mutation.json | tee reports/mutation/aggregate-summary.txt
+      - name: Append summary to GitHub job summary
+        if: always()
+        run: |
+          set -eu
+          if [ -f reports/mutation/aggregate-summary.txt ]; then
+            {
+              echo '## Unified mutation score'
+              echo ''
+              echo '```'
+              cat reports/mutation/aggregate-summary.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload aggregated report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-aggregate
+          path: reports/mutation/
+          if-no-files-found: warn
+          retention-days: 30

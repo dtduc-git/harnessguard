@@ -1,0 +1,66 @@
+# Optional Cursor SDK cloud agent. Manual dispatch only; does not gate merges.
+name: Cursor agent
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: Parity task to run
+        required: true
+        type: choice
+        options:
+          - parity-usdc-specs
+          - parity-usdc-fields
+      ref:
+        description: Git ref for cloud clone
+        required: true
+        default: main
+        type: string
+      dry_run:
+        description: Print prompt only (no API call)
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  cloud-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tools/agent/package-lock.json
+
+      - name: Install agent harness
+        working-directory: tools/agent
+        run: npm ci
+
+      - name: Run cloud parity agent
+        working-directory: tools/agent
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          slice="${{ inputs.task }}"
+          slice="${slice#parity-usdc-}"
+          args=(cloud-parity "${slice}" --ref "${{ inputs.ref }}")
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          npm run agent -- "${args[@]}" 2>&1 | tee "${RUNNER_TEMP}/cursor-agent.log"
+
+      - name: Upload agent log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cursor-agent-log
+          path: ${{ runner.temp }}/cursor-agent.log
+          if-no-files-found: ignore

@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.24.0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            platform: linux-amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            platform: linux-arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            platform: darwin-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            platform: darwin-arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            platform: windows-amd64
+          - os: windows-latest
+            goos: windows
+            goarch: arm64
+            platform: windows-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        shell: bash
+        run: |
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY="mcp-remote-go-${{ matrix.platform }}.exe"
+          else
+            BINARY="mcp-remote-go-${{ matrix.platform }}"
+          fi
+          go build -ldflags="-s -w" -o "$BINARY" .
+          HASH=$(openssl dgst -sha256 "$BINARY" | awk '{print $NF}')
+          printf '%s  %s\n' "$HASH" "$BINARY" > "${BINARY}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-remote-go-${{ matrix.platform }}
+          path: mcp-remote-go-${{ matrix.platform }}*
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest
+          body: |
+            Pre-built binaries for Linux, macOS, and Windows.
+            Built from `${{ github.sha }}` on `${{ github.ref_name }}`.
+          files: artifacts/mcp-remote-go-*
+          fail_on_unmatched_files: true
+          make_latest: true

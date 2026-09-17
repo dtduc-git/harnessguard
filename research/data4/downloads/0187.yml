@@ -1,0 +1,67 @@
+name: Release MCPB Extensions
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build project
+        run: npm run build
+
+      - name: Install MCPB CLI
+        run: npm install -g @anthropic-ai/mcpb
+
+      - name: Get version
+        id: version
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "tag=v${PKG_VERSION}-beta.${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "name=v${PKG_VERSION} beta (${SHORT_SHA})" >> $GITHUB_OUTPUT
+
+      - name: Pack Local Extension
+        run: |
+          cp manifest-local.json manifest.json
+          mcpb pack . 1001-albums-generator-mcp-local.mcpb
+          rm manifest.json
+
+      - name: Pack Remote Extension
+        run: |
+          mkdir -p /tmp/remote-mcpb/remote-shim
+          mkdir -p /tmp/remote-mcpb/assets
+          cp manifest-remote.json /tmp/remote-mcpb/manifest.json
+          cp remote-shim/index.js /tmp/remote-mcpb/remote-shim/index.js
+          cp assets/logo.png /tmp/remote-mcpb/assets/logo.png
+          mcpb pack /tmp/remote-mcpb 1001-albums-generator-mcp-remote.mcpb
+
+      - name: Create Prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.name }}
+          files: |
+            1001-albums-generator-mcp-local.mcpb
+            1001-albums-generator-mcp-remote.mcpb
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,78 @@
+# Optional publish of DevCake images to GHCR (manual workflow_dispatch only).
+# Images: ghcr.io/<owner>/devcake/<name>:<sha12> and :latest
+# SBOM + provenance are enabled on this bake only — there is no committed
+# tree-wide SBOM artifact process; PR CI keeps sbom/provenance false.
+name: Docker publish
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  publish:
+    name: Bake + push GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Image name prefix
+        id: meta
+        run: |
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "prefix=${{ env.REGISTRY }}/${owner}/devcake" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Bake and push all images
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7
+        env:
+          DEVCAKE_TAG: ${{ steps.meta.outputs.sha }}
+        with:
+          files: |
+            ./docker-bake.hcl
+          targets: all
+          push: true
+          provenance: true
+          sbom: true
+          set: |
+            *.cache-from=type=gha,scope=devcake-publish
+            *.cache-to=type=gha,mode=max,scope=devcake-publish,ignore-error=true
+            app.tags=${{ steps.meta.outputs.prefix }}/app:${{ steps.meta.outputs.sha }}
+            app.tags=${{ steps.meta.outputs.prefix }}/app:latest
+            admin.tags=${{ steps.meta.outputs.prefix }}/admin:${{ steps.meta.outputs.sha }}
+            admin.tags=${{ steps.meta.outputs.prefix }}/admin:latest
+            hello.tags=${{ steps.meta.outputs.prefix }}/dev-hello:${{ steps.meta.outputs.sha }}
+            hello.tags=${{ steps.meta.outputs.prefix }}/dev-hello:latest
+            claude-code.tags=${{ steps.meta.outputs.prefix }}/dev-claude-code:${{ steps.meta.outputs.sha }}
+            claude-code.tags=${{ steps.meta.outputs.prefix }}/dev-claude-code:latest
+            codex.tags=${{ steps.meta.outputs.prefix }}/dev-codex:${{ steps.meta.outputs.sha }}
+            codex.tags=${{ steps.meta.outputs.prefix }}/dev-codex:latest
+            grok-build.tags=${{ steps.meta.outputs.prefix }}/dev-grok-build:${{ steps.meta.outputs.sha }}
+            grok-build.tags=${{ steps.meta.outputs.prefix }}/dev-grok-build:latest
+            pi.tags=${{ steps.meta.outputs.prefix }}/dev-pi:${{ steps.meta.outputs.sha }}
+            pi.tags=${{ steps.meta.outputs.prefix }}/dev-pi:latest
+            opencode.tags=${{ steps.meta.outputs.prefix }}/dev-opencode:${{ steps.meta.outputs.sha }}
+            opencode.tags=${{ steps.meta.outputs.prefix }}/dev-opencode:latest
+            qwen-code.tags=${{ steps.meta.outputs.prefix }}/dev-qwen-code:${{ steps.meta.outputs.sha }}
+            qwen-code.tags=${{ steps.meta.outputs.prefix }}/dev-qwen-code:latest

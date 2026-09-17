@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build Python package
+        working-directory: mcp-server
+        run: python -m build
+
+      - name: Build GNOME extension zip
+        run: |
+          cd extension/desktop-automation@gnomemcp.github.io
+          glib-compile-schemas schemas/
+          cd ..
+          zip -r ../desktop-automation@gnomemcp.github.io.zip desktop-automation@gnomemcp.github.io/
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ### 1. GNOME Shell Extension
+
+            Download `desktop-automation@gnomemcp.github.io.zip` and install:
+
+            ```bash
+            gnome-extensions install desktop-automation@gnomemcp.github.io.zip
+            ```
+
+            Then log out and back in (required on Wayland), and enable:
+
+            ```bash
+            gnome-extensions enable desktop-automation@gnomemcp.github.io
+            ```
+
+            ### 2. MCP Server
+
+            ```bash
+            pip install gnome-desktop-mcp
+            ```
+
+            Or install the wheel from this release:
+
+            ```bash
+            pip install gnome_desktop_mcp-${{ steps.version.outputs.version }}-py3-none-any.whl
+            ```
+
+            ### 3. Configure Claude Code
+
+            Add to `~/.claude/settings.json`:
+
+            ```json
+            {
+              "mcpServers": {
+                "desktop-automation": {
+                  "command": "gnome-desktop-mcp"
+                }
+              }
+            }
+            ```
+          files: |
+            desktop-automation@gnomemcp.github.io.zip
+            mcp-server/dist/*
+
+      - name: Publish to PyPI
+        if: vars.PUBLISH_PYPI == 'true'
+        working-directory: mcp-server
+        run: |
+          pip install twine
+          twine upload dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}

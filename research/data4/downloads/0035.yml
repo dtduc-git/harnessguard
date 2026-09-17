@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to create, for example v0.1.1'
+        required: true
+        type: string
+      draft:
+        description: 'Create the release as a draft'
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: 'Mark the release as a prerelease'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    
+    strategy:
+      matrix:
+        include:
+          - runtime: win-x64
+            artifact_name: FlaUI-MCP-win-x64
+          - runtime: win-arm64
+            artifact_name: FlaUI-MCP-win-arm64
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Determine release version
+      id: release
+      shell: pwsh
+      run: |
+        if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+          $tag = "${{ inputs.tag_name }}"
+        } else {
+          $tag = "${{ github.ref_name }}"
+        }
+
+        if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+          throw "Release tag must look like v1.2.3 or v1.2.3-prerelease; got '$tag'."
+        }
+
+        $version = $tag.Substring(1)
+        "tag=$tag" >> $env:GITHUB_OUTPUT
+        "version=$version" >> $env:GITHUB_OUTPUT
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Restore dependencies
+      run: dotnet restore src/FlaUI.Mcp/FlaUI.Mcp.csproj
+
+    - name: Publish self-contained
+      run: |
+        dotnet publish src/FlaUI.Mcp/FlaUI.Mcp.csproj `
+          --configuration Release `
+          --runtime ${{ matrix.runtime }} `
+          --self-contained true `
+          --output ./publish/self-contained `
+          -p:Version=${{ steps.release.outputs.version }} `
+          -p:PublishSingleFile=true `
+          -p:IncludeNativeLibrariesForSelfExtract=true
+
+    - name: Publish framework-dependent
+      run: |
+        dotnet publish src/FlaUI.Mcp/FlaUI.Mcp.csproj `
+          --configuration Release `
+          --runtime ${{ matrix.runtime }} `
+          --self-contained false `
+          --output ./publish/framework-dependent `
+          -p:Version=${{ steps.release.outputs.version }}
+
+    - name: Create ZIP archives
+      run: |
+        Compress-Archive -Path ./publish/self-contained/* -DestinationPath ./${{ matrix.artifact_name }}-${{ steps.release.outputs.version }}-self-contained.zip
+        Compress-Archive -Path ./publish/framework-dependent/* -DestinationPath ./${{ matrix.artifact_name }}-${{ steps.release.outputs.version }}.zip
+      shell: pwsh
+
+    - name: Upload Release Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-${{ matrix.runtime }}
+        path: ./*.zip
+
+  create-release:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Determine release version
+      id: release
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          tag="${{ inputs.tag_name }}"
+          draft="${{ inputs.draft }}"
+          prerelease="${{ inputs.prerelease }}"
+        else
+          tag="${GITHUB_REF_NAME}"
+          draft="false"
+          prerelease="false"
+        fi
+
+        if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo "Release tag must look like v1.2.3 or v1.2.3-prerelease; got '$tag'." >&2
+          exit 1
+        fi
+
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+        echo "draft=$draft" >> "$GITHUB_OUTPUT"
+        echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        pattern: release-*
+        merge-multiple: true
+
+    - name: List artifacts
+      run: ls -la artifacts/
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.release.outputs.tag }}
+        target_commitish: ${{ github.sha }}
+        name: FlaUI-MCP ${{ steps.release.outputs.tag }}
+        body: |
+          ## FlaUI-MCP ${{ steps.release.outputs.tag }}
+          
+          An MCP server for Windows desktop automation using accessibility APIs.
+          
+          ### Downloads
+          
+          | Platform | Self-contained | Framework-dependent |
+          |----------|---------------|---------------------|
+          | Windows x64 | `FlaUI-MCP-win-x64-*-self-contained.zip` | `FlaUI-MCP-win-x64-*.zip` |
+          | Windows ARM64 | `FlaUI-MCP-win-arm64-*-self-contained.zip` | `FlaUI-MCP-win-arm64-*.zip` |
+          
+          - **Self-contained**: Includes .NET runtime, no prerequisites needed
+          - **Framework-dependent**: Requires .NET 8.0 runtime installed
+          
+          ### Installation
+          
+          1. Download and extract the appropriate ZIP for your platform
+          2. Add to your MCP config:
+          ```json
+          {
+            "mcpServers": {
+              "windows": {
+                "type": "local",
+                "command": "C:\\path\\to\\FlaUI.Mcp.exe",
+                "tools": ["*"]
+              }
+            }
+          }
+          ```
+          
+          See [README](https://github.com/shanselman/FlaUI-MCP#readme) for full documentation.
+        files: artifacts/*.zip
+        draft: ${{ steps.release.outputs.draft }}
+        prerelease: ${{ steps.release.outputs.prerelease }}

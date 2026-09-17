@@ -1,0 +1,104 @@
+name: 🤖 Claude AI .NET Developer
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  setup:
+    name: 🔍 Parse Label & Select Model
+    if: "startsWith(github.event.label.name, 'agent: ') && github.actor == 'baranacikgoz'"
+    runs-on: ubuntu-latest
+    outputs:
+      provider: ${{ steps.parse.outputs.provider }}
+      model: ${{ steps.parse.outputs.model }}
+      runner_tag: ${{ steps.parse.outputs.runner_tag }}
+    steps:
+      - name: 🛠️ Parse Label
+        id: parse
+        run: |
+          LABEL="${{ github.event.label.name }}"
+          DATA="${LABEL#agent: }"
+          PROVIDER="${DATA%%/*}"
+          MODEL="${DATA#*/}"
+          
+          # Standardize: Remove colons to match Kubernetes resource naming
+          CLEAN_MODEL="${MODEL//:/-}"
+          
+          # The runner tag must exactly match the Scale Set name
+          RUNNER_TAG="ai-dotnet-$PROVIDER-$CLEAN_MODEL"
+          
+          echo "provider=$PROVIDER" >> $GITHUB_OUTPUT
+          echo "model=$MODEL" >> $GITHUB_OUTPUT
+          echo "runner_tag=$RUNNER_TAG" >> $GITHUB_OUTPUT
+
+  dotnet-developer:
+    name: 🚀 .NET Agent (${{ needs.setup.outputs.provider }} / ${{ needs.setup.outputs.model }})
+    needs: setup
+    runs-on: ${{ needs.setup.outputs.runner_tag }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 💬 Contextualize Task
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_BODY=$(gh issue view ${{ github.event.issue.number }} --json body -q .body)
+          ISSUE_TITLE=$(gh issue view ${{ github.event.issue.number }} --json title -q .title)
+          echo "ISSUE_BODY<<EOF" >> $GITHUB_ENV
+          echo "$ISSUE_BODY" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
+          echo "$ISSUE_TITLE" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: 🌐 Verify Connectivity
+        run: |
+          echo "Checking internet access..."
+          curl -I https://api.nuget.org/v3/index.json
+          curl -I https://api.anthropic.com
+
+      - name: 🧠 Unleash .NET Agent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Environment Setup for Headless CI
+          export HOME=/home/runner
+          export CLAUDE_CONFIG_DIR=/home/runner/.claude
+          export XDG_CONFIG_HOME=/home/runner/.config
+          # We disable CI=true to prevent tools (like Claude Code) from entering restricted 'offline' modes
+          export CI=false
+          export DISABLE_TELEMETRY=1
+          export CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+          
+          mkdir -p "$CLAUDE_CONFIG_DIR"
+          echo '{"hasCompletedOnboarding": true}' > "$CLAUDE_CONFIG_DIR/config.json"
+          
+          # Ensure Vault environment is loaded and EXPORTED
+          if [ -f /vault/secrets/config.env ]; then
+            set -a
+            . /vault/secrets/config.env
+            set +a
+          fi
+
+          read -r -d '' CLAUDE_PROMPT <<EOF || true
+          # CONTEXT
+          GitHub Issue #${{ github.event.issue.number }}: '$ISSUE_TITLE' is assigned to you.
+
+          # TASK DATA (Instructions & Requirements)
+          $ISSUE_BODY
+          EOF
+          
+          echo "Starting Claude CLI..."
+          claude --bare --verbose --dangerously-skip-permissions --permission-mode bypassPermissions \
+            --mcp-config /home/runner/.claude.json \
+            --model "${{ needs.setup.outputs.model }}" -p "$CLAUDE_PROMPT" < /dev/null

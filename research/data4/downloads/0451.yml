@@ -1,0 +1,568 @@
+name: Claude Code Agent
+
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened, labeled]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+    # NOTE: Only human review events reach this trigger in practice.
+    # AI reviews from ai-review.yml are dispatched here via workflow_dispatch,
+    # bypassing GitHub's "action_required" approval gate for bot events.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to act on'
+        required: true
+      action:
+        description: 'Action: fix_ai_review | ai_approved | fix_rebase_conflict | fix_copilot_review | copilot_approved'
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+  id-token: write
+
+concurrency:
+  group: claude-code-${{ github.event.inputs.pr_number || github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  claude:
+    # Run when:
+    # 1. @claude is mentioned in issue or PR comments
+    # 2. Issues labeled/opened with 'agent-work'
+    # 3. @claude is mentioned in a PR review comment (inline)
+    # 4. A HUMAN reviewer requests changes on an [Agent] PR
+    # 5. /claude-fix in a PR comment
+    # 6. Dispatched by ai-review.yml (fix_ai_review or ai_approved)
+    # 7. Dispatched by rebase workflow (fix_rebase_conflict)
+    # 8. Dispatched by copilot-review-poller.yml (fix_copilot_review or copilot_approved)
+    if: |
+      (github.event_name == 'issue_comment' &&
+       contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '/claude-fix')) ||
+      (github.event_name == 'issues' &&
+       github.event.action == 'labeled' &&
+       github.event.label.name == 'agent-work' &&
+       !contains(toJSON(github.event.issue.labels.*.name), 'cursor-work')) ||
+      (github.event_name == 'issues' &&
+       github.event.action == 'opened' &&
+       contains(toJSON(github.event.issue.labels.*.name), 'agent-work') &&
+       !contains(toJSON(github.event.issue.labels.*.name), 'cursor-work')) ||
+      (github.event_name == 'pull_request_review_comment' &&
+       contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'changes_requested' &&
+       startsWith(github.event.pull_request.title, '[Agent]') &&
+       github.event.review.user.type != 'Bot') ||
+      (github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Post initial status comment
+        id: status_comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUM="${{ github.event.inputs.pr_number || github.event.issue.number || github.event.pull_request.number }}"
+          ACTION="${{ github.event.inputs.action }}"
+
+          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
+            echo "comment_id=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "$ACTION" in
+            fix_ai_review)        TITLE="🔧 Applying AI Review Fixes"    ;;
+            ai_approved)          TITLE="✅ Processing AI Approval"       ;;
+            fix_rebase_conflict)  TITLE="🔀 Resolving Rebase Conflicts"  ;;
+            *)                    TITLE="🤔 Working on Request"           ;;
+          esac
+
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          cat > /tmp/claude_status.md << STATUSEOF
+          <!-- claude-status -->
+          ## ${TITLE}
+
+          ### Progress
+          - [x] 🚀 Agent started
+          - [ ] 📖 Reading context...
+          - [ ] 🔨 Working...
+          - [ ] 📤 Done
+
+          *Started: ${TIMESTAMP}*
+          STATUSEOF
+
+          # Find existing status comment to update, or create new
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+            --jq '[.[] | select(.body | test("<!-- claude-status -->";""))] | last | .id // empty' \
+            2>/dev/null || echo "")
+
+          if [ -n "$EXISTING" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${EXISTING}" \
+              --method PATCH --field body=@/tmp/claude_status.md 2>/dev/null || true
+            echo "comment_id=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+              --method POST --field body=@/tmp/claude_status.md \
+              --jq '.id' 2>/dev/null || echo "")
+            echo "comment_id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Claude Code
+        id: claude_run
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          base_branch: develop
+          allowed_bots: 'github-actions[bot]'
+          claude_args: "--allowedTools 'Bash(gh issue comment:*),Bash(gh issue create:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh issue close:*),Bash(gh pr comment:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh pr merge:*),Bash(gh pr list:*),Bash(gh issue edit:*),Bash(gh label:*),Bash(gh api:*),Bash(gh workflow:*),Bash(git:*),Bash(swift:*),Bash(swiftlint:*),Bash(cat:*),Bash(sed:*),Bash(date:*),Bash(python3:*),Read,Write,Edit,Glob,Grep'"
+          prompt: |
+            You are working on the Provenance emulator app repository.
+            Read CLAUDE.md for project conventions and module structure.
+
+            ## GitHub Context
+            - Repository: ${{ github.repository }}
+            - Event: ${{ github.event_name }}
+            - Actor: ${{ github.actor }}
+            - Issue/PR number: ${{ github.event.inputs.pr_number || github.event.issue.number || github.event.pull_request.number }}
+            - Issue title: ${{ github.event.issue.title || github.event.pull_request.title || '' }}
+            - Status comment ID: ${{ steps.status_comment.outputs.comment_id }}
+
+            ## Live Status Comment
+            A `<!-- claude-status -->` comment has been posted to the PR (ID above).
+            Update it to show real-time progress using this exact pattern:
+            ```
+            STATUS_ID="${{ steps.status_comment.outputs.comment_id }}"
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+            cat > /tmp/claude_status.md << STATUSEOF
+            <!-- claude-status -->
+            ## 🔧 Applying Fixes — In Progress
+
+            ### Progress
+            - [x] 🚀 Agent started
+            - [x] 📖 Read context
+            - [x] 🔨 Applied 3 fixes
+            - [ ] 📤 Pushing changes...
+
+            *Updated: ${TIMESTAMP}*
+            STATUSEOF
+            [ -n "$STATUS_ID" ] && gh api repos/$GITHUB_REPOSITORY/issues/comments/${STATUS_ID} \
+              --method PATCH --field body=@/tmp/claude_status.md 2>/dev/null || true
+            ```
+            Update after: reading context, each major fix, pushing, completion.
+            At completion, ensure the status comment shows final state (✅ or ❌).
+
+            ## Posting Comments — REQUIRED FORMAT
+            NEVER use `--body "line1\nline2"` — `\n` is a literal backslash-n, not a newline.
+            For ANY multi-line comment, write to a file first:
+            ```
+            cat > /tmp/comment.md << 'COMMENTEOF'
+            ## Title
+
+            - point one
+            - point two
+            COMMENTEOF
+            gh pr comment <N> --body-file /tmp/comment.md --repo $GITHUB_REPOSITORY
+            ```
+            Use `--body "text"` only for truly single-line messages with no newlines.
+
+            ## Trigger Context
+            ${{ github.event_name == 'pull_request_review' && github.event.review.state == 'changes_requested' && 'A human reviewer requested changes on this PR. Read all review comments and fix them.' || '' }}
+            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'fix_ai_review' && format('The AI reviewer requested changes on PR #{0}. Read ALL review comments and fix every issue. Post a marker comment when done.', github.event.inputs.pr_number) || '' }}
+            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'ai_approved' && format('The AI reviewer has approved PR #{0} (or max review cycles reached). Enable auto-merge, add the ready-for-review label, and assign @JoeMatt for final review.', github.event.inputs.pr_number) || '' }}
+            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'fix_rebase_conflict' && format('PR #{0} has rebase conflicts that must be resolved. Follow the conflict resolution instructions below.', github.event.inputs.pr_number) || '' }}
+            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'fix_copilot_review' && format('GitHub Copilot requested changes on PR #{0}. Read ALL Copilot review comments and inline suggestions, fix every issue, post a marker comment `<!-- copilot-review-processed:REVIEW_ID -->` (replace REVIEW_ID with the review ID from the comment) when done, then push.', github.event.inputs.pr_number) || '' }}
+            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'copilot_approved' && format('GitHub Copilot has approved PR #{0} (or max Copilot review cycles reached). Enable auto-merge, add the ready-for-review label, and assign @JoeMatt for final review.', github.event.inputs.pr_number) || '' }}
+            ${{ contains(github.event.comment.body || '', '/claude-fix') && 'Fix all pending review comments on this PR. Read the full review, address each comment, commit fixes, and push.' || '' }}
+            ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request.url != '' && '⚠️ @claude COMMENT ON EXISTING PR: You are responding to a comment on an EXISTING open PR. You MUST work on that PR branch directly — NEVER create a new branch or open a new PR. Steps: 1) Get the branch: `gh pr view $PR_NUM --json headRefName --jq .headRefName` (where PR_NUM is the issue/PR number from GitHub Context above) 2) Checkout it: `git fetch origin && git checkout <branch> && git pull origin <branch>` 3) Make all requested changes 4) Commit and push to SAME branch: `git push origin <branch>` 5) The existing PR updates automatically — you are done. Never use `gh pr create`.' || '' }}
+
+            ## User Request
+            ${{ github.event.comment.body || github.event.review.body || github.event.issue.body || '' }}
+
+            ## Core Instructions
+            1. Address the trigger context and user request above
+            2. Post progress/responses as comments (use --body-file for multi-line, see above):
+               - On issues: `gh issue comment <number> --body-file /tmp/msg.md`
+               - On PRs: `gh pr comment <number> --body-file /tmp/msg.md`
+               - The issue/PR number is: ${{ github.event.inputs.pr_number || github.event.issue.number || github.event.pull_request.number }}
+            3. Target all PRs to the **'develop'** branch
+            4. Prefix agent PR titles with '[Agent]'
+            5. Do NOT modify submodule source code directly
+            6. Do NOT modify project.pbxproj unless absolutely necessary
+            7. Keep changes focused — one logical change per PR
+
+            ## Documentation & Quality (do these for every significant PR)
+
+            7b. Changelog fragment — For any feature addition, bug fix, or refactor, create
+               a changelog fragment file at `.changelog/<PR_NUMBER>.md` (where PR_NUMBER is
+               the current PR number from step 1 above). Do NOT edit CHANGELOG.md directly —
+               a consolidation workflow merges fragments automatically on every PR merge,
+               adds the PR number link, sorts entries, and eliminates merge conflicts.
+
+               Fragment format (only include sections that apply):
+               ```
+               ### Added
+               - **Feature Name** — one-sentence description of what was added.
+
+               ### Fixed
+               - **Bug Name** — what was broken and what the fix is.
+
+               ### Changed
+               - **Thing Changed** — why the behavior or API changed.
+               ```
+               Omit `(#PR_NUMBER)` — it is appended automatically from the filename.
+               Do NOT create fragments for trivial doc changes or CI tweaks.
+
+            7c. Release Notes — When adding a major user-visible feature, also add a new
+               version entry to `PVUI/Sources/PVSwiftUI/Resources/whats-new.json`.
+               Only add if the feature is significant enough to show in a "What's New" sheet.
+               Use a clear `version`, `title`, and up to 6 `features` entries with SF Symbol
+               names and named colors (blue, green, orange, purple, red, pink, yellow, gray).
+
+            7d. Tests — For any new protocol, model, parser, or business logic, add or update
+               tests in the appropriate test target. Tier 0-2 modules can use `swift test`.
+               At minimum, write a test for the happy path and one edge case.
+               If a test target doesn't exist yet, note it in the PR body.
+
+            7e. reviewer-context.md — If your PR introduces a new pattern, protocol, or
+               design rule that reviewers should check for in future PRs, add a brief
+               entry to `.github/prompts/reviewer-context.md` under "New Patterns".
+               Examples: new actor types, new thread-safety requirements, new module tiers.
+
+            7f. TODO.md — If your PR completes an epic task, mark the item as done (`[X]`).
+               If you discover new work, add it as a new `[ ]` item.
+            7a. CRITICAL — NEVER tell users to run shell commands referencing files on the
+               CI runner filesystem (/tmp, /home/runner, /root, etc.). Those files only exist
+               inside this CI container and are inaccessible to users on their own machines.
+               If you need to create a GitHub issue or PR with multi-line content,
+               CREATE IT YOURSELF during this run using --body-file. Never ask the user to
+               run a script with a /tmp path you've written. Do the work directly.
+            8. CRITICAL: Never use "Closes #N" or "Fixes #N" for EPIC or parent issues.
+               Only use "Closes" for the specific sub-task issue your PR fully completes.
+               Reference epics/parent issues with "Part of #N" to prevent premature closure.
+            9. EPIC ORDERING: When creating multiple sub-task PRs for the same epic that
+               touch overlapping files, add a "Depends on: #N" line to the PR body for PRs
+               that should merge AFTER another PR. Example body footer:
+               `Depends on: #2551` — this tells the dependency checker the merge order.
+               Only add this when there's a real ordering dependency (shared file changes).
+            10. GITHUB ISSUE RELATIONSHIPS — Use these APIs when creating epics and sub-tasks:
+
+               **Parent-child (sub-issues):** When you create a sub-task issue under an epic,
+               immediately wire it as a sub-issue of the parent epic:
+               ```bash
+               # Get the integer ID of the child issue
+               child_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/CHILD_NUMBER" --jq '.id')
+               # Add it as sub-issue of the parent epic
+               gh api -X POST "repos/$GITHUB_REPOSITORY/issues/PARENT_NUMBER/sub_issues" \
+                 -f "sub_issue_id=$child_id"
+               ```
+
+               **Blocked-by relationships:** When a task cannot start until another is done,
+               use the GraphQL API to mark it as blocked:
+               ```bash
+               # Get node IDs
+               blocked_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/BLOCKED_NUMBER" --jq '.node_id')
+               blocker_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/BLOCKER_NUMBER" --jq '.node_id')
+               # Mark BLOCKED_NUMBER as blocked by BLOCKER_NUMBER
+               gh api graphql -f query="mutation {
+                 addBlockedBy(input: {issueId: \"$blocked_id\", blockingIssueId: \"$blocker_id\"}) {
+                   issue { number }
+                 }
+               }"
+               ```
+
+               **Rules:**
+               - Every sub-task issue you create must be added as a sub-issue of its parent epic
+               - Add blocked-by only for OPEN issues blocking OPEN issues (closed = resolved)
+               - Never add a closed issue as a sub-issue (GitHub rejects it)
+               - Reference parents as "Part of #N" in issue bodies, NOT "Closes #N"
+               - When creating an epic, add all existing or newly created sub-tasks as sub-issues
+
+            ## NO DUPLICATE PRs — CRITICAL
+            Before creating any PR or branch:
+            - Check for an existing open PR on the same branch: `gh pr list --head "agent/issue-<N>" --state open --repo $GITHUB_REPOSITORY`
+            - If one exists, push fixes to THAT branch — never open a second PR
+            - When dispatched to fix AI review comments, determine the correct branch:
+              `gh pr view <pr_number> --json headRefName --jq .headRefName`
+              Then: `git fetch origin && git checkout <branch> && git pull origin <branch>`
+              Make fixes, commit, push to THAT branch. Never create a new branch or PR.
+
+            ## PR Labels (lifecycle — always keep these current)
+            Labels: agent-work | ai-reviewing | needs-fixes | ready-for-review
+            - agent-work:       set when PR is created; keep for its lifetime
+            - ai-reviewing:     set when AI review is running; remove when review posts
+            - needs-fixes:      set when AI requests changes; remove when fixes pushed
+            - ready-for-review: set when AI approves; stays until human merges
+
+            ## Review Pipeline (for [Agent] PRs)
+
+            **After creating a new PR:**
+            9.  Enable auto-merge (merge commit, NOT squash):
+                `gh pr merge <number> --auto --merge --repo $GITHUB_REPOSITORY`
+                If auto-merge was previously set to squash, disable then re-enable:
+                `gh pr merge <number> --disable-auto && gh pr merge <number> --auto --merge`
+            10. Set initial labels: `gh pr edit <number> --add-label "agent-work,ai-reviewing"`
+            11. Post a comment: `gh pr comment <number> --body "🤖 PR created. AI review starting automatically." --repo $GITHUB_REPOSITORY`
+            NOTE: Do NOT manually request a review — ai-review.yml fires automatically on the push.
+
+            **When fixing AI review comments (fix_ai_review):**
+            12. Update label — fixer is working:
+                `gh pr edit <number> --add-label "needs-fixes" --remove-label "ai-reviewing,ready-for-review"`
+            13. Get the PR branch: `gh pr view <number> --json headRefName --jq .headRefName`
+            14. Checkout the branch: `git fetch origin && git checkout <branch> && git pull origin <branch>`
+            15. Update status comment: "🔨 Applying fixes..." (see Live Status Comment above)
+            16. Fetch the latest AI review body:
+                `gh api repos/$GITHUB_REPOSITORY/pulls/<number>/reviews \
+                  --jq '[.[] | select(.user.login == "github-actions[bot]")] | sort_by(.submitted_at) | last | .body'`
+            17. Also fetch inline review comments:
+                `gh api repos/$GITHUB_REPOSITORY/pulls/<number>/comments \
+                  --jq '[.[] | select(.user.login == "github-actions[bot]")] | .[] | {path, line: .original_line, body}'`
+            18. Fix every CRITICAL and MAJOR issue. Fix MINOR issues where trivial.
+            19. Commit: `fix: address AI review — <brief summary>`
+            20. Push to EXISTING branch (never create a new branch or PR):
+                `git push origin <branch>`
+            21. Update label — fixes pushed:
+                `gh pr edit <number> --add-label "ai-reviewing" --remove-label "needs-fixes"`
+            22. Post marker comment (use --body-file):
+                ```
+                cat > /tmp/marker.md << 'MARKEREOF'
+                <!-- ai-review-processed -->
+                ✅ Fixes pushed — <brief summary of what was fixed>
+                MARKEREOF
+                gh pr comment <number> --body-file /tmp/marker.md --repo $GITHUB_REPOSITORY
+                ```
+            23. Update status comment to show completion (cycle N dispatched).
+            NOTE: Do NOT manually dispatch ai-review.yml — the claude-code.yml post-step does it automatically after you finish.
+
+            **When resolving rebase conflicts (fix_rebase_conflict):**
+            24. Get PR branch: `BRANCH=$(gh pr view <number> --json headRefName --jq .headRefName)`
+            25. Checkout and start rebase:
+                ```
+                git fetch origin develop
+                git checkout -B "$BRANCH" "origin/$BRANCH"
+                git rebase origin/develop || true   # will fail with conflicts — that's expected
+                ```
+            26. Find conflicting files: `git diff --name-only --diff-filter=U`
+            27. For EACH conflicting file:
+                a. Read the file — it contains conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`)
+                b. The `<<<<<<< HEAD` section is develop's version; `>>>>>>> <sha>` is the PR branch's version
+                c. Intelligently merge: for add/add conflicts prefer the PR branch's version (it's the
+                   feature being introduced); for content conflicts merge both sides' intent
+                d. Write the resolved file (no conflict markers)
+                e. `git add <file>`
+            28. Continue the rebase: `git rebase --continue` (set `GIT_EDITOR=true` to skip editor)
+                Repeat steps 26-28 if more conflicts arise in subsequent commits.
+            29. After rebase completes, push:
+                `git push --force-with-lease origin "$BRANCH"`
+            30. Post a comment summarising which conflicts were resolved and how.
+            31. Re-trigger CI: `gh workflow run agent-validation.yml --repo $GITHUB_REPOSITORY --ref develop -f branch="$BRANCH"`
+            32. Update status comment to show completion.
+            NOTE: AI review is automatically re-dispatched by the claude-code.yml post-step — do NOT manually run ai-review.yml.
+            IMPORTANT: If `git rebase --continue` keeps failing or there are too many complex conflicts,
+            abort with `git rebase --abort` and post a comment explaining what requires manual resolution.
+
+            **When AI review approves (ai_approved):**
+            34. Enable auto-merge if not already: `gh pr merge <number> --auto --merge --repo $GITHUB_REPOSITORY`
+            35. Set final labels:
+                `gh pr edit <number> --add-label "ready-for-review" --remove-label "ai-reviewing,needs-fixes"`
+            36. Assign for human review: `gh pr edit <number> --add-assignee JoeMatt --add-reviewer JoeMatt`
+            37. Update the status comment to final "ready for review" state:
+                ```
+                TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+                STATUS_ID="${{ steps.status_comment.outputs.comment_id }}"
+                cat > /tmp/claude_status.md << STATUSEOF
+                <!-- claude-status -->
+                ## ✅ Ready for Human Review
+
+                ### Completed
+                - [x] 🚀 Agent started
+                - [x] 🤖 AI review approved
+                - [x] 🔀 Auto-merge enabled
+                - [x] 👤 @JoeMatt assigned for final review
+
+                *Completed: ${TIMESTAMP}*
+                STATUSEOF
+                [ -n "$STATUS_ID" ] && gh api repos/$GITHUB_REPOSITORY/issues/comments/${STATUS_ID} \
+                  --method PATCH --field body=@/tmp/claude_status.md 2>/dev/null || true
+                ```
+
+      - name: Dispatch Cursor fallback
+        id: cursor_fallback
+        if: steps.claude_run.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          if [ -z "${CURSOR_API_KEY:-}" ]; then
+            echo "dispatched=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          EVENT_NAME="${{ github.event_name }}"
+          ACTION="${{ github.event.inputs.action }}"
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          PR_NUMBER="${{ github.event.inputs.pr_number || github.event.pull_request.number }}"
+
+          dispatch_success=false
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$PR_NUMBER" ] && [ -n "$ACTION" ]; then
+            gh workflow run cursor-agent.yml \
+              --repo "${{ github.repository }}" \
+              -f pr_number="$PR_NUMBER" \
+              -f action="$ACTION" && dispatch_success=true
+          elif [ "$EVENT_NAME" = "issues" ] && [ -n "$ISSUE_NUMBER" ]; then
+            ISSUE_LABELS=$(gh issue view "$ISSUE_NUMBER" --repo "${{ github.repository }}" --json labels \
+              --jq '[(.labels // [])[].name] | join(",")' 2>/dev/null || echo "")
+            ISSUE_ACTION="implement_issue"
+            if echo "$ISSUE_LABELS" | tr '[:upper:]' '[:lower:]' | grep -Eq '(^|,)(bug|regression)(,|$)'; then
+              ISSUE_ACTION="fix_bug"
+            fi
+
+            gh workflow run cursor-agent.yml \
+              --repo "${{ github.repository }}" \
+              -f issue_number="$ISSUE_NUMBER" \
+              -f action="$ISSUE_ACTION" && dispatch_success=true
+          elif [ "$EVENT_NAME" = "issue_comment" ] && [ -n "$ISSUE_NUMBER" ] && [ "${{ github.event.issue.pull_request.url != '' }}" = "true" ]; then
+            gh workflow run cursor-agent.yml \
+              --repo "${{ github.repository }}" \
+              -f pr_number="$ISSUE_NUMBER" \
+              -f action="fix_ai_review" && dispatch_success=true
+          elif [ "$EVENT_NAME" = "pull_request_review" ] && [ -n "$PR_NUMBER" ]; then
+            gh workflow run cursor-agent.yml \
+              --repo "${{ github.repository }}" \
+              -f pr_number="$PR_NUMBER" \
+              -f action="fix_ai_review" && dispatch_success=true
+          fi
+
+          echo "dispatched=$dispatch_success" >> "$GITHUB_OUTPUT"
+
+      # If Claude Code failed (rate limit, auth, or runtime error), notify the user
+      # so they can either rely on Cursor fallback or handle the task manually.
+      - name: Notify on Claude Code failure
+        if: steps.claude_run.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUM="${{ github.event.inputs.pr_number || github.event.issue.number || github.event.pull_request.number }}"
+          ACTION="${{ github.event.inputs.action }}"
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
+            echo "No PR/issue number — cannot post notification"
+            exit 0
+          fi
+
+          cat > /tmp/failure_notify.md << 'FAILEOF'
+          <!-- agent-failure-notice -->
+          ## ⚠️ Claude Code Agent Failed
+
+          The Claude Code agent could not complete this task (likely rate-limited or auth error).
+
+          **Options:**
+          1. **Wait** for the Claude Code token window to reset (~2 hours)
+          2. **Use Cursor** locally or via the Cursor GitHub app
+          3. **Re-trigger** by commenting `@claude` once tokens are available
+
+          FAILEOF
+
+          # Add action-specific context
+          if [ "$ACTION" = "fix_ai_review" ]; then
+            echo "**Task was:** Fix AI review comments on PR #${PR_NUM}" >> /tmp/failure_notify.md
+          elif [ "$ACTION" = "fix_rebase_conflict" ]; then
+            echo "**Task was:** Resolve rebase conflicts on PR #${PR_NUM}" >> /tmp/failure_notify.md
+          fi
+          if [ "${{ steps.cursor_fallback.outputs.dispatched }}" = "true" ]; then
+            echo "" >> /tmp/failure_notify.md
+            echo "**Cursor fallback:** Dispatched automatically via \`cursor-agent.yml\`." >> /tmp/failure_notify.md
+          fi
+          echo "" >> /tmp/failure_notify.md
+          echo "*Failed: ${TIMESTAMP}*" >> /tmp/failure_notify.md
+
+          gh pr comment "$PR_NUM" --body-file /tmp/failure_notify.md --repo "${{ github.repository }}" 2>/dev/null || \
+            gh issue comment "$PR_NUM" --body-file /tmp/failure_notify.md --repo "${{ github.repository }}" 2>/dev/null || true
+
+          if [ "${{ steps.cursor_fallback.outputs.dispatched }}" != "true" ]; then
+            gh pr edit "$PR_NUM" --add-label "needs-manual-intervention" --repo "${{ github.repository }}" 2>/dev/null || \
+              gh issue edit "$PR_NUM" --add-label "needs-manual-intervention" --repo "${{ github.repository }}" 2>/dev/null || true
+          fi
+
+          # Update status comment to show failure
+          STATUS_ID="${{ steps.status_comment.outputs.comment_id }}"
+          if [ -n "$STATUS_ID" ]; then
+            cat > /tmp/claude_status.md << STATUSEOF
+          <!-- claude-status -->
+          ## ❌ Claude Code Agent Failed
+
+          ### Progress
+          - [x] 🚀 Agent started
+          - [ ] ❌ Agent failed (rate limit or auth error)
+
+          **Fallback:** ${{ steps.cursor_fallback.outputs.dispatched == 'true' && 'Cursor workflow dispatched automatically.' || 'Manual intervention needed — use Cursor or wait for token reset.' }}
+
+          *Failed: ${TIMESTAMP}*
+          STATUSEOF
+            gh api "repos/${{ github.repository }}/issues/comments/${STATUS_ID}" \
+              --method PATCH --field body=@/tmp/claude_status.md 2>/dev/null || true
+          fi
+
+      # AI review dispatch DISABLED — GitHub Copilot handles PR reviews.
+      # To trigger manually: comment `/ai-review` on the PR, or:
+      #   gh workflow run ai-review.yml -f pr_number=<N>
+      - name: Dispatch AI review for Agent PRs
+        if: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO="${{ github.repository }}"
+          ACTION="${{ github.event.inputs.action }}"
+
+          # For fix_ai_review and fix_rebase_conflict: PR number is directly available
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR_NUMBER="${{ github.event.inputs.pr_number }}"
+            if [ -z "$PR_NUMBER" ]; then
+              echo "No PR number in workflow_dispatch inputs — skipping"
+              exit 0
+            fi
+            echo "Dispatching AI review for PR #${PR_NUMBER} (post-${ACTION})"
+            gh workflow run ai-review.yml \
+              --repo "$REPO" \
+              -f pr_number="$PR_NUMBER"
+            exit 0
+          fi
+
+          # For issues events: find the newly created Agent PR for this issue
+          ISSUE_NUM="${{ github.event.issue.number }}"
+
+          PR_NUMBER=$(gh pr list \
+            --repo "$REPO" \
+            --state open \
+            --json number,title,headRefName \
+            --jq ".[] | select(.title | startswith(\"[Agent]\")) | select(.headRefName | startswith(\"agent/issue-${ISSUE_NUM}\")) | .number" \
+            2>/dev/null | head -1)
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open [Agent] PR found for issue #${ISSUE_NUM} — skipping review dispatch"
+            exit 0
+          fi
+
+          echo "Dispatching AI review for PR #${PR_NUMBER} (new PR from issue #${ISSUE_NUM})"
+          gh workflow run ai-review.yml \
+            --repo "$REPO" \
+            -f pr_number="$PR_NUMBER"

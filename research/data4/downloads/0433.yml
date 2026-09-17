@@ -1,0 +1,52 @@
+name: Qwen Issue Triage
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to triage'
+        required: true
+      comment:
+        description: 'Triage instruction'
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Qwen Code
+        uses: qwenlm/qwen-code-action@main
+        with:
+          qwen_api_key: ${{ secrets.QWEN_API_KEY }}
+          prompt: |
+            Triage this GitHub issue for arifos-lab.
+            Classify by:
+            1. Type: bug / feature / question / documentation / governance
+            2. Priority: P0 (critical) / P1 (important) / P2 (nice-to-have)
+            3. Scope: isolated / cross-module / federation-wide
+            4. Authority: T0 auto-do / T1 auto-do / T1.5 propose / T2 announce / T3 888_HOLD
+
+            Suggest labels and a brief triage summary.
+
+      - name: Apply Labels
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue?.number || ${{ inputs.issue_number || 0 }};
+            if (issue) {
+              const summary = process.env.QWEN_SUMMARY || 'Triage completed';
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue,
+                body: `## 🏷️ Qwen Triage\n\n${summary}`
+              });
+            }

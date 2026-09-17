@@ -1,0 +1,153 @@
+name: release-preflight
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - '**.rs'
+      - 'README.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Justfile'
+      - 'just/**'
+      - '.github/workflows/**'
+      - 'docs/**'
+      - 'mcpb/**'
+      - 'openspec/**'
+      - 'scripts/**'
+      - 'server.json'
+      - 'tests/**'
+      - 'wrappers/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-preflight-ubuntu-stable-all-features
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Resolve version
+        id: version
+        if: startsWith(github.head_ref, 'release/v')
+        shell: bash
+        run: bash scripts/release/resolve-release-version.sh "pull_request" "" "${{ github.head_ref }}"
+
+      - name: Release target check
+        if: startsWith(github.head_ref, 'release/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: just VERSION="${{ steps.version.outputs.version }}" release-target-check
+
+      - name: Format check
+        run: just fmt-check
+
+      - name: Schema consistency check
+        run: just schema-check
+
+      - name: Test
+        run: cargo test --all-features --locked
+
+      - name: Examples
+        run: just examples
+
+      - name: MCP build
+        run: just mcp-build
+
+      - name: MCP stdio smoke
+        run: just mcp-stdio-smoke
+
+      - name: MCP remote build
+        run: just mcp-remote-build
+
+      - name: MCP remote smoke
+        run: just mcp-remote-smoke
+
+      - name: MCPB smoke
+        run: just mcpb-smoke
+
+      - name: MCP Registry metadata
+        run: just server-json-validate
+
+      - name: Action smoke
+        run: just action-smoke
+
+      - name: Binary artifact smoke
+        run: just binary-smoke
+
+      - name: Homebrew formula check
+        run: just homebrew-formula-check
+
+      - name: Partial publish simulation
+        run: just release-partial-publish-test
+
+      - name: Install uv
+        run: python3 -m pip install --upgrade uv
+
+      - name: Wrapper smoke
+        run: just wrapper-smoke
+
+      - name: npm package check
+        run: just npm-package-check
+
+      - name: PyPI package check
+        run: just pypi-package-check
+
+      - name: Wrapper publish gate
+        run: just wrapper-publish-gate
+
+      - name: Homebrew publish gate
+        run: just homebrew-publish-gate
+
+      - name: Editor publish gate
+        run: just editor-publish-gate
+
+      - name: Dogfood
+        run: just dogfood
+
+      - name: Public confidence
+        run: just public-confidence
+
+      - name: Document answer fix
+        run: just document-answer-fix
+
+      - name: Clone upstream markdownlint
+        run: git clone --depth 1 https://github.com/DavidAnson/markdownlint.git "${RUNNER_TEMP}/markdownlint"
+
+      - name: Upstream drift check
+        env:
+          KML_UPSTREAM_MARKDOWNLINT_DOC_DIR: ${{ runner.temp }}/markdownlint/doc
+        run: just upstream-drift
+
+      - name: Clippy
+        run: just lint
+
+      - name: Package
+        run: cargo package --locked --allow-dirty
+
+      - name: Dry-run publish
+        run: cargo publish --dry-run --locked --allow-dirty
+
+      - name: Install binary
+        run: |
+          cargo install --path . --locked --force --root "${RUNNER_TEMP}/kml-install-check" --bin kml
+          "${RUNNER_TEMP}/kml-install-check/bin/kml" init-config --config "${RUNNER_TEMP}/kml-install-check/.markdownlint.json"

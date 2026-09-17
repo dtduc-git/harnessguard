@@ -1,0 +1,148 @@
+name: Monthly Spec Update
+
+on:
+  schedule:
+    - cron: "0 6 1 * *" # 1st of every month at 06:00 UTC
+  workflow_dispatch: # Manual trigger for testing
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  update-spec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Research and update spec
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: '--model claude-sonnet-4-6 --max-turns 40 --allowedTools "Read,Edit,Write,WebSearch,WebFetch,Bash(git *),Bash(gh pr *),Bash(gh auth *),Bash(date *)"'
+          prompt: |
+            You are maintaining the MCP Server Security Specification. Your job is to
+            research recent MCP security developments and update the spec documents
+            if there are meaningful new findings.
+
+            Today's date: use `date -u +%Y-%m-%d` to get today's date.
+
+            ---
+
+            ## PHASE 1: RESEARCH
+
+            Search the web for NEW MCP security information. Focus on these categories:
+
+            1. **Official MCP spec changes**: Search for updates to the MCP specification
+               at modelcontextprotocol.io and github.com/modelcontextprotocol/specification.
+               Look for new spec versions, security requirements, authorization changes,
+               or transport changes.
+
+            2. **CVEs**: Search for new CVEs mentioning "MCP" or "Model Context Protocol"
+               at nvd.nist.gov and cve.org. Also search for CVEs in major MCP SDKs
+               (mcp-python, mcp-typescript, mcp-remote).
+
+            3. **OWASP**: Check genai.owasp.org and search for updates to the OWASP MCP
+               Top 10 or related GenAI security guidance.
+
+            4. **Security research**: Search for new MCP security research from
+               invariantlabs.ai, endorlabs.com, unit42.paloaltonetworks.com, cyberark.com,
+               and general security research blogs. Look for new attack techniques,
+               benchmarks, or vulnerability surveys.
+
+            5. **Industry frameworks**: Search for updates from the Coalition for Secure AI
+               (CoSAI) and other industry bodies regarding MCP security guidance.
+
+            6. **MCP ecosystem**: Search for significant MCP security incidents, advisories,
+               or announcements from major MCP server/client implementors.
+
+            For each finding, record:
+            - Source URL
+            - Publication date
+            - Brief summary of what is new
+            - Which spec section(s) it affects (if any)
+
+            ## PHASE 2: TRIAGE
+
+            Read SPEC.md, THREAT_MODEL.md, CHECKLIST.md, and COMPLIANCE_MATRIX.md.
+            Compare each finding against the current content. A finding is ACTIONABLE if:
+
+            - It describes a NEW threat not covered by the existing threat catalog
+            - It provides a NEW CVE that should be added to the references
+            - It updates statistics cited in the spec (e.g., new vulnerability survey data)
+            - It reflects a change to the official MCP specification that affects requirements
+            - It introduces a new mitigation technique or best practice not currently covered
+            - It updates the OWASP MCP Top 10 in a way that affects the compliance matrix
+
+            A finding is NOT actionable if:
+            - It is already covered by existing spec content
+            - It is a general AI security article without MCP-specific implications
+            - It is a minor blog post restating known information
+
+            If NO findings are actionable: create a file called `update-log.md` with a
+            summary of what was searched, the date, and the conclusion that no updates are
+            needed. Commit it directly to main and exit. Do NOT create a PR.
+
+            ## PHASE 3: UPDATE (only if actionable findings exist)
+
+            For each actionable finding, make the minimal, precise edit to the appropriate
+            document(s).
+
+            ### Writing rules
+            - Match the existing document voice, tone, and formatting exactly
+            - Use RFC 2119 normative language (MUST, SHOULD, MAY) consistently
+            - Maintain existing section numbering
+            - When adding references, follow the existing [N] citation format in Appendix A
+            - Do not rewrite existing paragraphs; add new content or update specific claims
+            - Keep checklist items in the same format as existing items
+
+            ### What to update in each document
+            - **SPEC.md**: New threats go in Section 1.2 table. New requirements go in the
+              relevant section. New references go in Appendix A. Updated statistics replace
+              old values with a citation to the new source.
+            - **THREAT_MODEL.md**: New threats get a full entry following the existing format
+              (STRIDE/CWE classification, attack scenario, mitigations, references).
+            - **CHECKLIST.md**: Add items only if a new SPEC.md requirement is added.
+            - **COMPLIANCE_MATRIX.md**: Update if the official MCP spec adds new requirements.
+            - **README.md**: Update statistics in "Why This Exists" if they change.
+            - **CHANGELOG.md**: Add an entry under `## [Unreleased]` for every change made.
+              Use the appropriate subsection (`### Added`, `### Changed`, or `### Removed`).
+              Each entry is a single bullet: `- Brief description ([source](URL))`.
+              Keep entries in reverse chronological order (newest at top of each subsection).
+
+            ### Git workflow
+            1. Get today's date: `date -u +%Y-%m-%d`
+            2. Create branch: `git checkout -b auto-update/YYYY-MM-DD`
+            3. Make all edits
+            4. Stage and commit: `git add -A && git commit -m "Update spec with latest MCP security findings (automated)"`
+            5. Push: `git push -u origin auto-update/YYYY-MM-DD`
+            6. Create PR with `gh pr create` using this format:
+
+            Title: "Monthly spec update: [brief summary]"
+            Body:
+            ## Changes
+            - [list each edit with source URL]
+
+            ## Sources Checked
+            - [every source searched, with date]
+
+            ## Considered But Not Included
+            - [findings that were reviewed but not actionable, with reasoning]
+
+            ---
+            *This PR was auto-generated by the weekly spec update workflow. Review before merging.*
+
+            ## CONSTRAINTS
+
+            - Every change MUST cite a specific, verifiable source URL.
+            - Do NOT make speculative additions.
+            - Do NOT reorganize or refactor existing content.
+            - Do NOT change the version number in SPEC.md.
+            - Do NOT modify the .claude/ or .github/ directories.
+            - If in doubt, do NOT make the change — note it in "Considered But Not Included".

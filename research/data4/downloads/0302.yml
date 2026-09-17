@@ -1,0 +1,781 @@
+name: 'Release: Publish Image'
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/**'
+      - '.devcontainer/**'
+      - '.cursor/**'
+      - '.cursorrules'
+      - 'images/**'
+      - 'LICENSE'
+      - 'fiesta-icon.png'
+      # The updater sidecar ships as its OWN image on its OWN cadence
+      # (build-fiestaupdater.yml, triggered on these same paths) and is not
+      # versioned with the app. Releasing the app for a sidecar-only change
+      # publishes an image whose application code is byte-identical to the
+      # previous one, and then prompts every user to install it.
+      #
+      # That is not hypothetical: #1969 touched only handler.sh and its bats
+      # tests, and cut 8.36.0 — a release whose entire diff outside version
+      # strings was the sidecar. Every FiestaBoard on the network asked to
+      # update to it.
+      #
+      # A PR that changes the sidecar AND app code still releases: paths-ignore
+      # skips a push only when EVERY changed file matches.
+      - 'fiestaupdater/**'
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: read
+  actions: write
+  models: read
+  id-token: write  # required by anthropics/claude-code-action@v1
+
+jobs:
+  # Prevent loop: skip release when this run was triggered by our own version-bump push.
+  # Repository guard: forks that push to their main otherwise self-bump and publish.
+  guard:
+    name: Skip if version-bump commit
+    if: github.repository == 'Fiestaboard/FiestaBoard'
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Check if trigger was a version-bump commit
+        id: check
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          # Skip when head commit is our version-bump (avoids loop when push uses RELEASE_PAT and actor is not github-actions[bot])
+          if echo "$COMMIT_MSG" | head -1 | grep -qE '^chore: bump version to '; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Skipping: trigger commit is a version-bump commit."
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+  prep:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    needs: [guard]
+    if: needs.guard.outputs.skip != 'true'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_sha: ${{ steps.commit.outputs.release_sha }}
+    steps:
+      # Use RELEASE_PAT when branch protection/rulesets block GITHUB_TOKEN from pushing to main.
+      # Add repo secret RELEASE_PAT (PAT with repo scope) and allow that user to bypass rules on main.
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          # Node 24 is the latest Active LTS; react-router 8 needs >= 22.22
+          # (issue #1381) and the Docker image runs Node 26.
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Determine version bump type
+        id: bump_type
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Get the most recent merged PR
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 10
+            });
+            
+            // Find the most recently merged PR
+            const mergedPR = prs.find(pr => 
+              pr.merged_at && 
+              new Date(pr.merged_at) > new Date(Date.now() - 60000) // Within last minute
+            );
+            
+            let bumpType = 'patch'; // default
+            
+            if (mergedPR) {
+              console.log(`Found merged PR #${mergedPR.number}: ${mergedPR.title}`);
+              
+              const labels = mergedPR.labels.map(l => l.name);
+              console.log(`PR labels: ${labels.join(', ')}`);
+              
+              if (labels.includes('major')) {
+                bumpType = 'major';
+              } else if (labels.includes('minor')) {
+                bumpType = 'minor';
+              } else if (labels.includes('patch')) {
+                bumpType = 'patch';
+              }
+            } else {
+              console.log('No recently merged PR found, using default: patch');
+            }
+            
+            console.log(`Version bump type: ${bumpType}`);
+            
+            // Set outputs
+            core.setOutput('bump_type', bumpType);
+            
+            return bumpType;
+          result-encoding: string
+
+      - name: Configure Git
+        run: |
+          git config user.name "FiestaBoard CI"
+          git config user.email "ci@fiestaboard.app"
+
+      - name: Sync with latest main
+        run: |
+          # Ensure we're working with the latest main branch.
+          # This handles the case where main has moved forward since the
+          # workflow was triggered (e.g., when multiple PRs merge in quick
+          # succession or a prior release workflow pushed a version bump).
+          git fetch origin main
+          git checkout -B main origin/main
+          echo "Synced to latest main: $(git rev-parse HEAD)"
+
+      - name: Bump version
+        id: version
+        run: |
+          echo "Bumping version with type: ${{ steps.bump_type.outputs.result }}"
+          node scripts/version-sync.js ${{ steps.bump_type.outputs.result }}
+          
+          # Read the new version from package.json
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "New version: ${NEW_VERSION}"
+
+      - name: Commit version bump
+        id: commit
+        run: |
+          git add package.json web/package.json web/package-lock.json src/__init__.py
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]"
+
+          # Push with retry to handle transient failures or rare race conditions
+          for attempt in 1 2 3; do
+            if git push origin main; then
+              echo "Push succeeded (attempt $attempt)"
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Push failed after 3 attempts"
+              exit 1
+            fi
+            echo "Attempt $attempt failed, pulling latest main and rebasing..."
+            git pull --rebase origin main
+          done
+
+          echo "release_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    needs: [prep]
+    if: needs.prep.result == 'success'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prep.outputs.release_sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Check if already pushed
+        id: check-existing
+        run: |
+          VERSION="${{ needs.prep.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          EXISTING=$(docker buildx imagetools inspect "fiestaboard/fiestaboard:${VERSION}" --raw 2>/dev/null | \
+            jq -r --arg arch "$ARCH" \
+            '.manifests[]? | select(.platform.architecture == $arch and .platform.os == "linux") | .digest' \
+            2>/dev/null) || true
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "fiestaboard/fiestaboard:${VERSION} (${ARCH}) already on Docker Hub — skipping build"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "digest=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push by digest
+        if: steps.check-existing.outputs.skip != 'true'
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          # Pin the production stage explicitly — a target-less build takes
+          # whatever stage is last in the Dockerfile, which once shipped the
+          # dev supervisor config to users (issue #1377).
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ needs.prep.outputs.version }}
+          cache-from: type=gha,scope=build-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.platform }}
+          outputs: type=image,name=fiestaboard/fiestaboard,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          if [ "${{ steps.check-existing.outputs.skip }}" = "true" ]; then
+            digest="${{ steps.check-existing.outputs.digest }}"
+          else
+            digest="${{ steps.build.outputs.digest }}"
+          fi
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge Multi-Platform Image
+    runs-on: ubuntu-latest
+    needs: [prep, build]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t fiestaboard/fiestaboard:${{ needs.prep.outputs.version }} \
+            -t fiestaboard/fiestaboard:latest \
+            $(printf 'fiestaboard/fiestaboard@sha256:%s ' *)
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [prep, merge]
+    if: always() && needs.prep.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prep.outputs.release_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 1 of 3 — gather release context: create the tag, fetch GitHub's
+      # auto-generated changelog, harvest per-PR `<!-- claude-changelog -->`
+      # comments left by the PR Changelog Summary workflow, and stash everything
+      # to /tmp for the Claude summarization step and the final render step.
+      - name: Gather release context
+        id: gather
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const version = '${{ needs.prep.outputs.version }}';
+            const releaseSha = '${{ needs.prep.outputs.release_sha }}';
+            const tagName = `v${version}`;
+
+            // Create a tag pointing to the version-bump commit
+            try {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/tags/${tagName}`,
+                sha: releaseSha
+              });
+              console.log(`Created tag: ${tagName}`);
+            } catch (error) {
+              console.log(`Tag ${tagName} may already exist: ${error.message}`);
+            }
+
+            // Find previous release tag
+            let previousTag = null;
+            try {
+              const { data: releases } = await github.rest.repos.listReleases({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 1
+              });
+              if (releases.length > 0) {
+                previousTag = releases[0].tag_name;
+              }
+            } catch (error) {
+              console.log(`Could not list previous releases: ${error.message}`);
+            }
+
+            // GitHub-auto-generated changelog (uses .github/release.yml for buckets)
+            let autoNotes = '';
+            try {
+              const notesParams = {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tagName,
+                target_commitish: releaseSha
+              };
+              if (previousTag) {
+                notesParams.previous_tag_name = previousTag;
+              }
+              const { data: generated } = await github.rest.repos.generateReleaseNotes(notesParams);
+              autoNotes = generated.body;
+            } catch (error) {
+              console.log(`Could not auto-generate release notes: ${error.message}`);
+            }
+
+            // Build context for Claude: per-PR human-readable changelog lines
+            // (from PR Changelog Summary workflow) + commit messages + areas.
+            let changesContext = '';
+            if (autoNotes) {
+              changesContext += `GitHub auto-generated changelog:\n${autoNotes}\n\n`;
+            }
+
+            const contributors = new Set();
+            const prChangelogLines = [];
+
+            if (previousTag) {
+              try {
+                const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${previousTag}...${releaseSha}`
+                });
+
+                // Contributors
+                for (const commit of comparison.commits) {
+                  const login = commit.author?.login || commit.committer?.login;
+                  if (login && login !== 'github-actions[bot]' && login !== 'web-flow') {
+                    contributors.add(login);
+                  }
+                }
+
+                // PR numbers from merge commit messages — fetch the
+                // <!-- claude-changelog --> comment we left at merge time.
+                const prNumbers = new Set();
+                for (const c of comparison.commits) {
+                  const match = c.commit.message.match(/\(#(\d+)\)|Merge pull request #(\d+)/);
+                  if (match) prNumbers.add(parseInt(match[1] || match[2], 10));
+                }
+
+                for (const num of prNumbers) {
+                  try {
+                    const { data: comments } = await github.rest.issues.listComments({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: num,
+                      per_page: 100
+                    });
+                    const tagged = comments.find(c => c.body && c.body.includes('<!-- claude-changelog -->'));
+                    if (tagged) {
+                      const body = tagged.body.replace('<!-- claude-changelog -->', '').trim();
+                      if (!body.startsWith('SKIP')) {
+                        prChangelogLines.push(`${body} (#${num})`);
+                      }
+                    }
+                  } catch (error) {
+                    console.log(`Could not fetch comments for PR #${num}: ${error.message}`);
+                  }
+                }
+
+                if (prChangelogLines.length > 0) {
+                  changesContext += `Per-PR human-written summaries:\n${prChangelogLines.join('\n')}\n\n`;
+                }
+
+                // Fallback context — raw commit titles
+                const commitMessages = comparison.commits
+                  .map(c => c.commit.message.split('\n')[0])
+                  .filter(msg => !msg.startsWith('chore: bump version to '))
+                  .slice(0, 50);
+                if (commitMessages.length > 0) {
+                  changesContext += `All commits in range:\n${commitMessages.map(m => `- ${m}`).join('\n')}\n\n`;
+                }
+
+                if (comparison.files && comparison.files.length > 0) {
+                  const areas = new Set();
+                  for (const file of comparison.files) {
+                    const parts = file.filename.split('/');
+                    if (parts[0] === 'plugins') areas.add(`${parts[1]} plugin`);
+                    else if (parts[0] === 'web') areas.add('frontend');
+                    else if (parts[0] === 'src') areas.add('backend');
+                    else if (parts[0] === 'docs') areas.add('documentation');
+                  }
+                  if (areas.size > 0) {
+                    changesContext += `Areas affected: ${[...areas].join(', ')}\n`;
+                  }
+                  changesContext += `Total files changed: ${comparison.files.length}\n`;
+                }
+              } catch (error) {
+                console.log(`Could not compare commits: ${error.message}`);
+              }
+            }
+
+            if (changesContext.length > 8000) {
+              changesContext = changesContext.substring(0, 8000) + '\n...(truncated)';
+            }
+
+            // Persist for the Claude step and the render step
+            fs.writeFileSync('/tmp/release-context.md',
+              `# Release ${tagName}\n\n${changesContext}`);
+            fs.writeFileSync('/tmp/release-meta.json', JSON.stringify({
+              version,
+              tagName,
+              releaseSha,
+              previousTag,
+              autoNotes,
+              contributors: [...contributors],
+            }, null, 2));
+
+            console.log(`Wrote /tmp/release-context.md (${changesContext.length} chars)`);
+            console.log(`Found ${prChangelogLines.length} per-PR claude-changelog lines`);
+
+      # Step 2 of 3 — Claude reads the gathered context and writes the
+      # user-facing summary to /tmp/release-summary.md. Uses the same Claude
+      # Code OAuth token as the @claude PR mention workflow — no API key needed.
+      #
+      # Uses claude-code-base-action (the primitive without event-type
+      # filtering); the higher-level claude-code-action@v1 rejects `push`
+      # events with "Unsupported event type", which is what broke every
+      # release after v7.3.0. The base action skips actor permission and
+      # trust-boundary checks — fine here because both the prompt and the
+      # input file (/tmp/release-context.md) are produced by this same
+      # workflow on a trusted push to main.
+      #
+      # continue-on-error: keep the AI summary strictly non-blocking. The
+      # publish step below already tolerates a missing summary file, so any
+      # transient API failure just ships the release without AI bullets
+      # instead of blocking the release entirely.
+      #
+      # Pinned to a SHA rather than @beta: the `beta` tag still points at
+      # e8132bc, whose nested `actions/setup-node@v4.4.0` and
+      # `oven-sh/setup-bun@v2.0.2` both declare `runs.using: node20`. The
+      # runner now executes those on Node 24 anyway and prints a deprecation
+      # notice; the only opt-out is literally named
+      # ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION. The mirror has not cut a tag
+      # since v0.0.63 (Aug 2025) but `main` still syncs daily, and this SHA
+      # pins setup-node v6.4.0 + setup-bun v2.2.0 — both node24. Re-point at
+      # an immutable tag if upstream ever tags again. See issue #1577.
+      #
+      # This also fixes a silent no-op: e8132bc predates `claude_args`, so
+      # every release since logged "Unexpected input(s) 'claude_args'" and
+      # ran without the --model and --allowed-tools below.
+      - name: Generate AI summary with Claude
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@f62f104041341fcdae5378be429d47b424dc130e
+        env:
+          # The action defaults the CLI's runtime to 18.x; align it with the
+          # Node 24 the rest of this repo's workflows use.
+          NODE_VERSION: '24'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: '--model claude-sonnet-4-6 --allowed-tools "Read,Write"'
+          prompt: |
+            You are writing the "Summary" section of FiestaBoard release
+            ${{ needs.prep.outputs.version }}. FiestaBoard is an open-source
+            self-hosted platform for controlling split-flap displays.
+
+            1. Read `/tmp/release-context.md`. It contains GitHub's auto
+               changelog, per-PR human-written summaries (most accurate when
+               present — prefer these), all commit titles, and the areas of
+               the repo affected.
+            2. Write 3-6 polished bullets to `/tmp/release-summary.md` that a
+               FiestaBoard user would read at the top of the release notes.
+               Group bullets into themes when natural:
+                 - New plugins (call them out by name)
+                 - New features / UX improvements
+                 - Bug fixes (only if user-visible)
+               Skip entirely: version bumps, CI tweaks, dependency bumps with
+               no behavior change, internal refactors, test additions, docs.
+               If everything in the release is internal, write a single bullet:
+               "🧹 Internal maintenance — no user-facing changes this release."
+            3. Each bullet:
+                 - Starts with an emoji (🎉 feature, 🔌 plugin, 🎨 UI,
+                   ⚙️  backend, 🐛 fix, 🍓 Pi/setup).
+                 - One sentence, ~15-25 words.
+                 - Leads with what the user can now do, not the implementation.
+                 - No PR numbers (they appear in the auto-generated list below).
+            4. Output ONLY the bullets to `/tmp/release-summary.md` — no
+               heading, no preamble, no trailing prose. Do not edit any other
+               file. Do not run shell commands beyond what Read/Write need.
+
+      # Step 3 of 3 — assemble and publish the release. Reads the Claude
+      # summary from /tmp and the metadata stashed in step 1, then renders
+      # the full body (Pi banner, summary, auto-changelog, install sections,
+      # contributors, links) and creates the GitHub Release.
+      - name: Render and publish release
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const meta = JSON.parse(fs.readFileSync('/tmp/release-meta.json', 'utf8'));
+            const { version, tagName, previousTag, autoNotes, contributors } = meta;
+
+            let aiSummary = '';
+            try {
+              aiSummary = fs.readFileSync('/tmp/release-summary.md', 'utf8').trim();
+            } catch (error) {
+              console.log(`No Claude summary found: ${error.message}`);
+            }
+
+            // Build final release notes
+            let releaseNotes = '';
+
+            // Pi image is built by a separate workflow (build-fiestapi.yml) that
+            // runs after this release is published and takes ~45-60 min. Mark the
+            // release with a banner so users know the .img.xz is on its way; the
+            // Pi workflow strips this block once the image has been attached.
+            // Markers are HTML comments so the regex-strip in build-fiestapi.yml
+            // can find this exact span no matter how the body is edited later.
+            const piPendingBanner =
+              `<!-- pi-image-pending-start -->\n` +
+              `> 🍓 **Raspberry Pi image is building** — the \`FiestaPi-${version}-arm64.img.xz\` ` +
+              `asset will appear in the **Assets** section below once the build completes ` +
+              `(~45-60 min). ` +
+              `[Watch progress](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/workflows/build-fiestapi.yml)\n` +
+              `<!-- pi-image-pending-end -->\n\n`;
+            releaseNotes += piPendingBanner;
+
+            if (aiSummary) {
+              releaseNotes += `## Summary\n\n${aiSummary}\n\n`;
+            }
+            
+            if (autoNotes) {
+              releaseNotes += autoNotes;
+            } else {
+              releaseNotes += `## What's Changed\n\nSee [commit history](https://github.com/${context.repo.owner}/${context.repo.repo}/commits/${tagName}) for changes.`;
+            }
+            
+            if (previousTag) {
+              releaseNotes += `\n\n**Full Changelog**: [\`${previousTag}...${tagName}\`](https://github.com/${context.repo.owner}/${context.repo.repo}/compare/${previousTag}...${tagName})\n`;
+            }
+
+            releaseNotes += `\n---\n\n## Raspberry Pi\n\n`;
+            releaseNotes += `Download the FiestaPi image from the **Assets** section below and flash it to a microSD card — no Docker setup, no command line.\n\n`;
+            releaseNotes += `1. Download \`image_...-fiestapi-lite.img.xz\` from **Assets** below\n`;
+            releaseNotes += `2. Flash it with [Raspberry Pi Imager](https://www.raspberrypi.com/software/) — choose **Use custom** and pick the file\n`;
+            releaseNotes += `3. Boot your Pi — FiestaBoard starts automatically at **http://fiestapi.local:4420**\n\n`;
+            releaseNotes += `Full setup guide: [FiestaPi Quick Start](https://fiestaboard.app/docs/setup/raspberry-pi)\n`;
+            releaseNotes += `\n---\n\n## Docker\n\n`;
+            releaseNotes += `### docker-compose (recommended)\n\n`;
+            releaseNotes += `\`\`\`bash\n`;
+            releaseNotes += `mkdir -p ~/fiestaboard && cd ~/fiestaboard\n`;
+            releaseNotes += `curl -O https://raw.githubusercontent.com/Fiestaboard/FiestaBoard/main/docker-compose.hub.yml\n`;
+            releaseNotes += `docker-compose -f docker-compose.hub.yml up -d\n`;
+            releaseNotes += `\`\`\`\n\n`;
+            releaseNotes += `Open **http://localhost:4420** in your browser.\n\n`;
+            releaseNotes += `### docker pull\n\n`;
+            releaseNotes += `\`\`\`bash\n`;
+            releaseNotes += `docker pull fiestaboard/fiestaboard:${version}\n\n`;
+            releaseNotes += `# or\n`;
+            releaseNotes += `docker pull fiestaboard/fiestaboard:latest\n`;
+            releaseNotes += `\`\`\`\n\n`;
+            releaseNotes += `Supports \`linux/amd64\` and \`linux/arm64\`. Running FiestaBoard in Docker on a Pi? Use these same commands.\n\n`;
+            releaseNotes += `Full setup guide: [Docker Setup](https://fiestaboard.app/docs/setup/quick-start)\n`;
+
+            if (contributors.length > 0) {
+              const sorted = [...contributors].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+              releaseNotes += `\n## Contributors\n\n`;
+              releaseNotes += sorted.map(c => `@${c}`).join(', ');
+              releaseNotes += `\n`;
+            }
+
+            releaseNotes += `\n## 🔗 Links\n\n`;
+            releaseNotes += `- 📖 [Documentation](https://fiestaboard.app)\n`;
+            releaseNotes += `- 🐳 [Docker Hub](https://hub.docker.com/r/fiestaboard/fiestaboard)\n`;
+            releaseNotes += `- 💬 [Discord](https://discord.gg/2GAqKnRF6h)\n`;
+            releaseNotes += `- 🐛 [Report an Issue](https://github.com/${context.repo.owner}/${context.repo.repo}/issues/new)\n`;
+            
+            // Create the release. `make_latest: 'true'` is the API default,
+            // but pin it explicitly so the "View Release" link in the in-app
+            // update banner (which falls back to /releases/latest) always
+            // resolves to the freshest release if the default ever changes.
+            const { data: release } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tagName,
+              name: `Release ${version}`,
+              body: releaseNotes,
+              draft: false,
+              prerelease: false,
+              make_latest: 'true'
+            });
+            
+            console.log(`Created release: ${release.html_url}`)
+
+      # The docs site now lives in Fiestaboard/fiestaboard.github.io, whose
+      # release-snapshot.yml listens for a `release` repository_dispatch and
+      # snapshots + deploys fiestaboard.app for this tag. GITHUB_TOKEN cannot
+      # dispatch cross-repo, so this uses RELEASE_PAT.
+      - name: Notify docs site repo of release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          TAG: v${{ needs.prep.outputs.version }}
+        run: |
+          gh api repos/Fiestaboard/fiestaboard.github.io/dispatches \
+            -f event_type=release \
+            -f "client_payload[tag]=${TAG}"
+
+  dockerhub-description:
+    name: Update Docker Hub Description
+    runs-on: ubuntu-latest
+    needs: [merge]
+    if: needs.merge.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Update Docker Hub Description
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: fiestaboard/fiestaboard
+          readme-filepath: ./DOCKERHUB_README.md
+          short-description: "Open-source self-hosted platform for controlling split-flap displays 🌮"
+          enable-url-completion: true
+
+  revert-on-failure:
+    name: Revert on Build Failure
+    runs-on: ubuntu-latest
+    needs: [prep, merge]
+    if: failure() && needs.merge.result == 'failure'
+    steps:
+      - name: Revert merge
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            console.log('🚨 Docker build failed! Reverting merge...');
+            
+            // Get the commit that triggered this workflow
+            const { data: commit } = await github.rest.repos.getCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha
+            });
+            
+            // Check if this is a merge commit
+            let prNumber = null;
+            let revertMessage = `Revert: ${commit.commit.message.split('\n')[0]}`;
+            
+            // Try to extract PR number from merge commit message
+            const prMatch = commit.commit.message.match(/Merge pull request #(\d+)/);
+            if (prMatch) {
+              prNumber = parseInt(prMatch[1]);
+              revertMessage = `Revert merge of PR #${prNumber} - Docker build failed`;
+            }
+            
+            // Create revert commit
+            try {
+              // Get the parent commit (the one before the merge)
+              const parentSha = commit.parents[0].sha;
+              
+              // Update the main branch to point to the parent
+              await github.rest.git.updateRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: 'heads/main',
+                sha: parentSha,
+                force: true
+              });
+              
+              console.log(`✅ Successfully reverted main to ${parentSha}`);
+              
+              // If we found a PR, comment on it
+              if (prNumber) {
+                try {
+                  // Get PR details
+                  const { data: pr } = await github.rest.pulls.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: prNumber
+                  });
+                  
+                  // Re-open the PR if it was closed
+                  if (pr.state === 'closed') {
+                    await github.rest.pulls.update({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      pull_number: prNumber,
+                      state: 'open'
+                    });
+                    console.log(`✅ Re-opened PR #${prNumber}`);
+                  }
+                  
+                  // Add comment to PR
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    body: `## 🚨 Docker Build Failed\n\nThe merge to \`main\` has been automatically reverted because the Docker build failed.\n\n**Build logs:** ${context.payload.repository.html_url}/actions/runs/${context.runId}\n\nPlease fix the Docker build issues and re-submit this PR.`
+                  });
+                  
+                  console.log(`✅ Posted comment to PR #${prNumber}`);
+                } catch (error) {
+                  console.log(`⚠️  Could not update PR #${prNumber}: ${error.message}`);
+                }
+              } else {
+                // Create an issue if we can't find the PR
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: '🚨 Docker Build Failed - Merge Reverted',
+                  body: `The merge to \`main\` at commit ${context.sha} has been automatically reverted because the Docker build failed.\n\n**Build logs:** ${context.payload.repository.html_url}/actions/runs/${context.runId}\n\nPlease investigate and fix the Docker build issues.`,
+                  labels: ['bug', 'build-failure']
+                });
+                console.log('✅ Created issue for build failure');
+              }
+            } catch (error) {
+              console.error(`❌ Failed to revert: ${error.message}`);
+              core.setFailed(`Failed to revert merge: ${error.message}`);
+            }

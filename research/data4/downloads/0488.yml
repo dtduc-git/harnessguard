@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+
+      - name: Validate public repository contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -nEi '500[, ]?000|500k|mobbin|refero|gummble' -- ':!*.lock' ':!.github/workflows/ci.yml'; then
+            echo "Found a stale 500,000+ claim or provider-specific copy."
+            exit 1
+          fi
+          while IFS= read -r file; do
+            [[ "$file" == */tsconfig.json ]] && continue
+            jq empty "$file"
+          done < <(git ls-files '*.json')
+          for package in \
+            skills/anti-ui-slop \
+            plugins/claude-directory/skills/anti-ui-slop \
+            plugins/openai-directory/uizze/skills/anti-ui-slop \
+            plugins/cursor-agent/skills/anti-ui-slop; do
+            (cd "$package" && sha256sum --check CHECKSUMS.sha256)
+            diff --brief --recursive skills/anti-ui-slop "$package"
+          done
+          (cd skills/ui-design && sha256sum --check CHECKSUMS.sha256)
+          for skill in anti-ui-slop ui-design ui-radar; do
+            test -s "skills/$skill/SKILL.md"
+            grep -qx "name: $skill" "skills/$skill/SKILL.md"
+          done
+
+      - name: Verify plugin consistency
+        run: node plugins/verify.mjs
+
+      - name: Verify GitHub Action
+        run: npm run verify
+        working-directory: integrations/github-action
+
+      - name: Verify benchmark
+        run: npm test
+        working-directory: integrations/benchmark
+
+      - name: Verify finish-gate example
+        run: npm test
+        working-directory: integrations/codex-finish-gate

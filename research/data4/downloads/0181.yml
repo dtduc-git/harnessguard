@@ -1,0 +1,167 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.3.1)'
+        required: true
+        default: 'v1.3.1'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.x'
+
+    - name: Enable pnpm via Corepack
+      run: |
+        corepack enable
+        corepack prepare pnpm@9 --activate
+        pnpm --version
+
+    - name: Install dependencies
+      run: pnpm install --frozen-lockfile
+
+    - name: Create .env file for build
+      run: |
+        touch .env
+        # Add values from GitHub secrets
+        echo "OKTA_CLIENT_ID=$OKTA_CLIENT_ID" >> .env
+        echo "OKTA_DOMAIN=$OKTA_DOMAIN" >> .env
+        echo "MCP_TOKEN_URI=$MCP_TOKEN_URI" >> .env
+        echo "MCP_REMOTE_URI=$MCP_REMOTE_URI" >> .env
+      env:
+        OKTA_CLIENT_ID: ${{ secrets.OKTA_CLIENT_ID }}
+        OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
+        MCP_TOKEN_URI: ${{ secrets.MCP_TOKEN_URI }}
+        MCP_REMOTE_URI: ${{ secrets.MCP_REMOTE_URI }}
+
+    - name: Run tests
+      run: pnpm test
+
+    - name: Lint code
+      run: pnpm run lint
+
+    - name: Build project (local app + install)
+      run: |
+        set -e
+        pnpm build
+        # Ensure install.js is executable
+        if [ -f dist/install.js ]; then chmod +x dist/install.js; fi
+
+    - name: Verify build output
+      run: |
+        ls -la dist/ || (echo "Build failed: dist/ not found" && exit 1)
+        test -f dist/index.js || (echo "Build failed: index.js not found in dist/" && exit 1)
+        test -f dist/install.js || (echo "Build failed: install.js not found in dist/" && exit 1)
+
+    - name: Create release archive
+      run: |
+        # Create a release directory with necessary files
+        mkdir -p release
+
+        # Include ALL files from dist/ (recursively) in the archive
+        cp -R dist/* release/
+        cp package.json release/
+        cp README.md release/
+        cp LICENSE release/
+        cp CHANGELOG.md release/
+
+        # Create tarball
+        tar -czf metalab-mcp-remote-with-okta.tar.gz -C release .
+
+        # Create zip file
+        (cd release && zip -r ../metalab-mcp-remote-with-okta.zip .)
+
+    - name: Get version from tag or input
+      id: get_version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}
+        release_name: Release ${{ steps.get_version.outputs.version }}
+        body: |
+          ## Changes in ${{ steps.get_version.outputs.version }}
+
+          Built from commit: ${{ github.sha }}
+
+          Follow install instructions in [README.md](https://github.com/metalabdesign/metalab-mcp-remote-with-okta#installation)
+
+        draft: false
+        prerelease: false
+
+    - name: Upload Release Asset (tar.gz)
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./metalab-mcp-remote-with-okta.tar.gz
+        asset_name: metalab-mcp-remote-with-okta-${{ steps.get_version.outputs.version }}.tar.gz
+        asset_content_type: application/gzip
+
+    - name: Upload Release Asset (zip)
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./metalab-mcp-remote-with-okta.zip
+        asset_name: metalab-mcp-remote-with-okta-${{ steps.get_version.outputs.version }}.zip
+        asset_content_type: application/zip
+
+    - name: Upload standalone index.js
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/index.js
+        asset_name: metalab-mcp-remote-with-okta.js
+        asset_content_type: application/javascript
+
+    - name: Upload standalone install.js
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/install.js
+        asset_name: install.js
+        asset_content_type: application/javascript
+
+    - name: Zip setup-mcp.command
+      run: |
+        chmod +x scripts/setup-mcp.command
+        (cd scripts && zip -r ../setup-mcp.zip setup-mcp.command)
+
+    - name: Upload setup-mcp.command.zip
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./setup-mcp.zip
+        asset_name: setup-mcp.zip
+        asset_content_type: application/zip

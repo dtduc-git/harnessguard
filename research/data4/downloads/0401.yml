@@ -1,0 +1,27 @@
+name: Qwen Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  qwen:
+    if: ${{ github.event_name != 'issue_comment' || contains(github.event.comment.body, '/qwen') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g @qwen-code/qwen-code
+      - name: Run Qwen Code
+        env:
+          QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
+        run: |
+          qwen -p "Review the changes in this PR. Provide a summary of what changed, potential issues, and suggestions." --print

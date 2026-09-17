@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax (bash -n)
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n skills/launch-film/finish.sh
+          bash -n skills/launch-film/sound-design.sh
+
+      - name: ShellCheck
+        run: shellcheck -S warning install.sh uninstall.sh skills/launch-film/finish.sh skills/launch-film/sound-design.sh || true
+
+      - name: Python compiles
+        run: python3 -m py_compile scripts/*.py
+
+      - name: JSON is valid
+        run: |
+          python3 -c "import json; json.load(open('plugin.json'))"
+          python3 -c "import json; json.load(open('.mcp.json'))"
+
+      - name: .mcp.json has mcpServers wrapper
+        run: python3 -c "import json,sys; d=json.load(open('.mcp.json')); sys.exit(0 if 'mcpServers' in d and 'blockrun' in d['mcpServers'] else 'missing mcpServers.blockrun')"
+
+      - name: No private-context leakage
+        run: |
+          # Scan shipped content; CHANGELOG/CONTRIBUTING legitimately name the guarded term.
+          if grep -rniE "your majesty|陛下|your highness" . \
+               --include='*.md' --include='*.json' --include='*.py' --include='*.sh' \
+               | grep -vE 'prompts/case-library/|CHANGELOG\.md|CONTRIBUTING\.md'; then
+            echo "::error::private-context leak found (see matches above)"; exit 1
+          fi
+          echo "clean"
+
+      - name: Every SKILL.md has name + description frontmatter
+        run: |
+          fail=0
+          for f in skills/*/SKILL.md; do
+            head -20 "$f" | grep -q '^name:' || { echo "::error file=$f::missing name:"; fail=1; }
+            head -20 "$f" | grep -q '^description:' || { echo "::error file=$f::missing description:"; fail=1; }
+          done
+          exit $fail
+
+      - name: Skills registered in plugin.json, install.sh, uninstall.sh
+        run: |
+          fail=0
+          for d in skills/*/; do
+            s=$(basename "$d")
+            grep -q "\"$s\"" plugin.json   || { echo "::error::$s not in plugin.json"; fail=1; }
+            grep -q "$s" install.sh        || { echo "::error::$s not in install.sh SKILLS"; fail=1; }
+            grep -q "$s" uninstall.sh      || { echo "::error::$s not in uninstall.sh SKILLS"; fail=1; }
+          done
+          exit $fail
+
+      - name: README gallery tile count matches claim (60)
+        run: |
+          n=$(grep -oE 'href="prompts/case-library/[^"]+\.md"' README.md | wc -l | tr -d ' ')
+          echo "case-library tiles linked from README: $n"
+          [ "$n" -ge 60 ] || { echo "::error::expected >=60 gallery tiles, found $n"; exit 1; }
+
+  starter-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Lint both launch-film starters
+        # lint is static (no headless Chrome); validate/inspect are run locally before release.
+        run: |
+          for s in starter starter-vertical; do
+            ( cd "skills/launch-film/$s" && npx --yes hyperframes@0.4.42 lint ) || exit 1
+          done

@@ -1,0 +1,148 @@
+name: Guide
+
+on:
+  # Schedule disabled pending a refactor of the curator cadence. Restore by
+  # uncommenting; workflow_dispatch still runs this on demand.
+  # schedule:
+  #   # Weekly on Saturday at 01:00 UTC. One full pass per weekend (the guide has no
+  #   # category rotation), an hour after the catalog weekend run begins.
+  #   - cron: '0 1 * * 6'
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Scope this run to one topic file (or "all")'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - claude-surfaces
+          - skills
+          - mcp-servers
+          - plugins
+          - marketplaces
+          - connectors
+          - decision-tree
+          - advanced/hooks
+          - advanced/slash-commands
+          - advanced/authentication
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: guide
+  cancel-in-progress: false
+
+jobs:
+  guide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compose run prompt
+        run: |
+          SCOPE="${{ inputs.topic }}"
+          SCOPE="${SCOPE:-all}"
+          {
+            cat GUIDE_AGENT.md
+            echo ""
+            echo "---"
+            echo ""
+            echo "## This run"
+            echo "- UTC date: $(date -u +%Y-%m-%d)"
+            echo "- Scope: ${SCOPE}"
+            if [ "${SCOPE}" = "all" ]; then
+              echo "- Update any of the guide files as warranted."
+            else
+              echo "- Limit edits to guide/${SCOPE}.md (plus GUIDE_CHANGELOG.md as required by your instructions)."
+            fi
+          } > .run-prompt.md
+
+      - uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34
+        env:
+          # WebFetch summarizes fetched pages with a small/fast "Haiku" model. Pin it
+          # to a live model so it does not 404 on the retired claude-3-5-haiku-20241022.
+          # The Claude Code bundled in the pinned action (v1.0.88) reads the OLD var
+          # name ANTHROPIC_SMALL_FAST_MODEL; the newer ANTHROPIC_DEFAULT_HAIKU_MODEL is
+          # ignored by that version (verified in CI) — which is why setting only the
+          # latter had no effect. Both are set so the pin can later move to a CC that
+          # uses the new name. Do NOT bump the action to a CC 2.x pin to "fix" this:
+          # CC 2.x sends the context_management API feature, which this org's HIPAA/ZDR
+          # key rejects with a 400, failing every run on turn 1.
+          ANTHROPIC_SMALL_FAST_MODEL: claude-haiku-4-5-20251001
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: claude-haiku-4-5-20251001
+        with:
+          prompt_file: .run-prompt.md
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Sonnet 5, not Opus: this run refreshes reference docs from fetched
+          # primary sources rather than exercising judgment about what to include.
+          # It is also a newer model than the claude-opus-4-8 it replaces.
+          model: claude-sonnet-5
+          # Narrower than it looks — do not rely on it. Observed 2026-07-29: a
+          # first-turn `529 overloaded_error` on claude-opus-5 killed the run with
+          # exit 1 while this was set, so it does NOT rescue a capacity event at the
+          # start of a run. It also cannot cover an unrecognized model string. Kept
+          # only because it costs nothing and may still catch a mid-run failure.
+          fallback_model: claude-sonnet-4-6
+          allowed_tools: "Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
+          # Explicit, because the action's own default is 10 minutes — well short
+          # of the 30 this job allows, so an unset value silently truncated runs.
+          timeout_minutes: "25"
+
+      - name: Commit, push, and notify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          rm -f .run-prompt.md
+          git config user.name "guide-curator[bot]"
+          git config user.email "guide-curator@users.noreply.github.com"
+
+          # Splice in the agent's dated changelog block and rotate older blocks to
+          # GUIDE_CHANGELOG_ARCHIVE.md. The agent writes `.changelog-block.md` instead of
+          # editing a 100 KB+ file, which keeps the changelog out of its context.
+          # If the block file is absent (the agent edited GUIDE_CHANGELOG.md directly, the
+          # older instruction), this still rotates and is a no-op otherwise.
+          python3 scripts/prepend_changelog.py --file GUIDE_CHANGELOG.md \
+            --block .changelog-block.md --keep 12
+          rm -f .changelog-block.md
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No guide changes this run."
+            exit 0
+          fi
+
+          DATE=$(date -u +%Y-%m-%d)
+          git add -A
+          git commit -m "Guide update ${DATE}"
+          # Rebase onto any commits that landed during this run (e.g., the catalog agent finishing first)
+          git pull --rebase origin main
+          git push
+          SHA=$(git rev-parse HEAD)
+
+          ISSUE=$(gh issue list \
+            --state open \
+            --search 'in:title "Guide updates"' \
+            --json number,title \
+            --jq '[.[] | select(.title == "Guide updates")][0].number')
+          if [ -z "${ISSUE}" ] || [ "${ISSUE}" = "null" ]; then
+            ISSUE_URL=$(gh issue create \
+              --title "Guide updates" \
+              --body "Rolling log of guide updates. Each scheduled or on-demand run that produced changes posts a comment here.")
+            ISSUE="${ISSUE_URL##*/}"
+            gh issue pin "${ISSUE}" || true
+          fi
+
+          LATEST=$(awk '/^## / {n++} n>=2 {exit} n==1 {print}' GUIDE_CHANGELOG.md)
+
+          {
+            echo "${LATEST}"
+            echo ""
+            echo "[View commit](${SERVER_URL}/${REPO}/commit/${SHA})"
+          } | gh issue comment "${ISSUE}" --body-file -

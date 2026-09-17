@@ -1,0 +1,80 @@
+name: Publish holy-moly-mcp-remote to PyPI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "remote/**"
+      - ".github/workflows/publish-remote.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    if: github.repository == 'the78mole/holy-moly-mcp'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_tag: ${{ steps.version.outputs.version_tag }}
+      should_release: ${{ steps.version.outputs.changed == 'true' && steps.version.outputs.is_tagged != 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Commit message conventions (checked against commit subject/body since the last v*
+      # tag): `feat!:`/`fix!:`/`refactor!:` -> major bump, `feat:` -> minor bump, anything
+      # else -> patch bump (bump_each_commit: patch increments on every non-major/minor commit).
+      - name: Determine next version
+        id: version
+        uses: paulhatch/semantic-version@v6.0.3
+        with:
+          branch: main
+          tag_prefix: "v"
+          version_format: "${major}.${minor}.${patch}"
+          major_pattern: "/^(feat|fix|refactor)!:/"
+          minor_pattern: "/^feat:/"
+          bump_each_commit: true
+          search_commit_body: true
+
+  release:
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write # to push the release tag and create the GitHub release
+      id-token: write # for PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set package version
+        run: |
+          sed -i "s/^version = .*/version = \"${{ needs.version.outputs.version }}\"/" remote/pyproject.toml
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.2
+
+      - name: Build
+        run: uv build --package holy-moly-mcp-remote --out-dir remote/dist
+
+      - name: Tag release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ needs.version.outputs.version_tag }}" -m "holy-moly-mcp-remote ${{ needs.version.outputs.version }}"
+          git push origin "${{ needs.version.outputs.version_tag }}"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version.outputs.version_tag }}
+          name: "holy-moly-mcp-remote ${{ needs.version.outputs.version }}"
+          generate_release_notes: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: remote/dist

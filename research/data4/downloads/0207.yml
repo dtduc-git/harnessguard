@@ -1,0 +1,97 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    # Optional: Only run on specific file changes  
+    # paths:
+    #   - "src/**/*.kt"
+    #   - "src/**/*.kts"
+    #   - "src/**/*.java"
+    #   - "build.gradle.kts"
+    #   - "settings.gradle.kts"
+
+# Prevent duplicate Claude review runs on the same PR
+# This will cancel any in-progress review when a new commit is pushed to the PR
+concurrency:
+  # Group by PR number to ensure only one review runs per PR at a time
+  group: claude-review-pr-${{ github.event.pull_request.number }}
+  # Cancel previous review when new commits are pushed
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    # Optional: Filter by PR author
+    # if: |
+    #   github.event.pull_request.user.login == 'external-contributor' ||
+    #   github.event.pull_request.user.login == 'new-developer' ||
+    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+    
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read          # Required to read code for review
+      pull-requests: write     # Required to comment on PRs
+      issues: write           # Required for issue interactions
+      id-token: write         # Required for OIDC authentication
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better diff analysis
+
+      - name: Read code reviewer personality
+        id: read-personality
+        run: |
+          if [ -f .claude/agents/code-reviewer.md ]; then
+            # Read the file content and store in environment variable
+            {
+              echo 'REVIEWER_PERSONALITY<<EOF'
+              cat .claude/agents/code-reviewer.md
+              echo 'EOF'
+            } >> $GITHUB_ENV
+          else
+            echo "REVIEWER_PERSONALITY=Please review this pull request and provide constructive feedback." >> $GITHUB_ENV
+          fi
+
+      - name: Run Claude Code Review
+        id: claude-review
+        timeout-minutes: 30  # Prevent runaway test execution
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Configure Linear MCP server for issue context
+          mcp_config: |
+            {
+              "mcpServers": {
+                "linear": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.linear.app/sse"],
+                  "env": {
+                    "LINEAR_API_KEY": "${{ secrets.LINEAR_API_KEY }}"
+                  }
+                }
+              }
+            }
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request with the following personality and approach:
+
+            ${{ env.REVIEWER_PERSONALITY }}
+
+            Note: The PR branch is already checked out in the current working directory.
+
+            Use `gh pr comment` for top-level feedback.
+            Only post GitHub comments - don't submit review text as messages.
+          use_sticky_comment: true
+          # Security-bounded tool access for comprehensive code review
+          # - Read/Grep/Glob: Read source files and search codebase
+          # - Bash(./gradlew:*): Execute Gradle tests (30min timeout enforced above)
+          # - Bash(gh pr:*): GitHub PR operations (preserved from original)
+          # - mcp__linear-server__*: Read-only Linear access (no create/update)
+          claude_args: |
+            --allowedTools "Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(./gradlew:*),mcp__linear-server__get_issue,mcp__linear-server__list_comments,mcp__linear-server__list_issue_statuses"
+

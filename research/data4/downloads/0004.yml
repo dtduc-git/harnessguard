@@ -1,0 +1,1762 @@
+# The "publish" half of the two-workflow release flow. Fires
+# automatically when a Release PR (from `release-pr.yml`) merges —
+# detects it via the `release: v<semver>` commit message on the
+# merge commit. A `workflow_dispatch` fallback lets a human re-run
+# the publish side manually when the auto-trigger needs a kick.
+#
+# Phase 6d: tag-all + publish-crate + publish-ffi + finalize.
+# Phase 6e adds publish-desktop.
+# Phase 6f adds build-python-wheels + publish-python.
+# Phase 6g adds build-nodejs-binaries + publish-nodejs.
+# Phase 6h adds publish-wasm.
+# Phase 6i adds publish-go (no registry — git tag + GitHub Release
+# with the FFI tarballs attached for users who want prebuilt
+# libsqlrite_c alongside `go get`).
+#
+# Design doc: docs/release-plan.md.
+# One-time registry / branch-protection setup: docs/release-secrets.md.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to (re-)publish. Use only when the auto-trigger needs a manual kick.'
+        required: true
+        type: string
+
+# `contents: write` — tag creation + GitHub Release uploads.
+permissions:
+  contents: write
+
+# Only one release at a time across the whole workflow. Back-to-back
+# merges of two Release PRs (which should never happen, but still)
+# run serially rather than racing on tag creation.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Step 1: figure out whether this push commit is actually a release
+  # (and extract the version from the commit message), or just a
+  # regular push we should ignore. Runs on every push to main.
+  detect:
+    name: Detect release commit
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      should_release: ${{ steps.parse.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: parse
+        # On workflow_dispatch, trust the input verbatim (validated
+        # by the dispatcher).
+        # On push, parse the top line of the HEAD commit message.
+        # If it matches `release: vX.Y.Z`, extract and proceed.
+        # Anything else is a regular commit — exit silently.
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Manually dispatched release for v$VERSION"
+            exit 0
+          fi
+
+          # GitHub's default squash-merge title is `<PR title> (#N)` —
+          # e.g. `release: v0.1.2 (#18)`. Strip the trailing ` (#N)` so
+          # the regex matches both the squash-merge form and the
+          # stripped-title form (we still recommend editing to the
+          # latter, but should-just-work beats should-remember).
+          MSG=$(git log -1 --pretty=%s | sed -E 's/ \(#[0-9]+\)$//')
+          if [[ "$MSG" =~ ^release:\ v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release commit detected: v$VERSION"
+          else
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Not a release commit — skipping"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Step 2: push per-product tags against the current commit. Runs
+  # BEFORE any publish step so a bad version number (e.g., tag
+  # already exists for some reason) aborts the whole release cleanly.
+  #
+  # As of Phase 6g, we tag:
+  #   - sqlrite-v<V>           (Rust engine)
+  #   - sqlrite-ffi-v<V>       (C FFI prebuilt binaries)
+  #   - sqlrite-desktop-v<V>   (Tauri desktop installers)
+  #   - sqlrite-py-v<V>        (Python wheels on PyPI)
+  #   - sqlrite-node-v<V>      (Node.js N-API bindings on npm)
+  #   - v<V>                   (umbrella)
+  #
+  # Later phases add sqlrite-wasm-v<V>, sdk/go/v<V> as their
+  # publish jobs come online.
+  #
+  # Idempotent on re-run: if a tag already exists (partial-failure
+  # scenario where publish-crate succeeded but publish-ffi failed,
+  # say), we skip instead of failing. Lets "Re-run failed jobs" in
+  # the GitHub UI actually work.
+  tag-all:
+    name: Tag all products
+    needs: detect
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need tag history to check existing tags.
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create + push tags
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          TAGS=(
+            "sqlrite-v$V"
+            "sqlrite-ffi-v$V"
+            "sqlrite-ask-v$V"
+            "sqlrite-mcp-v$V"
+            "sqlrite-desktop-v$V"
+            "sqlrite-py-v$V"
+            "sqlrite-node-v$V"
+            "sqlrite-notes-v$V"
+            "sqlrite-wasm-v$V"
+            "sdk/go/v$V"
+            "v$V"
+          )
+          for tag in "${TAGS[@]}"; do
+            if git rev-parse "$tag" >/dev/null 2>&1; then
+              echo "::notice::Tag $tag already exists — skipping (re-run scenario)"
+            else
+              git tag "$tag"
+              echo "Created tag $tag"
+            fi
+          done
+          git push --tags
+
+  # ---------------------------------------------------------------------------
+  # Step 3a: publish the Rust engine crate to crates.io + create
+  # its per-product GitHub Release. Gated by the `release`
+  # environment's required-reviewer rule (a maintainer has to
+  # click Approve before this job actually runs).
+  publish-crate:
+    name: Publish sqlrite crate to crates.io
+    # Engine depends on sqlrite-ask (post-v0.1.19 dep-direction flip), so
+    # publish-ask must complete first — otherwise crates.io rejects the
+    # engine publish with "failed to select a version for the requirement
+    # `sqlrite-ask = "^X.Y"`". This was masked through 0.1.x because old
+    # sqlrite-ask versions were already on crates.io and the engine's
+    # version requirement (`^0.1`) matched them; the v0.2.0 cut surfaced
+    # the latent bug.
+    needs: [detect, tag-all, publish-ask]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-crate
+
+      # Idempotency guard (SQLR-12). A re-dispatch of release.yml at a
+      # version where some-but-not-all artifacts already published (the
+      # v0.11.0 partial failure: the engine 413'd but every other channel
+      # had already shipped) must SKIP what's done and publish only what's
+      # missing — instead of erroring with "crate version already uploaded".
+      # crates.io returns HTTP 200 for an existing crate@version, 404 for a
+      # missing one. The `User-Agent` header is mandatory: crates.io 403s
+      # any request without one. On a transport error (curl fails → "000")
+      # we fall through to publish, preserving the old fail-loud behavior.
+      - name: Skip if already on crates.io
+        id: published_check
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: sqlrite-release-ci (https://github.com/joaoh82/rust_sqlite)' \
+            "https://crates.io/api/v1/crates/sqlrite-engine/$V" || true)
+          CODE=${CODE:-000}
+          if [ "$CODE" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-engine@$V already on crates.io (HTTP 200) — skipping cargo publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-engine@$V not found on crates.io (HTTP $CODE) — will publish"
+          fi
+
+      - name: cargo publish
+        if: steps.published_check.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          # `--no-verify` skips the rebuild+test that publish does
+          # by default — CI already ran on the same commit on the
+          # Release PR, so re-running here is duplicate work.
+          #
+          # Package name on crates.io is `sqlrite-engine`, not
+          # `sqlrite` — the latter was taken by an unrelated project
+          # (see root Cargo.toml for context). The [lib] name is
+          # still `sqlrite`, so downstream code writes `use sqlrite::…`.
+          cargo publish -p sqlrite-engine --no-verify
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-v${{ needs.detect.outputs.version }}
+          name: Rust engine v${{ needs.detect.outputs.version }}
+          body: |
+            Published to crates.io: https://crates.io/crates/sqlrite-engine/${{ needs.detect.outputs.version }}
+
+            ```toml
+            [dependencies]
+            sqlrite-engine = "${{ needs.detect.outputs.version }}"
+            ```
+
+            ```rust
+            // The [lib] name stays `sqlrite`, so the import alias is
+            // the short one even though the package name is longer.
+            use sqlrite::{Database, ExecutionResult};
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3a': publish the `sqlrite-ask` crate (Phase 7g.1) — natural-
+  # language → SQL adapter. Since the v0.1.19 dep-direction flip,
+  # sqlrite-ask is dep-free of sqlrite-engine — it's a pure-string-in /
+  # string-out adapter. The engine depends on IT, not the other way
+  # around. So this job runs FIRST in the publish chain; publish-crate
+  # waits on it.
+  #
+  # Crate name on crates.io: `sqlrite-ask`. Library name (the `use`
+  # path): `sqlrite_ask`. No alias-renaming this time — the short
+  # name was available unlike `sqlrite` (see Phase 6d retrospective
+  # for why the engine had to rename).
+  publish-ask:
+    name: Publish sqlrite-ask crate to crates.io
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-ask
+
+      # Idempotency guard (SQLR-12) — see publish-crate for the full
+      # rationale. crates.io: 200 = already published (skip), else publish.
+      - name: Skip if already on crates.io
+        id: published_check
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: sqlrite-release-ci (https://github.com/joaoh82/rust_sqlite)' \
+            "https://crates.io/api/v1/crates/sqlrite-ask/$V" || true)
+          CODE=${CODE:-000}
+          if [ "$CODE" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-ask@$V already on crates.io (HTTP 200) — skipping cargo publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-ask@$V not found on crates.io (HTTP $CODE) — will publish"
+          fi
+
+      - name: cargo publish
+        if: steps.published_check.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        # `--no-verify` mirrors `publish-crate` — Release-PR CI
+        # already validated this commit. sqlrite-ask has no
+        # SQLRite-internal path-deps after the v0.1.19 dep-direction
+        # flip, so this job is unblocked the moment `tag-all` lands.
+        run: cargo publish -p sqlrite-ask --no-verify
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-ask-v${{ needs.detect.outputs.version }}
+          name: sqlrite-ask v${{ needs.detect.outputs.version }}
+          body: |
+            Published to crates.io: https://crates.io/crates/sqlrite-ask/${{ needs.detect.outputs.version }}
+
+            Natural-language → SQL adapter for SQLRite. Anthropic-first; OpenAI / Ollama follow-ups.
+
+            ```toml
+            [dependencies]
+            sqlrite-engine = "${{ needs.detect.outputs.version }}"
+            sqlrite-ask    = "${{ needs.detect.outputs.version }}"
+            ```
+
+            ```rust
+            use sqlrite::Connection;
+            use sqlrite_ask::{AskConfig, ConnectionAskExt};
+
+            let conn = Connection::open("foo.sqlrite")?;
+            let cfg  = AskConfig::from_env()?;        // SQLRITE_LLM_API_KEY etc.
+            let resp = conn.ask("How many users are over 30?", &cfg)?;
+            println!("Generated SQL: {}", resp.sql);
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3a'': publish the `sqlrite-mcp` crate (Phase 7h) — Model
+  # Context Protocol server adapter that exposes SQLRite as a
+  # stdio-spawned tool surface for LLM agents (Claude Code, Cursor,
+  # mcp-inspector, etc.). Same shape as `publish-ask` above; gated
+  # `needs: publish-crate, publish-ask` because sqlrite-mcp depends
+  # on both (the engine via `default-features = false` + the engine's
+  # `ask` feature for the natural-language → SQL `ask` tool).
+  #
+  # Crate name on crates.io: `sqlrite-mcp`. Binary name produced by
+  # `cargo install`: `sqlrite-mcp` (one [[bin]] target). Per-platform
+  # prebuilt binary tarballs are produced by `build-mcp-binaries`
+  # below — `cargo install` is the from-source path.
+  publish-mcp:
+    name: Publish sqlrite-mcp crate to crates.io
+    needs: [detect, tag-all, publish-crate, publish-ask]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-mcp
+
+      # Idempotency guard (SQLR-12) — see publish-crate for the full
+      # rationale. crates.io: 200 = already published (skip), else publish.
+      - name: Skip if already on crates.io
+        id: published_check
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: sqlrite-release-ci (https://github.com/joaoh82/rust_sqlite)' \
+            "https://crates.io/api/v1/crates/sqlrite-mcp/$V" || true)
+          CODE=${CODE:-000}
+          if [ "$CODE" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-mcp@$V already on crates.io (HTTP 200) — skipping cargo publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-mcp@$V not found on crates.io (HTTP $CODE) — will publish"
+          fi
+
+      - name: cargo publish
+        if: steps.published_check.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        # `--no-verify` mirrors `publish-crate` / `publish-ask` —
+        # Release-PR CI already validated this commit.
+        #
+        # `needs: [..., publish-crate, publish-ask]` is load-bearing:
+        # sqlrite-mcp's path-dep on sqlrite-engine + (transitive)
+        # sqlrite-ask only resolves on crates.io once both have been
+        # published at the matching version. crates.io rejects
+        # path-dep publishes whose path-dep version isn't reachable.
+        run: cargo publish -p sqlrite-mcp --no-verify
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-mcp-v${{ needs.detect.outputs.version }}
+          name: sqlrite-mcp v${{ needs.detect.outputs.version }}
+          body: |
+            Published to crates.io: https://crates.io/crates/sqlrite-mcp/${{ needs.detect.outputs.version }}
+
+            Model Context Protocol (MCP) server for SQLRite. Wraps a SQLRite database as a stdio-spawned subprocess that LLM agents (Claude Code, Cursor, `mcp-inspector`) can drive without custom integration code.
+
+            ```sh
+            cargo install sqlrite-mcp
+            ```
+
+            ```json
+            // ~/.claude.json
+            {
+              "mcpServers": {
+                "sqlrite": {
+                  "command": "sqlrite-mcp",
+                  "args": ["/path/to/your.sqlrite"],
+                  "env": { "SQLRITE_LLM_API_KEY": "sk-ant-…" }
+                }
+              }
+            }
+            ```
+
+            Seven tools: `list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, `ask`. Pass `--read-only` to hide `execute`. Pre-built binary tarballs (no Rust toolchain required) are attached to this release as well — see `sqlrite-mcp-v${{ needs.detect.outputs.version }}-{platform}.tar.gz`.
+
+            Full docs: https://github.com/joaoh82/rust_sqlite/blob/main/docs/mcp.md
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3a''': build the `sqlrite-mcp` binary for each supported
+  # platform and upload the per-platform tarballs to the
+  # `sqlrite-mcp-v<V>` GitHub Release. So users who don't want to
+  # `cargo install` (no Rust toolchain) can grab a tarball and drop
+  # the binary on their PATH.
+  #
+  # Matrix mirrors `publish-ffi` — same four platforms, same
+  # "aarch64 on macOS, x86_64 elsewhere" choice. The binary is much
+  # smaller than the FFI artifact (one [[bin]], no .so/.a files) so
+  # we just package the executable + the README.
+  build-mcp-binaries:
+    name: Build sqlrite-mcp binary (${{ matrix.platform }})
+    needs: [detect, tag-all, publish-mcp]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            bin: sqlrite-mcp
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            bin: sqlrite-mcp
+          - os: macos-latest
+            platform: macos-aarch64
+            bin: sqlrite-mcp
+          - os: windows-latest
+            platform: windows-x86_64
+            bin: sqlrite-mcp.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-mcp-${{ matrix.platform }}
+
+      - name: Build sqlrite-mcp
+        # Default features include `ask`, so the binary ships with the
+        # natural-language → SQL tool wired in. Users who want a leaner
+        # build (no LLM machinery, six pure-SQL tools) can
+        # `cargo install sqlrite-mcp --no-default-features` from source.
+        run: cargo build --release -p sqlrite-mcp
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          STAGE="sqlrite-mcp-v$V-${{ matrix.platform }}"
+          mkdir -p "$STAGE"
+          cp "target/release/${{ matrix.bin }}" "$STAGE/"
+          cat > "$STAGE/README" <<EOF
+          sqlrite-mcp v$V — ${{ matrix.platform }}
+
+          Model Context Protocol server for SQLRite.
+
+          Drop the binary on your PATH and wire it into your MCP client
+          (Claude Code, Cursor, mcp-inspector, etc.):
+
+            sqlrite-mcp /path/to/your.sqlrite              # read-write
+            sqlrite-mcp /path/to/your.sqlrite --read-only  # shared-lock RO
+            sqlrite-mcp --in-memory                        # ephemeral
+
+          Full docs: https://github.com/joaoh82/rust_sqlite/blob/main/docs/mcp.md
+          EOF
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          echo "ASSET=$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-mcp-v${{ needs.detect.outputs.version }}
+          name: sqlrite-mcp v${{ needs.detect.outputs.version }}
+          files: ${{ env.ASSET }}
+          # The release body was already populated by `publish-mcp`
+          # above; this job only attaches assets. Don't overwrite it.
+          append_body: false
+
+  # ---------------------------------------------------------------------------
+  # Step 3b: build `libsqlrite_c` for each supported platform and
+  # upload the tarballs to the `sqlrite-ffi-v<V>` GitHub Release.
+  #
+  # Matrix covers the platforms the Go / Python / Node SDKs' cgo /
+  # dlopen paths care about. Note: macos-latest is Apple Silicon
+  # (aarch64). A universal binary (x86_64 + aarch64 lipo'd
+  # together) is a follow-up — the MVP ships aarch64-only for
+  # macOS. Add `macos-13` to the matrix if x86_64 Mac support
+  # becomes a real ask.
+  publish-ffi:
+    name: Publish C FFI (${{ matrix.platform }})
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            shared_lib: libsqlrite_c.so
+            static_lib: libsqlrite_c.a
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            shared_lib: libsqlrite_c.so
+            static_lib: libsqlrite_c.a
+          - os: macos-latest
+            platform: macos-aarch64
+            shared_lib: libsqlrite_c.dylib
+            static_lib: libsqlrite_c.a
+          - os: windows-latest
+            platform: windows-x86_64
+            shared_lib: sqlrite_c.dll
+            static_lib: sqlrite_c.lib
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-ffi-${{ matrix.platform }}
+
+      - name: Build libsqlrite_c
+        run: cargo build --release -p sqlrite-ffi
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          STAGE="sqlrite-ffi-v$V-${{ matrix.platform }}"
+          mkdir -p "$STAGE/lib" "$STAGE/include"
+          cp "target/release/${{ matrix.shared_lib }}" "$STAGE/lib/"
+          cp "target/release/${{ matrix.static_lib }}" "$STAGE/lib/" 2>/dev/null || \
+            echo "::warning::static lib ${{ matrix.static_lib }} not found on ${{ matrix.platform }} — shipping shared lib only"
+          cp "sqlrite-ffi/include/sqlrite.h" "$STAGE/include/"
+          # README pointer so end users know what they're looking at
+          # when they untar the download.
+          cat > "$STAGE/README" <<EOF
+          SQLRite C FFI v$V — ${{ matrix.platform }}
+
+          Contents:
+            lib/ ${{ matrix.shared_lib }}  — dynamic library to link against
+            lib/ ${{ matrix.static_lib }}  — static library (if present)
+            include/ sqlrite.h             — C header
+
+          Full docs: https://github.com/joaoh82/rust_sqlite/blob/main/sqlrite-ffi/README.md
+          EOF
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          # Emit the path for the upload step below.
+          echo "ASSET=$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-ffi-v${{ needs.detect.outputs.version }}
+          name: C FFI v${{ needs.detect.outputs.version }}
+          body: |
+            Prebuilt `libsqlrite_c` for every supported platform, plus the `sqlrite.h` header.
+
+            Download the tarball for your platform, extract, and link:
+
+            ```
+            tar xzf sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>.tar.gz
+            # lib/   — dynamic + static libraries
+            # include/sqlrite.h — header to #include
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3c: build the Tauri desktop app for each supported platform
+  # and upload the installers to the `sqlrite-desktop-v<V>` GitHub
+  # Release. (Phase 6e.)
+  #
+  # Matrix mirrors publish-ffi's — same three OS families, same
+  # "aarch64 on macOS, x86_64 elsewhere" choice. The actual installer
+  # formats per platform come from Tauri's bundler, not the matrix:
+  #   - ubuntu-22.04 → AppImage + .deb           (x86_64)
+  #   - macos-latest → .dmg                       (aarch64)
+  #   - windows-latest → .msi                     (x86_64)
+  #
+  # ubuntu-22.04 (not ubuntu-latest) is deliberate: AppImage links
+  # glibc at build time, so building on 22.04 (glibc 2.35) yields
+  # an AppImage that runs on any distro with glibc ≥ 2.35 — which
+  # covers everything shipped since 2022. Building on ubuntu-latest
+  # (24.04, glibc 2.39) would produce an AppImage that refuses to
+  # launch on Debian 12 / Ubuntu 22.04 and older.
+  #
+  # macOS universal (x86_64 + aarch64 lipo'd together) + Linux
+  # aarch64 desktop are follow-ups — same MVP-simplicity reasoning
+  # as publish-ffi. Apple Silicon is the majority of Mac downloads
+  # and x86_64 Linux is the majority of Linux downloads, so this
+  # covers 95%+ of users on day one.
+  #
+  # Installers ship **unsigned** — Phase 6.1 wires up Apple
+  # Developer ID + Windows code-signing cert. Unsigned installers
+  # trigger the expected "unidentified developer" / SmartScreen
+  # warnings; the release body explains how to bypass them.
+  publish-desktop:
+    name: Publish desktop (${{ matrix.platform }})
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+          - os: macos-latest
+            platform: macos-aarch64
+          - os: windows-latest
+            platform: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-desktop-${{ matrix.platform }}
+          workspaces: './ -> target'
+
+      # Linux-only: Tauri's webview backend is webkit2gtk, which
+      # isn't preinstalled on GitHub runners. libayatana-appindicator
+      # / librsvg2 / patchelf are the rest of the standard Tauri
+      # Linux build kit. Matches the `desktop-build` job in ci.yml.
+      - name: Install Tauri Linux deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: npm ci
+        working-directory: desktop
+        run: npm ci
+
+      # Icons (icon.ico, icon.icns, size-specific PNGs for Linux,
+      # mobile assets) are pre-generated in the repo via `npx tauri
+      # icon src-tauri/icons/icon.png` and committed to
+      # `desktop/src-tauri/icons/`. That keeps CI deterministic and
+      # saves ~10s per matrix cell; the tradeoff is that anyone
+      # changing `icon.png` needs to re-run `tauri icon` locally and
+      # commit the regenerated assets (PR review catches this).
+
+      # tauri-action does: frontend build (via beforeBuildCommand) →
+      # `cargo tauri build` → bundle installers per platform → upload
+      # each installer to the target GitHub Release. It reads
+      # tauri.conf.json for bundle config, so flipping `bundle.active`
+      # from `false` to `true` there is what actually causes installers
+      # to get produced. `tagName` is templated so the action doesn't
+      # create its own tag — we already did that in `tag-all`.
+      - name: Build + upload installers
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: sqlrite-desktop-v${{ needs.detect.outputs.version }}
+          releaseName: Desktop v${{ needs.detect.outputs.version }}
+          releaseBody: |
+            SQLRite desktop app — unsigned installers. This release wave ships:
+
+            - **Linux**: `.AppImage` + `.deb` (Debian/Ubuntu) + `.rpm` (Fedora/RHEL), x86_64
+            - **macOS**: `.dmg` + raw `.app.tar.gz`, Apple Silicon (aarch64). Intel Macs not supported yet — tracked as a Phase 6e follow-up (universal dmg).
+            - **Windows**: `.msi` + `.exe` (NSIS installer), x86_64
+
+            ### ⚠️ Unsigned installer warnings
+
+            Installers aren't code-signed yet (Phase 6.1 wires up Apple Developer ID + Windows code-signing). First-launch warnings to expect:
+
+            **macOS — "SQLRite is damaged and can't be opened" or "unidentified developer":**
+
+            ```bash
+            xattr -cr /Applications/SQLRite.app
+            ```
+
+            This strips the `com.apple.quarantine` attribute your browser attached on download. macOS Gatekeeper shows "damaged" (not the gentler "unidentified developer") because Tauri ad-hoc signs the binary — Apple Silicon *requires* a signature, even an ad-hoc one, but quarantined ad-hoc signatures trip a stricter Gatekeeper path. The app is fine; the signature just isn't from a registered Apple Developer ID.
+
+            **Windows — SmartScreen "Windows protected your PC":**
+
+            Click "More info" → "Run anyway".
+
+            **Linux — AppImage:**
+
+            ```bash
+            chmod +x SQLRite_*_amd64.AppImage
+            ./SQLRite_*_amd64.AppImage
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          releaseDraft: false
+          prerelease: false
+          projectPath: desktop
+          # tauri-action's default is to create the release if it
+          # doesn't exist. Since we want the release to aggregate
+          # artifacts across all three matrix jobs, the first job
+          # to finish creates it; the other two upload additional
+          # files to the same release. (action is idempotent on
+          # this — it uses `tagName` as the identity key.)
+
+  # ---------------------------------------------------------------------------
+  # Step 3d: build Python wheels for every supported platform.
+  # (Phase 6f — build half; publish half lives in the next job.)
+  #
+  # Why the split: PyPI expects wheels to be uploaded as one
+  # batch — if publish-python-wheels had publish logic inline,
+  # each matrix cell would race to upload its wheel independently,
+  # and a failure mid-matrix would leave PyPI with a partial wave.
+  # The two-job shape lets us aggregate every wheel (+ sdist) into
+  # one `dist/` directory and do the upload as a single atomic
+  # step in the `publish-python` job below.
+  #
+  # Matrix mirrors publish-ffi / publish-desktop — same four
+  # OS / arch combinations. abi3-py38 means each platform gets
+  # ONE wheel that works on every CPython ≥ 3.8, so we don't
+  # need a per-Python-version matrix axis.
+  build-python-wheels:
+    name: Build Python wheel (${{ matrix.platform }})
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            platform: linux-x86_64
+            manylinux: auto
+          - os: ubuntu-24.04-arm
+            target: aarch64
+            platform: linux-aarch64
+            manylinux: auto
+          - os: macos-latest
+            target: aarch64
+            platform: macos-aarch64
+            manylinux: ""
+          - os: windows-latest
+            target: x64
+            platform: windows-x86_64
+            manylinux: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.10 is the build interpreter; abi3 means the wheel
+          # itself runs on every CPython ≥ 3.8. Any recent
+          # Python on the runner would work — 3.10 is just
+          # well-supported + cached on all runner images.
+          python-version: '3.10'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-python-wheels-${{ matrix.platform }}
+
+      # `maturin-action` builds + packages the wheel. For Linux
+      # `manylinux: auto` means it runs inside a manylinux2014
+      # container so glibc gets baked at an old-enough version
+      # that the wheel runs on any distro shipped since ~2014.
+      # macOS / Windows don't use manylinux — the wheel tags
+      # reflect the specific OS version it was built on.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: sdk/python
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: ${{ matrix.manylinux }}
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel-${{ matrix.platform }}
+          path: sdk/python/dist/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Step 3e: build the Python source distribution.
+  #
+  # Uploaded alongside the wheels so users on odd platforms not
+  # covered by our wheel matrix (FreeBSD, alpine aarch64, etc.)
+  # can still `pip install sqlrite` and get a source build
+  # (requires their local Rust toolchain, which is the standard
+  # fallback path for any PyO3 crate).
+  build-python-sdist:
+    name: Build Python sdist
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: sdk/python
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: sdk/python/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Step 3f: aggregate every wheel + the sdist, upload to PyPI
+  # via OIDC trusted publishing, and cut the per-product
+  # `sqlrite-py-v<V>` GitHub Release.
+  #
+  # OIDC trusted publishing: no long-lived PyPI API token exists
+  # anywhere. The `permissions: id-token: write` block below
+  # lets `pypa/gh-action-pypi-publish` mint a short-lived OIDC
+  # token, exchange it at PyPI for a one-time upload token, and
+  # push every wheel. PyPI-side config lives on the `sqlrite`
+  # project's settings page — see docs/release-secrets.md for
+  # the one-time trusted-publisher registration.
+  publish-python:
+    name: Publish Python wheels to PyPI
+    needs: [detect, tag-all, build-python-wheels, build-python-sdist]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # OIDC: required for PyPI trusted-publisher token exchange.
+      id-token: write
+      # For the softprops/action-gh-release step at the end.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pull every wheel artifact (one per matrix platform) +
+      # the sdist into a single `dist/` directory.
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: python-sdist
+          path: dist
+
+      - name: List files about to be uploaded
+        run: ls -la dist/
+
+      # Idempotency log line (SQLR-12). PyPI's JSON API returns HTTP 200
+      # for an existing project/version, 404 otherwise. Unlike the
+      # single-artifact crates.io / npm jobs, PyPI's publish unit is a
+      # *set* of files (one wheel per platform + the sdist), so we do NOT
+      # gate the whole step on this check: a partial wave (some wheels
+      # landed before the job died) would leave the version "present" yet
+      # incomplete, and a version-level skip would strand the missing
+      # wheels. Instead this step just records the state in the run log;
+      # `skip-existing: true` below does the actual file-granular skipping.
+      - name: Report PyPI publish state
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/sqlrite/$V/json" || true)
+          CODE=${CODE:-000}
+          if [ "$CODE" = "200" ]; then
+            echo "::notice::sqlrite==$V already present on PyPI (HTTP 200) — upload will skip files already there (skip-existing)"
+          else
+            echo "::notice::sqlrite==$V not found on PyPI (HTTP $CODE) — uploading all wheels + sdist"
+          fi
+
+      # Upload all wheels + sdist aggregated from the build matrix.
+      # `skip-existing: true` (SQLR-12) is what makes this job idempotent:
+      # a re-dispatch (full or partial-wave recovery) uploads only the
+      # files not yet on PyPI and silently skips the rest, instead of the
+      # old `skip-existing: false` which failed loudly the moment any one
+      # file already existed. File-granular skipping is the right unit for
+      # PyPI's multi-file publish — it cleanly handles both a fully-shipped
+      # version (every file skipped → no-op) and a half-shipped one.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-py-v${{ needs.detect.outputs.version }}
+          name: Python v${{ needs.detect.outputs.version }}
+          body: |
+            Published to PyPI: https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/
+
+            ```bash
+            pip install sqlrite==${{ needs.detect.outputs.version }}
+            ```
+
+            ```python
+            import sqlrite
+            conn = sqlrite.connect(":memory:")
+            conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            conn.execute("INSERT INTO users (name) VALUES (?)", ("alice",))
+            for row in conn.execute("SELECT * FROM users"):
+                print(row)
+            ```
+
+            **Wheels in this release:**
+            - Linux x86_64 (manylinux2014 or newer)
+            - Linux aarch64 (manylinux2014 or newer)
+            - macOS aarch64 (Apple Silicon)
+            - Windows x86_64
+            - Source distribution (`.tar.gz`) — builds from source on other platforms via a local Rust toolchain
+
+            All wheels are `abi3-py38`, so one wheel per platform works on every CPython ≥ 3.8.
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          files: dist/*
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3g: build Node.js N-API binaries for every supported
+  # platform. (Phase 6g — build half; publish half lives in the
+  # next job.)
+  #
+  # Architecture: the "bundled binaries" approach, not napi-rs's
+  # newer optional-deps-per-platform pattern. The main `sqlrite`
+  # npm package ships every platform's `.node` binary inside one
+  # tarball; napi-rs's generated `index.js` dispatcher picks the
+  # right one at require time based on process.platform / arch.
+  # Simpler for MVP than maintaining N+1 npm packages; the cost
+  # is a ~15 MiB tarball instead of a ~4 MiB per-platform download,
+  # which is fine for a database driver people install once.
+  #
+  # Same build/publish split as publish-python for the same
+  # reason: npm expects one `npm publish` invocation per package
+  # version. If every matrix cell published independently, a
+  # partial-failure would put some-but-not-all binaries on npm
+  # with no clean rollback.
+  #
+  # Matrix mirrors publish-ffi / publish-desktop / publish-python.
+  # Naming convention for the `.node` file is napi-rs's own: the
+  # platform triple is baked into the filename, e.g.,
+  # `sqlrite.linux-x64-gnu.node` vs `sqlrite.darwin-arm64.node`.
+  # The `files` glob in sdk/nodejs/package.json matches on
+  # `sqlrite.*.node`, so whichever binaries land in the directory
+  # at publish time get included in the tarball.
+  build-nodejs-binaries:
+    name: Build Node.js binary (${{ matrix.platform }})
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            napi_triple: linux-x64-gnu
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            napi_triple: linux-arm64-gnu
+          - os: macos-latest
+            platform: macos-aarch64
+            napi_triple: darwin-arm64
+          - os: windows-latest
+            platform: windows-x86_64
+            napi_triple: win32-x64-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: sdk/nodejs/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-nodejs-${{ matrix.platform }}
+
+      - name: Install npm deps
+        working-directory: sdk/nodejs
+        run: npm ci
+
+      # `napi build --platform --release` produces:
+      #   - sqlrite.<napi_triple>.node  (the actual binary)
+      #   - index.js                    (platform-dispatch loader)
+      #   - index.d.ts                  (TypeScript types)
+      # We upload all three but only index.js/d.ts from the
+      # Linux x86_64 cell (they're identical across platforms
+      # since napi generates platform-agnostic dispatch code).
+      - name: Build native binary
+        working-directory: sdk/nodejs
+        run: npm run build
+
+      - name: Verify binary exists
+        working-directory: sdk/nodejs
+        shell: bash
+        run: |
+          ls -la sqlrite.*.node
+          # Fail early if napi produced an unexpected filename —
+          # otherwise the publish step would silently ship an
+          # incomplete tarball.
+          test -f "sqlrite.${{ matrix.napi_triple }}.node"
+
+      - name: Upload .node binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-binary-${{ matrix.platform }}
+          path: sdk/nodejs/sqlrite.${{ matrix.napi_triple }}.node
+          if-no-files-found: error
+          retention-days: 1
+
+      # Only Linux x86_64 uploads the shared dispatcher files.
+      # These are identical regardless of build platform (they're
+      # just require-the-right-.node glue), so we only need one
+      # copy in the final npm tarball.
+      - name: Upload JS dispatcher (linux-x86_64 only)
+        if: matrix.platform == 'linux-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-dispatcher
+          path: |
+            sdk/nodejs/index.js
+            sdk/nodejs/index.d.ts
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Step 3h: aggregate every platform's `.node` binary + the JS
+  # dispatcher into sdk/nodejs/, publish to npm via OIDC trusted
+  # publishing, and cut the per-product `sqlrite-node-v<V>`
+  # GitHub Release.
+  #
+  # OIDC trusted publishing: similar to the PyPI setup in
+  # publish-python. `permissions: id-token: write` lets npm mint
+  # a short-lived OIDC token, which `npm publish --provenance`
+  # exchanges for a one-time upload token. No NPM_TOKEN secret.
+  # One-time trusted-publisher config on npmjs.com — see
+  # docs/release-secrets.md.
+  #
+  # `--provenance` also attaches a signed attestation linking
+  # the package to this exact GitHub Actions workflow run (via
+  # sigstore, same mechanism as PyPI's PEP 740). Users who care
+  # about supply-chain can verify it with `npm audit signatures`.
+  publish-nodejs:
+    name: Publish Node.js package to npm
+    needs: [detect, tag-all, build-nodejs-binaries]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # OIDC for npm trusted publisher + provenance signing.
+      id-token: write
+      # For softprops/action-gh-release step at the end.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # NOTE: deliberately NO `registry-url:` here. setting that
+      # makes setup-node generate an `.npmrc` with
+      # `_authToken=${NODE_AUTH_TOKEN}`, which forces npm into
+      # token-based auth and *bypasses* the trusted-publisher
+      # OIDC pathway entirely. The v0.1.5 canary blew up on this
+      # exact issue: `404 Not Found - PUT ... is not in this
+      # registry` because npm sent an empty/missing
+      # NODE_AUTH_TOKEN instead of minting an OIDC token.
+      #
+      # With registry-url omitted, no `.npmrc` is generated, and
+      # npm CLI ≥ 11.5 auto-detects the GitHub Actions OIDC
+      # environment (via ACTIONS_ID_TOKEN_REQUEST_URL +
+      # permissions: id-token: write below), mints an OIDC token,
+      # and exchanges it at npm for a one-time publish token. The
+      # public default registry is fine — that's where
+      # registry.npmjs.org lives anyway.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Node 20 LTS ships with npm 10.x, but trusted publishing
+      # auto-detection landed in npm 11.5. Force-upgrade so we
+      # don't depend on the runner image happening to ship a
+      # recent-enough npm.
+      - name: Upgrade npm to latest (need 11.5+ for trusted publishing)
+        run: npm install -g npm@latest
+
+      # Pull every platform's `.node` binary plus the JS
+      # dispatcher into sdk/nodejs/, overlaying them on top of
+      # the checked-out package.json / package-lock.json / etc.
+      - name: Download .node binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nodejs-binary-*
+          path: sdk/nodejs
+          merge-multiple: true
+
+      - name: Download JS dispatcher
+        uses: actions/download-artifact@v4
+        with:
+          name: nodejs-dispatcher
+          path: sdk/nodejs
+
+      - name: List publish payload + OIDC env diagnostics
+        working-directory: sdk/nodejs
+        run: |
+          ls -la
+          echo "---"
+          npm --version
+          echo "---"
+          # Confirm the OIDC env vars GitHub Actions auto-sets when
+          # `permissions: id-token: write` is granted. If either of
+          # these is empty, OIDC token exchange CAN'T happen and
+          # npm publish will fall back to "no auth available".
+          # Just print whether they're set, not their values
+          # (the URL has a trailing token-issuance path; treat as
+          # sensitive).
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL  is set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN is set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
+          echo "---"
+          # Dry-run the pack to see exactly what ends up in the
+          # published tarball. A missing .node file or a stray
+          # devDep pulled in by accident would be visible here.
+          npm pack --dry-run
+
+      # Idempotency guard (SQLR-12) — see publish-crate for the full
+      # rationale. `npm view <pkg>@<version> version` prints the version
+      # on a hit and exits non-zero with empty stdout on a miss; the
+      # `|| true` keeps the `-e` shell from aborting on the miss path.
+      # npm's publish unit is a single tarball per version, so a present
+      # version means a complete publish — a clean version-level skip.
+      - name: Skip if already on npm
+        id: published_check
+        working-directory: sdk/nodejs
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          EXISTING=$(npm view "@joaoh82/sqlrite@$V" version 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::@joaoh82/sqlrite@$V already on npm ($EXISTING) — skipping npm publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::@joaoh82/sqlrite@$V not found on npm — will publish"
+          fi
+
+      # Single atomic publish via OIDC trusted publisher.
+      #
+      # The `--provenance` flag is what tells npm CLI to use the
+      # OIDC code path. Without it, npm only checks for `_authToken`
+      # config and gives up with ENEEDAUTH (this happened on the
+      # v0.1.6 canary attempt that ran without the flag — npm
+      # never even tried OIDC). With it, npm:
+      #   1. Reads ACTIONS_ID_TOKEN_REQUEST_URL +
+      #      ACTIONS_ID_TOKEN_REQUEST_TOKEN from the GHA env
+      #   2. Mints an OIDC token bearing the workflow's identity
+      #      claims (repo, environment, workflow filename, etc.)
+      #   3. Exchanges it at npm for a one-time publish token
+      #   4. Publishes the package + attaches a sigstore-signed
+      #      provenance attestation linking the artifact to this
+      #      exact workflow run
+      #
+      # The previous v0.1.5 failure with `--provenance` set was a
+      # different bug — `registry-url` on setup-node was generating
+      # an `.npmrc` that forced token-auth and bypassed OIDC. With
+      # registry-url removed (this file's previous fix) and
+      # `--provenance` restored, both bugs are addressed.
+      #
+      # `--access public` is REQUIRED because `@joaoh82/sqlrite`
+      # is a scoped package and scoped packages default to private;
+      # without the flag, npm rejects the upload for a free-tier
+      # account that can't host private packages.
+      #
+      # `--loglevel verbose` makes auth/transport errors
+      # diagnosable from the run log without re-running with
+      # debug-on. Cheap insurance against another silent failure.
+      - name: Publish to npm
+        if: steps.published_check.outputs.skip != 'true'
+        working-directory: sdk/nodejs
+        run: npm publish --access public --provenance --loglevel verbose
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-node-v${{ needs.detect.outputs.version }}
+          name: Node.js v${{ needs.detect.outputs.version }}
+          body: |
+            Published to npm: https://www.npmjs.com/package/@joaoh82/sqlrite/v/${{ needs.detect.outputs.version }}
+
+            ```bash
+            npm install @joaoh82/sqlrite@${{ needs.detect.outputs.version }}
+            ```
+
+            ```javascript
+            const { Database } = require('@joaoh82/sqlrite');
+
+            const db = new Database(':memory:');
+            db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+            const stmt = db.prepare('INSERT INTO users (name) VALUES (?)');
+            stmt.run('alice');
+
+            for (const row of db.prepare('SELECT * FROM users').iterate()) {
+              console.log(row);
+            }
+            ```
+
+            **Binaries bundled in this release:**
+            - Linux x86_64 (`sqlrite.linux-x64-gnu.node`)
+            - Linux aarch64 (`sqlrite.linux-arm64-gnu.node`)
+            - macOS aarch64 (`sqlrite.darwin-arm64.node`)
+            - Windows x86_64 (`sqlrite.win32-x64-msvc.node`)
+
+            The package's `index.js` dispatcher auto-selects the right binary at require time — no platform-specific install step.
+
+            Verify package provenance:
+            ```bash
+            npm audit signatures
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3g': publish the `sqlrite-notes` example as a pure-JS npm
+  # package so users can `npx sqlrite-notes init <dir>` on a fresh
+  # machine without cloning the repo. (SQLR-64, follow-up from SQLR-40.)
+  #
+  # The package itself ships no binaries — it's a thin CLI on top of
+  # the `@joaoh82/sqlrite` N-API package (which carries the prebuilt
+  # `.node` binaries via the platform-dispatch shim) and spawns
+  # `sqlrite-mcp` as a subprocess for the read side. The Node bits
+  # are platform-agnostic JS modules, so this job is a single ubuntu
+  # cell instead of the publish-nodejs build matrix.
+  #
+  # `needs: publish-nodejs` is load-bearing: the example's
+  # `@joaoh82/sqlrite` dep pin resolves against the version that
+  # publish-nodejs just put on npm. Without that ordering, `npx
+  # sqlrite-notes@<new>` would resolve a slightly-stale engine on
+  # the first install after release (caret pin floats up *eventually*
+  # but the npm cache will have served the old one for minutes).
+  #
+  # Package name: **unscoped `sqlrite-notes`** (per ticket). The
+  # similarity rejection that hit `sqlrite` (vs `sqlite`) doesn't
+  # apply here — `notes` isn't a confusable suffix. If the registry
+  # ever rejects this on a future bootstrap, fall back to
+  # `@joaoh82/sqlrite-notes` and update both `package.json` and
+  # `docs/release-secrets.md`'s trusted-publisher section.
+  #
+  # OIDC trusted-publisher setup mirrors publish-nodejs verbatim —
+  # see that job's comment block for the long-form rationale on why
+  # `registry-url` is omitted, why we force-upgrade npm to 11.5+, and
+  # why `--provenance --access public --loglevel verbose` is the
+  # canonical flag combo.
+  publish-notes-example:
+    name: Publish sqlrite-notes example to npm
+    needs: [detect, tag-all, publish-nodejs]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # OIDC for npm trusted publisher + provenance signing.
+      id-token: write
+      # For softprops/action-gh-release at the end.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same OIDC dance as publish-nodejs — see that job's comment
+      # block for why we deliberately do NOT set `registry-url:`.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Upgrade npm to latest (need 11.5+ for trusted publishing)
+        run: npm install -g npm@latest
+
+      - name: List publish payload + OIDC env diagnostics
+        working-directory: examples/nodejs-notes
+        run: |
+          ls -la
+          echo "---"
+          npm --version
+          echo "---"
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL  is set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN is set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
+          echo "---"
+          # `npm pack --dry-run` prints exactly what will end up in
+          # the tarball. The `files` whitelist in package.json should
+          # produce: bin/sqlrite-notes.mjs, src/*.mjs, README.md,
+          # package.json — nothing else (no test fixtures, no
+          # node_modules).
+          npm pack --dry-run
+
+      # Idempotency guard (SQLR-12) — see publish-crate / publish-nodejs.
+      # Package is the unscoped `sqlrite-notes`.
+      - name: Skip if already on npm
+        id: published_check
+        working-directory: examples/nodejs-notes
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          EXISTING=$(npm view "sqlrite-notes@$V" version 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-notes@$V already on npm ($EXISTING) — skipping npm publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-notes@$V not found on npm — will publish"
+          fi
+
+      - name: Publish to npm
+        if: steps.published_check.outputs.skip != 'true'
+        working-directory: examples/nodejs-notes
+        run: npm publish --access public --provenance --loglevel verbose
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-notes-v${{ needs.detect.outputs.version }}
+          name: sqlrite-notes example v${{ needs.detect.outputs.version }}
+          body: |
+            Published to npm: https://www.npmjs.com/package/sqlrite-notes/v/${{ needs.detect.outputs.version }}
+
+            ```bash
+            # Ingest a folder of markdown notes into a SQLRite database
+            # — no clone, no Rust toolchain, no env setup beyond an
+            # optional embedding API key.
+            npx sqlrite-notes@${{ needs.detect.outputs.version }} init ~/Documents/notes
+            ```
+
+            The example uses `@joaoh82/sqlrite@^${{ needs.detect.outputs.version }}` for storage + retrieval (HNSW + BM25) and spawns [`sqlrite-mcp`](../../releases/tag/sqlrite-mcp-v${{ needs.detect.outputs.version }}) as a subprocess to expose the database to Claude Desktop / any MCP client. Install `sqlrite-mcp` separately — `cargo install sqlrite-mcp` or a prebuilt binary from the MCP release.
+
+            Verify package provenance:
+            ```bash
+            npm audit signatures
+            ```
+
+            Full docs: [`examples/nodejs-notes/README.md`](https://github.com/joaoh82/rust_sqlite/blob/main/examples/nodejs-notes/README.md).
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3h: build the WASM package via wasm-pack and publish to
+  # npm as @joaoh82/sqlrite-wasm. (Phase 6h.)
+  #
+  # Single job — unlike the Python / Node SDKs there's no per-OS
+  # binary matrix, because WebAssembly is one universal artifact
+  # that runs on any wasm32-capable host (browsers, Deno, modern
+  # bundlers). One build, one upload.
+  #
+  # **Why scoped (`@joaoh82/sqlrite-wasm`) preemptively:** the
+  # unscoped `sqlrite-wasm` is currently free on npm but the
+  # similarity check that rejected `sqlrite` (vs `sqlite`) might
+  # also reject `sqlrite-wasm` (vs `sqlite-wasm` — distance 1).
+  # Going scoped from day one matches the Node SDK's
+  # `@joaoh82/sqlrite` decision and avoids the rename dance we
+  # did in PR #30. Free to revisit if the ecosystem demands an
+  # unscoped name.
+  #
+  # **Build target = `bundler`:** webpack/vite/rollup users get
+  # JS modules + .wasm without needing additional config. `web`
+  # / `nodejs` / `deno` targets can be added as siblings later
+  # if there's demand; one target per package is the simpler
+  # MVP shape.
+  #
+  # `--scope joaoh82` on `wasm-pack build` makes wasm-pack emit
+  # an auto-generated package.json with `name: "@joaoh82/sqlrite-wasm"`
+  # in the `pkg/` output directory — saves us from managing two
+  # package.json files (the auto-generated one and a hand-written
+  # override).
+  publish-wasm:
+    name: Publish WASM package to npm
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    # Pinned binaryen version — see docs/release-plan.md
+    # ("Pinned binaryen / wasm-opt") for the bump procedure. Older
+    # binaryen rejects rustc's multi-table WASM output with
+    # "Only 1 table definition allowed in MVP" (SQLR-58). The
+    # release pipeline can't tolerate that flake — a failed
+    # publish-wasm leaves the rest of the release wave inconsistent.
+    env:
+      BINARYEN_VERSION: version_122
+    permissions:
+      # OIDC: required for npm trusted-publisher token exchange.
+      # Same flow proven in publish-nodejs after the v0.1.5–0.1.7
+      # debugging adventure.
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-wasm
+          workspaces: 'sdk/wasm -> target'
+
+      - name: Install pinned binaryen (wasm-opt)
+        # MUST run before wasm-pack: wasm-pack picks up wasm-opt
+        # from PATH if present, otherwise downloads whatever
+        # binaryen its own internal cache happens to have. Pinning
+        # + prepending to PATH forces a deterministic version
+        # across runner images.
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            -o "$RUNNER_TEMP/binaryen.tar.gz"
+          tar -xzf "$RUNNER_TEMP/binaryen.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/binaryen-${BINARYEN_VERSION}/bin/wasm-opt" --version
+
+      # Install wasm-pack — the canonical tool for building +
+      # packaging Rust crates as npm-publishable WASM modules.
+      # `cargo binstall` would be faster than `cargo install`
+      # (downloads a prebuilt binary) but binstall isn't
+      # preinstalled on `ubuntu-latest`; the curl|sh installer
+      # does the same thing in one step without bootstrapping
+      # binstall first.
+      - name: Install wasm-pack
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      # See publish-nodejs for the long-form rationale of this
+      # whole setup-node + npm-upgrade dance. Short version:
+      # NO `registry-url:` (would force token-auth via .npmrc),
+      # then explicitly upgrade npm to 11.5+ so trusted
+      # publishing is supported.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Upgrade npm to latest (need 11.5+ for trusted publishing)
+        run: npm install -g npm@latest
+
+      # Build the WASM package. `--target bundler` produces
+      # ES modules + .wasm that webpack/vite/rollup can consume
+      # directly. `--scope joaoh82` makes the auto-generated
+      # package.json's name `@joaoh82/sqlrite-wasm`. `--release`
+      # picks up the size-optimized profile from sdk/wasm/
+      # Cargo.toml ([profile.release] opt-level = "z" + LTO).
+      - name: Build WASM package
+        working-directory: sdk/wasm
+        run: |
+          # Sanity-check that the pinned wasm-opt is on PATH (SQLR-58).
+          which wasm-opt
+          wasm-opt --version
+          wasm-pack build --release --target bundler --scope joaoh82
+          echo "--- generated pkg/ contents ---"
+          ls -la pkg/
+          echo "--- generated package.json ---"
+          cat pkg/package.json
+          echo "--- WASM binary size ---"
+          ls -la pkg/*.wasm
+
+      # OIDC env diagnostics — same defensive logging that paid
+      # off when publish-nodejs hit the trusted-publisher subject
+      # mismatch in v0.1.7.
+      - name: OIDC env diagnostics
+        working-directory: sdk/wasm/pkg
+        run: |
+          npm --version
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL  is set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN is set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
+          npm pack --dry-run
+
+      # Idempotency guard (SQLR-12) — see publish-crate / publish-nodejs.
+      # Package is the scoped `@joaoh82/sqlrite-wasm`. (The wasm-pack build
+      # above still runs on a skip — gating only the publish keeps this
+      # consistent with the other channels; the build is cheap relative to
+      # the rest of the release wave.)
+      - name: Skip if already on npm
+        id: published_check
+        working-directory: sdk/wasm/pkg
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          EXISTING=$(npm view "@joaoh82/sqlrite-wasm@$V" version 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::@joaoh82/sqlrite-wasm@$V already on npm ($EXISTING) — skipping npm publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::@joaoh82/sqlrite-wasm@$V not found on npm — will publish"
+          fi
+
+      # Atomic OIDC publish. Same flag combo proven in
+      # publish-nodejs: `--provenance` to trigger OIDC code path,
+      # `--access public` because scoped packages default to
+      # private, `--loglevel verbose` to keep error logs
+      # diagnosable.
+      - name: Publish to npm
+        if: steps.published_check.outputs.skip != 'true'
+        working-directory: sdk/wasm/pkg
+        run: npm publish --access public --provenance --loglevel verbose
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-wasm-v${{ needs.detect.outputs.version }}
+          name: WASM v${{ needs.detect.outputs.version }}
+          body: |
+            Published to npm: https://www.npmjs.com/package/@joaoh82/sqlrite-wasm/v/${{ needs.detect.outputs.version }}
+
+            ```bash
+            npm install @joaoh82/sqlrite-wasm@${{ needs.detect.outputs.version }}
+            ```
+
+            ```javascript
+            // Bundler target — works with webpack, vite, rollup, parcel
+            import init, { Database } from '@joaoh82/sqlrite-wasm';
+
+            await init();
+            const db = new Database();
+            db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+            db.exec("INSERT INTO users (name) VALUES ('alice')");
+            const rows = db.query("SELECT id, name FROM users");
+            // → [{ id: 1, name: 'alice' }]
+            ```
+
+            **What's in the package:**
+            - `sqlrite_wasm_bg.wasm` — the WebAssembly engine binary
+            - `sqlrite_wasm.js` — auto-generated JS glue (wasm-bindgen)
+            - `sqlrite_wasm.d.ts` — TypeScript types
+            - `package.json` — bundler-target metadata
+
+            **Build target:** `bundler` (webpack/vite/rollup-friendly).
+            For `web` / `nodejs` / `deno` targets, build from source via `wasm-pack build sdk/wasm --target <target>`.
+
+            Verify package provenance:
+            ```bash
+            npm audit signatures
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          files: sdk/wasm/pkg/*.wasm
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3i: publish the Go SDK. (Phase 6i.)
+  #
+  # Go's distribution model is unique among our publish channels:
+  # there's NO central registry. Go modules pull straight from VCS
+  # via tag, and `go get github.com/joaoh82/rust_sqlite/sdk/go@v0.X.Y`
+  # works the moment a `sdk/go/v0.X.Y` tag is on the remote (modulo
+  # ~minutes of cache lag at proxy.golang.org). The tag is created
+  # by `tag-all` upstream of this job — there's nothing to upload.
+  #
+  # **What this job DOES do:** the binding uses cgo against
+  # `libsqlrite_c` (the C FFI from sqlrite-ffi), so end users
+  # need that shared library on their system to run anything.
+  # We pull the per-platform tarballs that publish-ffi already
+  # uploaded to its release and re-attach them to the Go release
+  # page so Go users have a one-stop-shop:
+  #
+  #   `go get github.com/joaoh82/rust_sqlite/sdk/go@vX.Y.Z`
+  #   download `libsqlrite_c-<platform>.tar.gz` from the same
+  #   release page → set CGO_LDFLAGS / CGO_CFLAGS → `go build`.
+  #
+  # **Tag with slashes:** Go's submodule tag convention is
+  # `<subpath>/vX.Y.Z` — for our module path
+  # `github.com/joaoh82/rust_sqlite/sdk/go`, the canonical tag is
+  # `sdk/go/vX.Y.Z` (slashes intact). GitHub Releases handle
+  # slash-bearing tags fine; the URL just URL-encodes them.
+  publish-go:
+    name: Publish Go SDK GitHub Release
+    needs: [detect, tag-all, publish-ffi]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # For softprops/action-gh-release + gh CLI release-download.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full tag history to verify tag-all's `sdk/go/v$V`
+          # is on the remote.
+          fetch-depth: 0
+
+      # Cheap consistency check that tag-all did its job. If this
+      # fires, something's wrong upstream and the human should
+      # know before we cut a confusingly-named GitHub Release.
+      - name: Verify Go module tag exists
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          TAG="sdk/go/v$V"
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG not found — tag-all should have created + pushed it"
+            exit 1
+          fi
+          echo "Tag $TAG exists at $(git rev-parse --short $TAG)"
+
+      # Pull the tarballs publish-ffi already attached to the
+      # sqlrite-ffi-v<V> release. The `gh release download` flow
+      # avoids re-running the whole publish-ffi build matrix just
+      # to get the artifacts here — it's a single API call with
+      # the workflow's auto-injected GITHUB_TOKEN.
+      - name: Download FFI tarballs from this release wave
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          mkdir -p ffi-tarballs
+          gh release download "sqlrite-ffi-v$V" \
+            --repo joaoh82/rust_sqlite \
+            --dir ffi-tarballs \
+            --pattern '*.tar.gz'
+          echo "--- FFI tarballs downloaded ---"
+          ls -la ffi-tarballs/
+
+      # Cut the Go release page. Tag has slashes — softprops handles
+      # that correctly (URL-encodes the slashes in the resulting
+      # release URL).
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sdk/go/v${{ needs.detect.outputs.version }}
+          name: Go SDK v${{ needs.detect.outputs.version }}
+          body: |
+            ```bash
+            go get github.com/joaoh82/rust_sqlite/sdk/go@v${{ needs.detect.outputs.version }}
+            ```
+
+            ```go
+            package main
+
+            import (
+                "database/sql"
+                "fmt"
+
+                _ "github.com/joaoh82/rust_sqlite/sdk/go"  // registers "sqlrite" driver
+            )
+
+            func main() {
+                db, _ := sql.Open("sqlrite", ":memory:")
+                defer db.Close()
+
+                _, _ = db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+                _, _ = db.Exec("INSERT INTO users (name) VALUES ('alice')")
+
+                rows, _ := db.Query("SELECT id, name FROM users")
+                defer rows.Close()
+                for rows.Next() {
+                    var id int64
+                    var name string
+                    rows.Scan(&id, &name)
+                    fmt.Printf("%d: %s\n", id, name)
+                }
+            }
+            ```
+
+            ## Prebuilt `libsqlrite_c` (cgo dependency)
+
+            The Go binding uses cgo against the `libsqlrite_c` shared library shipped by [`sqlrite-ffi`](https://github.com/joaoh82/rust_sqlite/tree/main/sqlrite-ffi). The tarballs attached below are the same ones from this release wave's [C FFI release](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — provided here so Go users have a one-stop-shop:
+
+            - `sqlrite-ffi-v${{ needs.detect.outputs.version }}-linux-x86_64.tar.gz`
+            - `sqlrite-ffi-v${{ needs.detect.outputs.version }}-linux-aarch64.tar.gz`
+            - `sqlrite-ffi-v${{ needs.detect.outputs.version }}-macos-aarch64.tar.gz`
+            - `sqlrite-ffi-v${{ needs.detect.outputs.version }}-windows-x86_64.tar.gz`
+
+            Extract for your platform, then point cgo at it:
+
+            ```bash
+            tar xzf sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>.tar.gz
+            export CGO_CFLAGS="-I$(pwd)/sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>/include"
+            export CGO_LDFLAGS="-L$(pwd)/sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>/lib -lsqlrite_c"
+            export LD_LIBRARY_PATH="$(pwd)/sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>/lib"
+            go build ./...
+            ```
+
+            (On macOS use `DYLD_LIBRARY_PATH` instead of `LD_LIBRARY_PATH`. On Windows, place the `.dll` next to your binary or on `%PATH%`.)
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          files: ffi-tarballs/*.tar.gz
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 4: create the umbrella GitHub Release. Runs after all
+  # publish-* jobs succeed. Uses GitHub's native auto-generated
+  # release notes so the changelog is "everything between the
+  # previous v* tag and this one" — curated via .github/release.yml
+  # config if we add one later.
+  finalize:
+    name: Finalize umbrella release
+    needs: [detect, publish-crate, publish-ask, publish-mcp, build-mcp-binaries, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-notes-example, publish-wasm, publish-go]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Umbrella GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.detect.outputs.version }}
+          name: v${{ needs.detect.outputs.version }}
+          body: |
+            **SQLRite v${{ needs.detect.outputs.version }}**
+
+            Per-product releases in this wave:
+
+            - 🦀 [Rust engine](../../releases/tag/sqlrite-v${{ needs.detect.outputs.version }}) → [crates.io](https://crates.io/crates/sqlrite-engine/${{ needs.detect.outputs.version }})
+            - 🤖 [MCP server](../../releases/tag/sqlrite-mcp-v${{ needs.detect.outputs.version }}) → [crates.io](https://crates.io/crates/sqlrite-mcp/${{ needs.detect.outputs.version }}) — `cargo install sqlrite-mcp` or grab a prebuilt binary tarball; wires SQLRite into Claude Code / Cursor / any MCP client over stdio
+            - 🔧 [C FFI](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — prebuilt `libsqlrite_c` for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
+            - 🖥️ [Desktop](../../releases/tag/sqlrite-desktop-v${{ needs.detect.outputs.version }}) — unsigned installers for Linux (AppImage + deb), macOS (dmg aarch64), Windows (msi)
+            - 🐍 [Python](../../releases/tag/sqlrite-py-v${{ needs.detect.outputs.version }}) → [PyPI](https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/) — abi3-py38 wheels for Linux x86_64/aarch64, macOS aarch64, Windows x86_64 + sdist
+            - 🟢 [Node.js](../../releases/tag/sqlrite-node-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/@joaoh82/sqlrite/v/${{ needs.detect.outputs.version }}) — N-API bindings with prebuilt `.node` binaries for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
+            - 📝 [`sqlrite-notes` example](../../releases/tag/sqlrite-notes-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/sqlrite-notes/v/${{ needs.detect.outputs.version }}) — `npx sqlrite-notes init <dir>` ingests a folder of markdown notes into a SQLRite DB and exposes it to Claude Desktop / any MCP client
+            - 🌐 [WASM](../../releases/tag/sqlrite-wasm-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/@joaoh82/sqlrite-wasm/v/${{ needs.detect.outputs.version }}) — browser/bundler-target WebAssembly build via wasm-pack
+            - 🐹 [Go SDK](../../releases/tag/sdk%2Fgo%2Fv${{ needs.detect.outputs.version }}) → `go get github.com/joaoh82/rust_sqlite/sdk/go@v${{ needs.detect.outputs.version }}` — `database/sql` driver via cgo against `libsqlrite_c`
+
+            ---
+
+            Auto-generated changelog below ↓
+          generate_release_notes: true

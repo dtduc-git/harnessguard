@@ -1,0 +1,30 @@
+# wake up Claude every morning to start the session early so  the 5 hour window resets earlier when i start working.
+
+name: Claude Morning Warmup
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+      timezone: "Europe/Brussels"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  warmup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping Claude
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          prompt: |
+            Reply only with: OK
+            Do not inspect files.
+            Do not use tools.
+            Do not perform any other work.
+          claude_args: |
+            --max-turns 1
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

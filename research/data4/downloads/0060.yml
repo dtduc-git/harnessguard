@@ -1,0 +1,151 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Release
+
+on:
+    release:
+        types: [created]
+    workflow_dispatch:
+        inputs:
+            tag_name:
+                description: 'The tag of the release to upload assets to (e.g. v0.1.0)'
+                required: true
+                type: string
+
+permissions:
+    contents: write
+
+jobs:
+    prep-release:
+        uses: ./.github/workflows/prep-release.yaml
+        with:
+            release: ${{ github.event.release.tag_name || inputs.tag_name }}
+
+    build-release:
+        needs: prep-release
+        runs-on: ubuntu-latest
+        defaults:
+            run:
+                working-directory: cicd-mcp-server
+        env:
+            RELEASE_DIR: "${{ github.workspace }}/release"
+            DIST_DIR: "${{ github.workspace }}/dist"
+        strategy:
+            matrix:
+                platform:
+                    - {
+                          goos: "linux",
+                          goarch: "amd64",
+                          bin_file: "cicd-mcp-server",
+                          archive: "linux.x64.cicd.tar.gz",
+                          archive_cmd: 'tar -czvf "${ARCHIVE_PATH}" -C "${RELEASE_DIR}" .',
+                      }
+                    - {
+                          goos: "darwin",
+                          goarch: "arm64",
+                          bin_file: "cicd-mcp-server",
+                          archive: "darwin.arm64.cicd.tar.gz",
+                          archive_cmd: 'tar -czvf "${ARCHIVE_PATH}" -C "${RELEASE_DIR}" .',
+                      }
+
+                    - {
+                          goos: "windows",
+                          goarch: "amd64",
+                          bin_file: "cicd-mcp-server.exe",
+                          archive: "win32.x64.cicd.zip",
+                          archive_cmd: 'cd "${RELEASE_DIR}" && zip -r "${ARCHIVE_PATH}" .',
+                      }
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6
+              with:
+                  # Do not checkout 'main'. Checkout the exact SHA prep-release used.
+                  ref: ${{ needs.prep-release.outputs.release_sha }}
+            - name: prep-release
+              env:
+                  BIN_FILE: "${{ matrix.platform.bin_file }}"
+                  TAG_NAME: ${{ github.event.release.tag_name || inputs.tag_name }}
+              run: |
+                  mkdir -p "${RELEASE_DIR}"
+
+                  # Extract version from tag (v1.2.3 -> 1.2.3)
+                  VERSION="${TAG_NAME#v}"
+                  
+                  command_exp='.mcpServers."cicd-mcp".command = "${extensionPath}${/}'
+                  command_exp="${command_exp}${BIN_FILE}\""
+                  command_exp="${command_exp} | .version = \"${VERSION}\""
+                  
+                  jq "${command_exp}" < ../gemini-extension.json >"${RELEASE_DIR}/gemini-extension.json"
+
+                  cp ../README.md "${RELEASE_DIR}/"
+                  cp ../LICENSE "${RELEASE_DIR}/"
+                  cp -r ../skills "${RELEASE_DIR}/"
+
+            - name: Set up Go
+              uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+              with:
+                  go-version: "~1.25.5"
+
+            - name: Download Dependencies
+              run: go mod tidy
+
+            - name: Build
+              run: |
+                  export GOOS=${{ matrix.platform.goos }}
+                  export GOARCH=${{ matrix.platform.goarch }}
+
+                  output_path="${RELEASE_DIR}/${{ matrix.platform.bin_file }}"
+                  go build -o "${output_path}"
+
+            - name: Create release assets
+              id: archive
+              run: |
+                  mkdir -p "${DIST_DIR}"
+                  echo "Creating ${{ matrix.platform.archive }}"
+                  export ARCHIVE_PATH="${DIST_DIR}/${{ matrix.platform.archive }}"
+                  sh -c "${{ matrix.platform.archive_cmd }}"
+                  echo "Created ${ARCHIVE_PATH}"
+                  echo "ARCHIVE_NAME=${{ matrix.platform.archive }}" >> "$GITHUB_OUTPUT"
+
+            - name: Upload archive as artifact
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: ${{ steps.archive.outputs.ARCHIVE_NAME }}
+                  path: ${{ github.workspace }}/dist/*
+
+    upload-assets:
+        needs: [build-release]
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6
+
+            - name: Download all archives from artifacts
+              uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+              with:
+                  path: artifacts
+
+            - name: List downloaded files
+              run: |
+                  echo "--- Downloaded files ---"
+                  ls -Rlrt artifacts/*
+                  echo "------------------------"
+            - name: Upload release assets
+              id: upload-assets
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  TAG_NAME: ${{ github.event.release.tag_name || inputs.tag_name }}
+              run: |
+                  gh release upload --clobber \
+                    ${TAG_NAME} \
+                    artifacts/*/*

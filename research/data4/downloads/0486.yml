@@ -1,0 +1,194 @@
+name: Cursor canary
+
+# Proves the Cursor half of the pipeline end to end on a real GitHub Actions
+# runner, and - just as importantly - RECORDS what Cursor prints while doing it.
+#
+# Everything checkable without a Cursor credential already has been, locally,
+# against production: all 61 tools arrive with names matching the registry
+# exactly, both auth forms work, the connect command merges safely. See
+# docs-private/CURSOR_FACTS.md. What could NOT be checked is anything that needs
+# a funded account, and that list is exactly what blocks the unattended builder:
+#
+#   1. what a SUCCESSFUL headless run prints, and on which stream
+#   2. the text Cursor emits when a quota is exhausted vs rate-limited vs the
+#      key being dead - three failures that must be classified differently
+#      (retry tomorrow / retry tomorrow / wake the owner up)
+#   3. which --model values the account actually accepts
+#
+# So this workflow is a measurement instrument first and a pass/fail check
+# second. It dumps raw output verbatim rather than summarising it, because the
+# classify branch in a future scripts/agent-ci/cursor.mjs has to be written from
+# those exact strings. Guessing them is the codex-429 mistake, and it ends with
+# a build reporting green having built nothing.
+#
+# Manual-only on purpose: it spends real Cursor usage, and it exists to answer
+# questions rather than to guard anything.
+#
+# Two measured traps this file is deliberately shaped around:
+#   - `cursor-agent models` EXITS 0 even when the API key is invalid, and
+#     `cursor-agent status` ignores CURSOR_API_KEY entirely. Neither exit code
+#     means anything. Every check here reads output, never $?.
+#   - an MCP server Cursor has not approved reports "not loaded (needs
+#     approval)" and hands the agent no tools at all, so `mcp enable` is a
+#     required step and `--approve-mcps` backs it up on the invocation.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model to run (leave blank for the account default; the models step lists what is valid)"
+        default: ""
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    # continue-on-error at JOB level: failures report to the dashboard rails,
+    # so the RUN concluding green here just stops GitHub from also emailing
+    # "Run failed".
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Deliberately NOT version-pinned. A pinned builder wants a fixed version;
+      # a canary wants to learn what the CURRENT CLI does, so it installs
+      # whatever cursor.com/install serves and prints which version that was.
+      # The version it reports is what any later pin should be set to.
+      - name: Install the Cursor CLI
+        run: |
+          curl https://cursor.com/install -fsS | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Report the CLI version under test
+        run: |
+          echo "cursor-agent version: $(cursor-agent --version)"
+
+      # Preflight before anything is spent. The MCP half is provable without
+      # touching the Cursor account at all, so a broken key and a broken server
+      # can never be confused for each other in the report below.
+      - name: Preflight - secrets present and MCP reachable
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          SEO_MCP_API_KEY: ${{ secrets.SEO_MCP_API_KEY }}
+        run: |
+          [ -n "$CURSOR_API_KEY" ] || { echo "::error::CURSOR_API_KEY secret is missing or empty."; exit 1; }
+          [ -n "$SEO_MCP_API_KEY" ] || { echo "::error::SEO_MCP_API_KEY secret is missing or empty."; exit 1; }
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 -X POST https://dispatchseo.com/api/mcp \
+            -H "Authorization: Bearer $SEO_MCP_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json, text/event-stream" \
+            -d '{"jsonrpc":"2.0","id":0,"method":"tools/list"}')
+          [ "$code" = "200" ] || { echo "::error::MCP returned HTTP $code before Cursor even started."; exit 1; }
+          echo "MCP reachable, both secrets present."
+
+      # Cursor has no `mcp add` command - the config file IS the interface.
+      # Project-scoped in the checkout, so no CURSOR_HOME redirect is needed
+      # (this is the one place Cursor is tidier than Codex).
+      - name: Write and approve the MCP config
+        env:
+          SEO_MCP_API_KEY: ${{ secrets.SEO_MCP_API_KEY }}
+        run: |
+          mkdir -p .cursor
+          jq -n --arg key "$SEO_MCP_API_KEY" '{
+            mcpServers: {
+              dispatchseo: {
+                url: "https://dispatchseo.com/api/mcp",
+                headers: { Authorization: ("Bearer " + $key) }
+              }
+            }
+          }' > .cursor/mcp.json
+          echo "--- config written (key redacted) ---"
+          jq '.mcpServers.dispatchseo.headers.Authorization = "Bearer <redacted>"' .cursor/mcp.json
+          # Approval is not optional: without it the server is "not loaded" and
+          # the agent silently gets zero tools.
+          cursor-agent mcp enable dispatchseo
+
+      # Proves the MCP link independently of the agent run. If this says `ready`
+      # and the run below still fails, the fault is the Cursor account, not us.
+      - name: Verify the MCP link
+        run: |
+          echo "--- mcp list ---"
+          cursor-agent mcp list 2>&1 | tee /tmp/mcp-list.txt
+          echo "--- mcp list-tools (count is the number that must equal the registry) ---"
+          cursor-agent mcp list-tools dispatchseo 2>&1 | tee /tmp/mcp-tools.txt | head -5
+          echo "tool lines: $(grep -c '^- ' /tmp/mcp-tools.txt || true)"
+          grep -q "dispatchseo: ready" /tmp/mcp-list.txt \
+            || { echo "::error::MCP server is not ready - see mcp list output above."; exit 1; }
+
+      # MEASUREMENT 3: which models this account accepts. Output-parsed, never
+      # exit-code-checked - this command exits 0 on an invalid key.
+      - name: Record the available models
+        continue-on-error: true
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          echo "--- cursor-agent models ---"
+          cursor-agent models 2>&1 | tee /tmp/models.txt
+          if grep -qi "API key is invalid\|Authentication required" /tmp/models.txt; then
+            echo "::error::CURSOR_API_KEY was rejected. Note this command still exited 0 - that is why the text is what gets checked."
+            exit 1
+          fi
+
+      # MEASUREMENT 1: the success path. Both output formats are captured
+      # because a future runner has to pick one, and the choice depends on which
+      # one carries a reliably greppable final message.
+      - name: Run Cursor against the MCP server
+        id: run
+        continue-on-error: true
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          set +e
+          MODEL_ARG=""
+          [ -n "$MODEL" ] && MODEL_ARG="--model $MODEL"
+          # --force: allow tool/shell use unattended. --approve-mcps: belt and
+          # braces over `mcp enable`. --trust: a fresh checkout is an untrusted
+          # workspace and would otherwise prompt for a human who is not here.
+          cursor-agent -p "Call the dispatchseo MCP tool get_project. Then reply with EXACTLY three lines and nothing else:
+          DOMAIN=<the domain field it returned>
+          TOOLS=<the total number of tools the dispatchseo MCP server exposes to you>
+          OK=yes" \
+            --output-format json --force --approve-mcps --trust $MODEL_ARG \
+            > /tmp/cursor-out.json 2> /tmp/cursor-err.txt
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          # json, not text: the runner classifies on .is_error/.subtype rather
+          # than on prose, so the canary must exercise the same shape the
+          # builder depends on. .result is the final message.
+          jq -r '.result // empty' /tmp/cursor-out.json 2>/dev/null > /tmp/cursor-out.txt || true
+          echo "--- .result ---"; cat /tmp/cursor-out.txt
+          echo "--- verdict fields ---"; jq -c '{subtype,is_error,duration_ms,usage}' /tmp/cursor-out.json 2>/dev/null || echo "(no parseable JSON)"
+          echo "--- stderr ---"; cat /tmp/cursor-err.txt
+
+      # Everything below is the payload worth having: raw, verbatim, unsummarised.
+      - name: Report what happened
+        if: always()
+        env:
+          EXIT_CODE: ${{ steps.run.outputs.exit_code }}
+        run: |
+          echo "=================================================================="
+          echo "PASTE THIS WHOLE SECTION BACK when writing scripts/agent-ci/cursor.mjs"
+          echo "=================================================================="
+          echo "--- exit code: ${EXIT_CODE:-unknown}"
+          echo "--- raw json (verbatim - this is what the classify step reads) ---"
+          cat /tmp/cursor-out.json 2>/dev/null || echo "(none)"
+          echo "--- .result (verbatim) ---"
+          cat /tmp/cursor-out.txt 2>/dev/null || echo "(none)"
+          echo "--- stderr (verbatim) ---"
+          cat /tmp/cursor-err.txt 2>/dev/null || echo "(none)"
+          echo "--- any files the run left behind (looking for a transcript) ---"
+          ls -la ~/.cursor 2>/dev/null || echo "(no ~/.cursor)"
+          find ~/.cursor -maxdepth 3 -newermt '-20 minutes' -type f 2>/dev/null | head -20 || true
+          echo "=================================================================="
+          echo "--- verdict ---"
+          if grep -q "OK=yes" /tmp/cursor-out.txt 2>/dev/null; then
+            grep -E '^(DOMAIN|TOOLS)=' /tmp/cursor-out.txt || true
+            echo "CANARY PASSED - Cursor reached the MCP server and called a tool from a runner."
+          else
+            echo "::error::CANARY FAILED - the output above is the useful part. If this is a quota or rate-limit failure, its exact wording is one of the three strings the builder's classify branch needs."
+            exit 1
+          fi

@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Verify content integrity
+        run: npm run lint:content
+
+      - name: Build site
+        run: npm run build
+
+      - name: Syntax check worker
+        run: node --check tools/mcp-remote/src/index.js
+
+      - name: Python syntax check
+        run: python -m py_compile tools/ollama-helper.py

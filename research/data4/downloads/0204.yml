@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to create the release with (e.g. v0.0.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build all targets
+        run: bun run build:all
+
+      - name: Verify all 5 binaries were produced
+        run: |
+          ls -l dist/
+          count=$(ls dist/mcp-remote-* | wc -l)
+          if [ "$count" -ne 5 ]; then
+            echo "expected 5 binaries, got $count"
+            exit 1
+          fi
+
+      - name: Smoke test the linux-x64 binary
+        run: |
+          chmod +x dist/mcp-remote-linux-x64
+          # 引数なしだと usage を出して非ゼロ終了するので、
+          # usage 文字列が出ることを合格条件にする（grep の終了ステータスが最後になる）
+          ./dist/mcp-remote-linux-x64 2>&1 | grep -q 'Usage:' || {
+            echo 'smoke test failed: usage line not found'
+            exit 1
+          }
+
+      - name: Generate checksums
+        run: cd dist && sha256sum mcp-remote-* > ../SHA256SUMS && cat ../SHA256SUMS
+
+      - name: Write release notes
+        run: |
+          cat > RELEASE_NOTES.md <<'NOTES'
+          `bunx mcp-remote` と同等の動作をする単一バイナリです。Node.js / Bun のインストールは不要です。
+
+          | ファイル | プラットフォーム |
+          | --- | --- |
+          | `mcp-remote-windows-x64.exe` | Windows x64 |
+          | `mcp-remote-linux-x64` | Linux x64 |
+          | `mcp-remote-linux-arm64` | Linux arm64 |
+          | `mcp-remote-darwin-arm64` | macOS Apple Silicon |
+          | `mcp-remote-darwin-x64` | macOS Intel |
+
+          `SHA256SUMS` で整合性を検証できます。
+
+          macOS / Linux では実行権限の付与が必要です。
+
+          ```bash
+          chmod +x mcp-remote-darwin-arm64
+          ./mcp-remote-darwin-arm64 <https://server-url> [callback-port] [--debug]
+          ```
+
+          macOS のバイナリは未署名のため、Gatekeeper に阻まれる場合があります。
+
+          ---
+          NOTES
+          echo "bundled mcp-remote (npm package version): $(bun --print 'require("./node_modules/mcp-remote/package.json").version')" >> RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            dist/mcp-remote-* SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file RELEASE_NOTES.md \
+            --generate-notes

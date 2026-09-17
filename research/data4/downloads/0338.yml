@@ -1,0 +1,142 @@
+# =============================================================================
+# AI 代码评审 — Claude Code TOKEN 版
+# -----------------------------------------------------------------------------
+# 当前活跃路径:
+#   secrets.CLAUDE_CODE_OAUTH_TOKEN  Claude Code OAuth token
+#   vars.CLAUDE_MODEL                可选;不设则使用 Claude Code 默认模型
+#
+# Legacy 路径已停用:
+#   Codex CLI: OPENAI_API_KEY / CODEX_ACCESS_TOKEN / scripts/codex_review.sh
+#   云上 LLM: LLM_PROVIDER / LLM_API_KEY / scripts/ai_review.py
+# =============================================================================
+name: AI Review (Claude Code)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GITHUB_REPOSITORY: ${{ github.repository }}
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  BASE_REF: ${{ github.base_ref }}
+
+jobs:
+  # 纯文档 PR 跳过三趟评审(省 CI/Claude Code 额度)。
+  # ai-review-gate 始终跑并变绿,所以 required check 不会卡住纯文档 PR。
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.f.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: f
+        name: Detect non-doc changes
+        run: |
+          base='${{ github.event.pull_request.base.sha }}'
+          head='${{ github.event.pull_request.head.sha }}'
+          code=$(git diff --name-only "$base" "$head" \
+                 | grep -vE '(\.(md|mdx|markdown|txt|rst)$)|(^|/)docs/|^prompts/|^\.harness/prompts/|(^|/)LICENSE|(^|/)CHANGELOG' \
+                 || true)
+          if [ -n "$code" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "Non-doc changes detected; running Claude Code review:"
+            echo "$code"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Docs-only PR; skipping Claude Code review passes."
+          fi
+
+  quality:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: prepare
+        name: Prepare Pass 1 Prompt
+        run: bash scripts/claude_review_prepare.sh --pass quality --base "$BASE_REF" --out "$RUNNER_TEMP/claude-review-quality-prompt.md" --review-file "$RUNNER_TEMP/claude-review-quality.md"
+      - id: claude
+        name: Pass 1 — Code Quality
+        if: steps.prepare.outputs.skip != '1'
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt_file: ${{ steps.prepare.outputs.prompt_file }}
+          claude_args: ${{ vars.CLAUDE_MODEL != '' && format('--max-turns 8 --model {0}', vars.CLAUDE_MODEL) || '--max-turns 8' }}
+      - name: Enforce Pass 1
+        run: node scripts/claude_review_finish.js --pass quality --execution-file "${{ steps.claude.outputs.execution_file }}"
+
+  security:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: prepare
+        name: Prepare Pass 2 Prompt
+        run: bash scripts/claude_review_prepare.sh --pass security --base "$BASE_REF" --out "$RUNNER_TEMP/claude-review-security-prompt.md" --review-file "$RUNNER_TEMP/claude-review-security.md"
+      - id: claude
+        name: Pass 2 — Security
+        if: steps.prepare.outputs.skip != '1'
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt_file: ${{ steps.prepare.outputs.prompt_file }}
+          claude_args: ${{ vars.CLAUDE_MODEL != '' && format('--max-turns 8 --model {0}', vars.CLAUDE_MODEL) || '--max-turns 8' }}
+      - name: Enforce Pass 2
+        run: node scripts/claude_review_finish.js --pass security --execution-file "${{ steps.claude.outputs.execution_file }}"
+
+  dependency:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: prepare
+        name: Prepare Pass 3 Prompt
+        run: bash scripts/claude_review_prepare.sh --pass dependency --base "$BASE_REF" --out "$RUNNER_TEMP/claude-review-dependency-prompt.md" --review-file "$RUNNER_TEMP/claude-review-dependency.md"
+      - id: claude
+        name: Pass 3 — Dependency
+        if: steps.prepare.outputs.skip != '1'
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt_file: ${{ steps.prepare.outputs.prompt_file }}
+          claude_args: ${{ vars.CLAUDE_MODEL != '' && format('--max-turns 8 --model {0}', vars.CLAUDE_MODEL) || '--max-turns 8' }}
+      - name: Enforce Pass 3
+        if: steps.prepare.outputs.skip != '1'
+        run: node scripts/claude_review_finish.js --pass dependency --execution-file "${{ steps.claude.outputs.execution_file }}"
+      - name: Enforce Skipped Pass 3
+        if: steps.prepare.outputs.skip == '1'
+        run: node scripts/claude_review_finish.js --pass dependency --review-file "${{ steps.prepare.outputs.review_file }}"
+
+  ai-review-gate:
+    needs: [changes, quality, security, dependency]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce all passes
+        run: |
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "AI review results: $results"
+          for r in $results; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::AI review gate failed — see Claude Code review comments and job logs."
+              exit 1
+            fi
+          done
+          echo "✅ AI review gate green."

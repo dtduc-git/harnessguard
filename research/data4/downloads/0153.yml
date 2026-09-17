@@ -1,0 +1,51 @@
+name: app-mcp-remote
+on:
+  workflow_dispatch:
+env:
+  SRC: ${{github.workspace}}
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+  VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+  VAULT_ADDR: ${{ secrets.VAULT_ADDR}}
+jobs:
+  app-mcp-remote:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{env.SRC}}/templates/app-mcp-remote
+    steps:
+      - name: run git safe.directory
+        if: ${{ github.event.inputs.LOCAL == 'true' }}
+        run: git config --global --add safe.directory "*"
+      - name: "check github repository"
+        uses: actions/checkout@v3
+      - uses: denoland/setup-deno@v1
+        with:
+          deno-version: canary
+      - name: "install run"
+        uses: ghostmind-dev/play/actions/run@main
+        with:
+          dev_mode: ${{ github.event.inputs.LOCAL }}
+      - name: set environment
+        uses: ghostmind-dev/play/actions/env@main
+      - name: "install vault cmd"
+        uses: ghostmind-dev/play/actions/vault@main
+        with:
+          login: "true"
+      - name: "set global secrets"
+        uses: ghostmind-dev/play/actions/secrets@main
+        with:
+          global: "true"
+      - name: "set up gcloud credentials"
+        uses: ghostmind-dev/play/actions/gcloud@main
+      - name: "terraform installation"
+        uses: ghostmind-dev/play/actions/terraform@main
+        with:
+          version: "1.3.7"
+      - name: "hasura installation"
+        uses: ghostmind-dev/play/actions/hasura@main
+      - name: "set directory secrets"
+        uses: ghostmind-dev/play/actions/secrets@main
+        with:
+          dir: ${{ github.workspace }}/templates/app-mcp-remote
+      - name: "deploy app"
+        run: run custom init --all

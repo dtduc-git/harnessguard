@@ -1,0 +1,124 @@
+name: UML-MCP CI Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "mcp_core/**"
+      - "tools/**"
+      - "api/**"
+      - "app.py"
+      - "server.py"
+      - "tests/**"
+      - "smithery.yaml"
+      - "vercel.json"
+      - "Dockerfile"
+      - "pyproject.toml"
+      - ".pre-commit-config.yaml"
+      - ".github/workflows/**"
+      - ".cursor/mcp.json"
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "latest"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Ruff check and format
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Type check
+        run: uv run ty check
+
+      - name: Validate Cursor MCP config
+        run: |
+          jq -e '
+            .mcpServers["uml-mcp"].transport == "http" and
+            (.mcpServers["uml-mcp"].url | test("/mcp$")) and
+            (.mcpServers["uml-mcp"].url | startswith("https://"))
+          ' .cursor/mcp.json
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "latest"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Run tests
+        run: |
+          uv run pytest --cov=mcp_core --cov=tools --cov-report=term --cov-report=html --cov-fail-under=82
+
+      - name: Build documentation
+        run: uv run mkdocs build --strict
+
+      - name: Build static MCP server card
+        run: uv run python -m mcp_core.build_static_server_card
+
+      - name: Vercel/FastAPI entrypoint smoke test
+        env:
+          FASTMCP_STATELESS_HTTP: "true"
+          MCP_MEMORY_ONLY: "true"
+          MCP_URL_ONLY: "true"
+          MCP_OUTPUT_DIR: /tmp/diagrams
+          VERCEL_OUTPUT_DIR: /tmp/diagrams
+        run: |
+          uv run python - <<'PY'
+          from fastapi.testclient import TestClient
+          from app import app
+
+          route_paths = {getattr(route, "path", None) for route in app.routes}
+          assert "/health" in route_paths, route_paths
+          assert "/mcp" in route_paths, route_paths
+
+          with TestClient(app) as client:
+              response = client.get("/health")
+              assert response.status_code == 200, response.text
+              payload = response.json()
+              assert payload.get("status") == "healthy", payload
+
+          print("Vercel/FastAPI entrypoint smoke test OK")
+          PY
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report-${{ matrix.python-version }}
+          path: htmlcov/
+          retention-days: 14
+
+  build:
+    uses: ./.github/workflows/build.yml

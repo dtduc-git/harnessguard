@@ -1,0 +1,396 @@
+name: 'CI'
+
+on:
+  push:
+    branches:
+      - 'main'
+      - 'release/**'
+  pull_request:
+    branches:
+      - 'main'
+      - 'release/**'
+  workflow_dispatch:
+    inputs:
+      branch_ref:
+        description: 'Branch to run on'
+        required: true
+        default: 'main'
+        type: 'string'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.head_ref || github.ref }}'
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: 'bash'
+
+env:
+  ACTIONLINT_VERSION: '1.7.12'
+  SHELLCHECK_VERSION: '0.11.0'
+  YAMLLINT_VERSION: '1.35.1'
+
+jobs:
+  # ── Gatekeeper: avoids duplicate runs on merge queue ──────────
+  merge_queue_skipper:
+    name: 'Merge Queue Skipper'
+    if: github.repository == 'Jyf0214/AutocodeLLM'
+    runs-on: 'ubuntu-latest'
+    continue-on-error: true
+    permissions: read-all
+    outputs:
+      skip: '${{ steps.check.outputs.skip }}'
+    steps:
+      - name: 'Check merge queue context'
+        id: 'check'
+        run: |
+          skip=false
+          if [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            skip=true
+            echo "Merge group event — CI already validated, skip redundant checks"
+          fi
+          echo "skip=${skip}" >> "${GITHUB_OUTPUT}"
+
+  # ── Lint: all quality checks serial in one job ────────────────
+  lint:
+    name: 'Lint'
+    needs: 'merge_queue_skipper'
+    if: ${{ !cancelled() && (needs.merge_queue_skipper.outputs.skip != 'true') }}
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    steps:
+      - uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # v4.2.2
+        with:
+          ref: '${{ github.event.inputs.branch_ref || github.ref }}'
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: 'actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a' # v4.2.0
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - run: 'npm ci'
+
+      - name: 'Check lockfile'
+        run: 'npm run check:lockfile'
+
+      - name: 'Check desktop workspace isolation'
+        run: 'npm run check:desktop-isolation'
+
+      - name: 'Install linters'
+        run: 'node scripts/lint.js --setup'
+
+      - name: 'Run ESLint'
+        run: 'node scripts/lint.js --eslint'
+
+      - name: 'Run actionlint'
+        run: 'node scripts/lint.js --actionlint'
+
+      - name: 'Run shellcheck'
+        run: 'node scripts/lint.js --shellcheck'
+
+      - name: 'Run yamllint'
+        run: 'node scripts/lint.js --yamllint'
+
+      - name: 'Run Prettier'
+        run: 'node scripts/lint.js --prettier'
+
+      - name: 'Run sensitive keyword linter'
+        run: 'node scripts/lint.js --sensitive-keywords'
+
+      - name: 'Run i18n check'
+        run: 'npm run check-i18n'
+
+      - name: 'Check GitHub Actions pinning'
+        run: 'node scripts/lint.js --check-github-actions-pinning'
+
+      - name: 'Generate settings schema'
+        run: 'npm run generate:settings-schema'
+
+      - name: 'Check settings schema is up-to-date'
+        run: |
+          if [[ -n $(git status --porcelain packages/vscode-ide-companion/schemas/settings.schema.json) ]]; then
+            echo "❌ Error: settings.schema.json is out of date!"
+            echo "   Run: npm run generate:settings-schema"
+            echo "   Then commit the updated schema file."
+            git diff packages/vscode-ide-companion/schemas/settings.schema.json
+            exit 1
+          fi
+          echo "✅ Settings schema is up-to-date"
+
+  # ── TypeScript strict typecheck ───────────────────────────────
+  typecheck:
+    name: 'Typecheck'
+    needs: 'merge_queue_skipper'
+    if: ${{ !cancelled() && (needs.merge_queue_skipper.outputs.skip != 'true') }}
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: 'actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a' # v4.2.0
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - run: 'npm ci'
+      - name: 'TypeScript typecheck'
+        run: 'npm run typecheck'
+
+  # ── Bundle size check (PR only) ───────────────────────────────
+  bundle_size:
+    name: 'Bundle Size'
+    needs: 'merge_queue_skipper'
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.merge_queue_skipper.outputs.skip != 'true' }}
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: 'actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a' # v4.2.0
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - run: 'npm ci'
+      - uses: 'preactjs/compressed-size-action@55bc26418aac9d1e7ee232255af3e3e9523ba23b' # v2.9.1
+        with:
+          repo-token: '${{ secrets.GITHUB_TOKEN }}'
+          build-script: 'npm run build'
+
+  # ── Tests: matrix × OS × Node × shard ─────────────────────────
+  test:
+    name: 'Test (${{ matrix.os }}, Node ${{ matrix.node-version }}, ${{ matrix.shard }})'
+    needs: 'merge_queue_skipper'
+    if: ${{ !cancelled() && (needs.merge_queue_skipper.outputs.skip != 'true') }}
+    runs-on: '${{ matrix.os }}'
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: 'ubuntu-latest'
+            node-version: '22.x'
+            shard: 'cli'
+            upload-coverage: 'true'
+          - os: 'ubuntu-latest'
+            node-version: '22.x'
+            shard: 'others'
+            upload-coverage: 'true'
+          - os: 'macos-latest'
+            node-version: '22.x'
+            shard: 'cli'
+            upload-coverage: 'false'
+          - os: 'macos-latest'
+            node-version: '22.x'
+            shard: 'others'
+            upload-coverage: 'false'
+          - os: 'windows-latest'
+            node-version: '22.x'
+            shard: 'cli'
+            upload-coverage: 'false'
+          - os: 'windows-latest'
+            node-version: '22.x'
+            shard: 'others'
+            upload-coverage: 'false'
+    steps:
+      - uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: 'actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a' # v4.2.0
+        with:
+          node-version: '${{ matrix.node-version }}'
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org/'
+
+      - name: 'Configure npm for rate limiting'
+        run: |
+          npm config set fetch-retry-mintimeout 20000
+          npm config set fetch-retry-maxtimeout 120000
+          npm config set fetch-retries 5
+          npm config set fetch-timeout 300000
+
+      - run: 'npm ci --prefer-offline --no-audit --progress=false'
+
+      - name: 'Run tests'
+        env:
+          NO_COLOR: true
+        run: |
+          if [[ "${{ matrix.shard }}" == "cli" ]]; then
+            npm run test:ci --workspace @qwen-code/qwen-code
+          else
+            npm run test:ci --workspaces --if-present --parallel \
+              --workspace @qwen-code/qwen-code-core \
+              --workspace @qwen-code/acp-bridge \
+              --workspace @qwen-code/sdk-typescript \
+              --workspace @qwen-code/webui \
+              --workspace @qwen-code/web-shell
+            npm run test:scripts
+          fi
+
+      - name: 'Publish Test Report'
+        if: ${{ always() && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: 'dorny/test-reporter@31a54ee7ebcacc03a09ea97a7e5465a47b84aea5' # v2.0.0
+        with:
+          name: 'Test Results (${{ matrix.os }}, Node ${{ matrix.node-version }}, ${{ matrix.shard }})'
+          path: 'packages/*/junit.xml'
+          reporter: 'java-junit'
+          fail-on-error: 'false'
+
+      - name: 'Upload Test Results Artifact (forks)'
+        if: ${{ always() && github.event.pull_request.head.repo.full_name != github.repository }}
+        uses: 'actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08' # v4.6.0
+        with:
+          name: 'test-results-${{ matrix.node-version }}-${{ matrix.os }}-${{ matrix.shard }}'
+          path: 'packages/*/junit.xml'
+
+      - name: 'Upload coverage reports'
+        if: ${{ always() && matrix.upload-coverage == 'true' }}
+        uses: 'actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08' # v4.6.0
+        with:
+          name: 'coverage-${{ matrix.node-version }}-${{ matrix.os }}-${{ matrix.shard }}'
+          path: 'packages/*/coverage'
+
+  # ── Coverage PR comment ───────────────────────────────────────
+  coverage:
+    name: 'Coverage Comment'
+    runs-on: 'ubuntu-latest'
+    needs:
+      - 'merge_queue_skipper'
+      - 'test'
+    if: ${{ always() && needs.merge_queue_skipper.outputs.skip != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
+    strategy:
+      matrix:
+        os: ['ubuntu-latest']
+        node-version: ['22.x']
+    steps:
+      - uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: 'actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16' # v4.1.8
+        with:
+          name: 'coverage-${{ matrix.node-version }}-${{ matrix.os }}-others'
+          path: 'coverage_artifact'
+
+      - name: 'Generate coverage summary'
+        id: 'coverage_summary'
+        run: |
+          MISSING=false
+          for f in coverage_artifact/*/coverage/coverage-summary.json; do
+            [ -f "$f" ] || { MISSING=true; continue; }
+            pkg=$(basename $(dirname $(dirname "$f")))
+            echo "::group::Coverage: $pkg"
+            python3 -c "
+            import json,sys
+            d=json.load(open('$f'))['total']
+            for k in ['lines','statements','functions','branches']:
+                pct=d[k].get('pct',0)
+                print(f'  $pkg | {k}: {pct:.1f}%')
+            " || true
+            echo "::endgroup::"
+          done
+          echo "has_missing=$MISSING" >> "$GITHUB_OUTPUT"
+
+  # ── CodeQL security analysis ──────────────────────────────────
+  codeql:
+    name: 'CodeQL'
+    needs: 'merge_queue_skipper'
+    if: ${{ !cancelled() && (needs.merge_queue_skipper.outputs.skip != 'true') }}
+    runs-on: 'ubuntu-latest'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: 'github/codeql-action/init@6a3a83aeea0c7d3e609a9a104525be0873a19329' # v3.26.10
+        with:
+          languages: 'javascript'
+
+      - uses: 'github/codeql-action/analyze@6a3a83aeea0c7d3e609a9a104525be0873a19329' # v3.26.10
+
+  # ── Links: broken link checker ────────────────────────────────
+  links:
+    name: 'Link Checker'
+    needs: 'merge_queue_skipper'
+    if: ${{ !cancelled() && (needs.merge_queue_skipper.outputs.skip != 'true') }}
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: 'lycheeverse/lychee-action@f613c4a64e50d792e0b31ec34bbcbba12263c6a6' # v2.3.0
+        with:
+          args: './**/*.md --exclude node_modules --accept 200,503'
+          fail: true
+
+  # ── Aggregator: single pass/fail for branch protection ────────
+  ci:
+    name: 'CI'
+    if: ${{ always() && github.repository == 'Jyf0214/AutocodeLLM' }}
+    needs:
+      - 'merge_queue_skipper'
+      - 'lint'
+      - 'typecheck'
+      - 'test'
+      - 'codeql'
+      - 'links'
+    runs-on: 'ubuntu-latest'
+    permissions: read-all
+    steps:
+      - name: 'Check results'
+        env:
+          MERGE_SKIP: '${{ needs.merge_queue_skipper.outputs.skip }}'
+          LINT_RESULT: '${{ needs.lint.result }}'
+          TYPECHECK_RESULT: '${{ needs.typecheck.result }}'
+          TEST_RESULT: '${{ needs.test.result }}'
+          CODEQL_RESULT: '${{ needs.codeql.result }}'
+          LINKS_RESULT: '${{ needs.links.result }}'
+        run: |
+          FAILED=false
+
+          check_result() {
+            local name="$1"
+            local result="$2"
+            if [ "$result" = "success" ] || [ "$result" = "skipped" ]; then
+              echo "✅ $name: $result"
+            else
+              echo "❌ $name: $result"
+              FAILED=true
+            fi
+          }
+
+          check_result "Lint" "$LINT_RESULT"
+          check_result "Typecheck" "$TYPECHECK_RESULT"
+          check_result "Test" "$TEST_RESULT"
+          check_result "CodeQL" "$CODEQL_RESULT"
+          check_result "Link Checker" "$LINKS_RESULT"
+
+          if [ "$FAILED" = "true" ]; then
+            echo "❌ CI failed — one or more checks did not pass"
+            exit 1
+          fi
+          echo "✅ All CI checks passed"

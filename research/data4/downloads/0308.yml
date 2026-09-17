@@ -1,0 +1,51 @@
+name: AI Slop Cleanup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  execute:
+    name: Execute slop cleanup markdown
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .turbo
+            node_modules
+          key: ${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - run: corepack enable
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Run Claude Code with prompt file
+        uses: Infrawrench/claude-code-base-action@15e19c645e8088acf05af5b16a9fef294aef55df
+        with:
+          prompt_file: ".github/prompts/CLEANUP.md"
+          dangerously_skip_permissions: "true"
+          use_oauth: "true"
+          timeout_minutes: "180"
+          claude_access_token: ${{ secrets.CLAUDE_ACCESS_TOKEN }}
+          claude_refresh_token: ${{ secrets.CLAUDE_REFRESH_TOKEN }}
+          claude_expires_at: ${{ secrets.CLAUDE_EXPIRES_AT }}
+          secrets_admin_pat: ${{ secrets.SECRETS_ADMIN_PAT}}
+          model: "claude-fable-5"
+
+      - name: Run git push just in case
+        run: git push

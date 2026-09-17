@@ -1,0 +1,58 @@
+name: Install smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  npm-pack-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: sh scripts/build-dashboard-spa.sh
+
+      - name: Validate npm pack includes dashboard out/
+        run: node scripts/validate-npm-pack.mjs
+
+      - name: Pack and global install
+        run: |
+          TGZ=$(npm pack --silent 2>/dev/null | grep '\.tgz$' | tail -1)
+          node scripts/postpack-npm-deps.mjs
+          npm install -g "./${TGZ}"
+          rm -f "$TGZ"
+
+      - name: Verify global install artifacts
+        run: |
+          mastyf-ai --version
+          ROOT="$(npm root -g)/@mastyf_ai/server"
+          test -f "$ROOT/dist/cli.js"
+          test -f "$ROOT/deploy/dashboard-spa/out/index.html"
+
+      - name: Start smoke (headless)
+        run: |
+          # Minimal mastyf-ai config for proxy (filesystem stub)
+          mkdir -p /tmp/mastyf-ai-smoke/mastyf-ai-configs
+          cat > /tmp/mastyf-ai-smoke/mastyf-ai-configs/test.json <<'EOF'
+          {
+            "mcpServers": {
+              "echo": {
+                "command": "node",
+                "args": ["-e", "process.stdin.pipe(process.stdout)"]
+              }
+            }
+          }
+          EOF
+          cd /tmp/mastyf-ai-smoke
+          timeout 25s mastyf-ai start --config mastyf-ai-configs/test.json || test $? -eq 124
+        env:
+          DASHBOARD_PORT: '4000'

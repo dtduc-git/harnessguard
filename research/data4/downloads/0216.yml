@@ -1,0 +1,88 @@
+name: Test, Build & Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  deploy:
+    name: Build & Deploy
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Build OpenNext worker
+        run: npm run build:worker
+        env:
+          NODE_ENV: production
+
+      - name: Compute build hash
+        run: |
+          BUILD_HASH=$(shasum -a 256 .open-next/worker.js | cut -d' ' -f1)
+          echo "BUILD_HASH=$BUILD_HASH" >> $GITHUB_ENV
+          echo "Build SHA-256: $BUILD_HASH"
+
+      - name: Sign with Sigstore (keyless)
+        uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Create Sigstore signature bundle
+        run: |
+          cosign sign-blob \
+            --bundle .open-next/worker.js.sigstore.json \
+            --yes \
+            .open-next/worker.js
+
+          REKOR_INDEX=$(cat .open-next/worker.js.sigstore.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('rekorBundle',{}).get('logIndex','unknown'))" 2>/dev/null || echo "unknown")
+          echo "REKOR_INDEX=$REKOR_INDEX" >> $GITHUB_ENV
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-worker-${{ github.sha }}
+          path: |
+            .open-next/worker.js
+            .open-next/worker.js.sigstore.json
+
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+
+      - name: Record deployment in transparency chain
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          curl -s -X POST https://mcp-ext.kaptionai.com/transparency/append \
+            -H "Authorization: Bearer ${{ secrets.DEPLOY_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"version\": \"$VERSION\",
+              \"commitSha\": \"${{ github.sha }}\",
+              \"buildHash\": \"${{ env.BUILD_HASH }}\",
+              \"sigstoreBundleUrl\": \"https://github.com/Kaption-AI/kaption-mcp-remote/actions/runs/${{ github.run_id }}\",
+              \"rekorLogIndex\": \"${{ env.REKOR_INDEX }}\",
+              \"deployedAt\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+            }"

@@ -1,0 +1,89 @@
+name: Verify Deployment Integrity
+
+on:
+  schedule:
+    - cron: '*/30 * * * *' # every 30 minutes
+  workflow_dispatch: {} # allow manual trigger
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Cross-reference CF deploys vs transparency chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch CF deployment history
+        run: |
+          curl -sf \
+            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/mcp-remote/deployments" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            > cf_deployments.json
+          echo "CF deployments fetched:"
+          python3 -c "import json; d=json.load(open('cf_deployments.json')); print(f\"{len(d.get('result',{}).get('deployments',[]))} versions found\")"
+
+      - name: Fetch transparency chain (paginated)
+        run: |
+          # /transparency caps each response at 100 entries ([L3] in
+          # deployment-chain.ts). Loop until we've fetched `total` entries,
+          # then merge into chain.json shaped like a single response.
+          OFFSET=0
+          : > chain_pages.ndjson
+          while true; do
+            PAGE=$(curl -sf "https://mcp.kaptionai.com/transparency?offset=$OFFSET&limit=100")
+            COUNT=$(echo "$PAGE" | python3 -c "import json,sys;print(len(json.load(sys.stdin).get('entries',[])))")
+            TOTAL=$(echo "$PAGE" | python3 -c "import json,sys;print(json.load(sys.stdin).get('total',0))")
+            if [ "$COUNT" = "0" ]; then break; fi
+            echo "$PAGE" >> chain_pages.ndjson
+            OFFSET=$((OFFSET + COUNT))
+            if [ "$OFFSET" -ge "$TOTAL" ]; then break; fi
+          done
+          python3 - <<'PY'
+          import json
+          entries = []
+          total = 0
+          with open("chain_pages.ndjson") as f:
+              for line in f:
+                  page = json.loads(line)
+                  entries.extend(page.get("entries", []))
+                  total = page.get("total", total)
+          with open("chain.json", "w") as f:
+              json.dump({"entries": entries, "total": total}, f)
+          print(f"Chain fetched: {len(entries)} of {total} entries across pages")
+          PY
+
+      - name: Verify chain integrity
+        run: |
+          RESULT=$(curl -sf https://mcp.kaptionai.com/transparency/verify)
+          echo "$RESULT"
+          VALID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('valid', False))")
+          if [ "$VALID" != "True" ]; then
+            echo "::error::Transparency chain integrity check FAILED"
+            exit 1
+          fi
+          echo "Chain integrity verified."
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cross-reference deployments
+        run: node scripts/verify-chain.js
+
+      - name: Alert on gap
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_ALERT_WEBHOOK }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "🚨 *DEPLOYMENT INTEGRITY ALERT* — mcp.kaptionai.com\nA Cloudflare deployment version exists with no matching Rekor attestation in the transparency chain.\nInvestigate: https://github.com/Kaption-AI/mcp-extension-remote/actions"
+              }'
+            echo "Slack alert sent."
+          else
+            echo "::warning::SLACK_ALERT_WEBHOOK not configured — skipping Slack notification"
+          fi

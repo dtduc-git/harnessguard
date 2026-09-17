@@ -1,0 +1,92 @@
+name: Run Cursor agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt to run with Cursor CLI'
+        required: true
+        type: string
+      model:
+        description: 'Model to use (e.g., gpt-5)'
+        required: false
+        default: 'gpt-5'
+        type: string
+      output_format:
+        description: 'Output format (e.g., text, json)'
+        required: false
+        default: 'text'
+        type: string
+      branch:
+        description: 'Branch to commit and push changes to'
+        required: false
+        type: string
+
+jobs:
+  run-cursor-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git for push
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+
+      - name: Checkout target branch
+        shell: bash
+        run: |
+          BRANCH="${{ github.event.inputs.branch }}"
+          if [ -z "$BRANCH" ]; then BRANCH="${{ vars.BRANCH }}"; fi
+          if [ -z "$BRANCH" ]; then echo "No branch specified and vars.BRANCH is unset" >&2; exit 1; fi
+          echo "Using branch: $BRANCH"
+          git fetch origin || true
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Remote branch exists. Checking out tracking branch."
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+            git branch --set-upstream-to="origin/$BRANCH" "$BRANCH" || true
+            git pull --ff-only || true
+          else
+            echo "Remote branch '$BRANCH' does not exist. Creating locally from current HEAD."
+            git checkout -b "$BRANCH"
+          fi
+
+      - name: Install Cursor CLI
+        shell: bash
+        run: |
+          curl https://cursor.com/install -fsS | bash
+          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run Cursor agent
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          cursor-agent -p "${{ github.event.inputs.prompt }}" --model "${{ github.event.inputs.model }}" --output-format "${{ github.event.inputs.output_format }}"
+
+      - name: Stage changes
+        run: git add -A
+
+      - name: Commit changes if any
+        shell: bash
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(cursor): apply updates from Cursor agent"
+          else
+            echo "No changes to commit"
+          fi
+
+      - name: Push to branch
+        shell: bash
+        run: |
+          BRANCH="${{ github.event.inputs.branch }}"
+          if [ -z "$BRANCH" ]; then BRANCH="${{ vars.BRANCH }}"; fi
+          git push -u origin "$BRANCH"
+
+

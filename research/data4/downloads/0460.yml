@@ -1,0 +1,48 @@
+name: Cursor Agent Automation
+
+on:
+  push:
+    branches:
+      - main
+      - feature/*
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issues:
+    types: [opened, edited]
+
+jobs:
+  cursor-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: '7.0.x'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '18'
+
+      - name: Create PR
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/heads/main')
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat: Automated changes by Cursor Agent"
+          title: "🤖 Automated PR: Latest Changes"
+          body: |
+            ## Automated Pull Request
+            
+            Changes made by Cursor Agent based on recent commits.
+            
+            ### Changed Files:
+            ```diff
+            ${{ steps.file-changes.outputs.files }}
+            ```
+          branch: cursor-agent/changes
+          base: main 

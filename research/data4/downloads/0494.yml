@@ -1,0 +1,44 @@
+name: Agents Canary (latest, may fail)
+
+# Drift canary: installs the agent CLIs at @latest (unpinned) and runs the same
+# smoke-load probes as agents.yml. It has NO push/pull_request trigger and gates
+# nothing — a red run here is an early signal that a new CLI release changed
+# behavior, prompting a deliberate version bump in agents.yml.
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  agents-canary:
+    name: Install @latest + smoke-load CLIs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Install agent CLIs at @latest (unpinned — drift canary)
+        run: npm install -g @anthropic-ai/claude-code@latest @google/gemini-cli@latest @openai/codex@latest
+      - name: Assert CLIs run
+        run: |
+          claude --version
+          gemini --version
+          codex --version
+      - name: Install cursor-agent (best-effort)
+        continue-on-error: true
+        run: curl https://cursor.com/install -fsS | bash
+      - name: Smoke-load Codex (pinned classification — fails on drift)
+        run: node scripts/smoke-load.mjs --cli codex --expect launch-only
+      - name: Smoke-load Claude
+        run: node scripts/smoke-load.mjs --cli claude
+      - name: Smoke-load Gemini
+        run: node scripts/smoke-load.mjs --cli gemini
+      - name: Smoke-load Cursor (skips if absent)
+        run: node scripts/smoke-load.mjs --cli cursor

@@ -1,0 +1,64 @@
+name: Build and Publish Qwen Code images
+run-name: "${{ github.event.client_payload.message || (github.event_name == 'repository_dispatch' && format('{0}: repository_dispatch by {1}', github.event.action, github.actor)) || format('{0} by {1}', github.event_name, github.actor) }}"
+
+on:
+  repository_dispatch:
+    types: [universal-workbench-updated]
+  push:
+    branches-ignore:
+      - 'renovate/**'
+    paths:
+      - 'qwen-code-docker/**'
+      - '.github/workflows/qwen-code-publish.yaml'
+  workflow_dispatch:
+    inputs:
+      universal_tag:
+        description: Universal Workbench tag (optional; falls back to GHCR latest)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  resolve-universal-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.final-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/resolve-ghcr-tag
+        id: final-tag
+        with:
+          owner: ${{ github.repository_owner }}
+          image: universal-workbench
+          payload_tag: ${{ github.event.client_payload.universal_tag }}
+          input_tag: ${{ inputs.universal_tag }}
+          ghcr_token: ${{ secrets.IMAGES_PUBLISH_TOKEN }}
+
+  build-qwen-workbench:
+    needs:
+      - resolve-universal-tag
+    uses: spigell/my-shared-workflows/.github/workflows/docker-build-release.yaml@main
+    secrets:
+      gh-token: ${{ secrets.IMAGES_PUBLISH_TOKEN }}
+    with:
+      image-name: qwen-workbench
+      context: ./qwen-code-docker
+      version: 0.23.0 # renovate: datasource=npm depName=@qwen-code/qwen-code
+      build-args: |
+        UNIVERSAL_WORKBENCH_IMAGE_TAG=${{ needs.resolve-universal-tag.outputs.tag }}
+      build-contexts: |
+        shared=./shared
+
+  trigger-downstreams:
+    needs: build-qwen-workbench
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch Qwen Workbench Update
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ secrets.IMAGES_PUBLISH_TOKEN }}
+          event-type: qwen-workbench-updated
+          client-payload: '{"qwen_tag":"${{ needs.build-qwen-workbench.outputs.sha-tag }}"}'

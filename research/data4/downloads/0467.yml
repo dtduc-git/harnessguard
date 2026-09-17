@@ -1,0 +1,240 @@
+name: "Cursor Agent: Implement Issues"
+
+on:
+  issues:
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+
+    # Run when:
+    # 1. A new issue is opened, OR
+    # 2. A comment is added to an open issue (but not by a bot, to avoid loops)
+    if: >
+      (github.event_name == 'issues') ||
+      (github.event_name == 'issue_comment' &&
+       !github.event.issue.pull_request &&
+       github.event.issue.state == 'open' &&
+       !endsWith(github.event.comment.user.login, '[bot]'))
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Cursor CLI
+        run: |
+          curl https://cursor.com/install -fsS | bash
+          echo "$HOME/.cursor/bin" >> $GITHUB_PATH
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "cursor-agent[bot]"
+          git config user.email "cursor-agent[bot]@users.noreply.github.com"
+
+      - name: Resolve issue number
+        run: |
+          # For 'issues' events, the number is on github.event.issue.number
+          # For 'issue_comment' events, it's the same path
+          echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
+
+      - name: Read issue details and conversation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Read issue details
+          ISSUE_TITLE=$(gh issue view $ISSUE_NUMBER --json title -q '.title')
+          ISSUE_BODY=$(gh issue view $ISSUE_NUMBER --json body -q '.body')
+          ISSUE_LABELS=$(gh issue view $ISSUE_NUMBER --json labels -q '[.labels[].name] | join(", ")')
+
+          # Read all comments on the issue (the conversation thread)
+          ISSUE_COMMENTS=$(gh issue view $ISSUE_NUMBER --json comments -q '[.comments[] | "**\(.author.login):** \(.body)"] | join("\n\n---\n\n")')
+
+          # Store in environment files (safe against injection)
+          echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
+          echo "$ISSUE_TITLE" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          echo "ISSUE_BODY<<EOF" >> $GITHUB_ENV
+          echo "$ISSUE_BODY" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          echo "ISSUE_LABELS<<EOF" >> $GITHUB_ENV
+          echo "$ISSUE_LABELS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          echo "ISSUE_COMMENTS<<EOF" >> $GITHUB_ENV
+          echo "$ISSUE_COMMENTS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Create or switch to working branch
+        run: |
+          BRANCH_NAME="cursor/issue-$ISSUE_NUMBER"
+
+          # Check if a remote branch already exists (from a previous attempt)
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+            git fetch origin "$BRANCH_NAME"
+            git checkout "$BRANCH_NAME"
+          else
+            git checkout -b "$BRANCH_NAME"
+          fi
+
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Build agent prompt
+        run: |
+          cat > /tmp/agent-prompt.txt << 'PROMPT_END'
+          You are operating in a GitHub Actions runner.
+
+          The GitHub CLI is available as `gh` and authenticated via `GH_TOKEN`. Git is available.
+          You have write access to repository contents and can create pull requests and comment on issues.
+
+          ## Issue #ISSUE_NUMBER_PLACEHOLDER
+          **Title:** ISSUE_TITLE_PLACEHOLDER
+          **Labels:** ISSUE_LABELS_PLACEHOLDER
+
+          **Description:**
+          ISSUE_BODY_PLACEHOLDER
+
+          ## Conversation thread
+          ISSUE_COMMENTS_PLACEHOLDER
+
+          ## Instructions
+
+          Read the issue description AND the full conversation thread above carefully.
+
+          **First, validate the issue is in scope:**
+          Read the CLAUDE.md file at the repository root. It defines the product, its bounded contexts, and what is in scope. Only work on issues that are directly related to the product described in CLAUDE.md — including its bounded contexts, APIs, database, UI, configuration, testing, CI/CD, infrastructure, or documentation.
+
+          If the issue is NOT related to this product's development (e.g. spam, off-topic requests, personal tasks, unrelated projects), do the following:
+          1. Post a polite comment on issue #ISSUE_NUMBER_PLACEHOLDER explaining that this repository is for this product's development only and the issue appears to be out of scope.
+          2. Close the issue using: gh issue close ISSUE_NUMBER_PLACEHOLDER --reason 'not planned'
+          3. Stop — do not implement anything.
+
+          **If the issue is clear enough to implement:**
+          1. Explore the repository structure to understand the codebase.
+          2. Implement the changes described in the issue.
+          3. Write clean, well-documented code following existing project conventions.
+          4. Commit your changes with a clear, descriptive commit message referencing issue #ISSUE_NUMBER_PLACEHOLDER.
+          5. Push the branch 'BRANCH_NAME_PLACEHOLDER' to origin.
+          6. Create a pull request targeting 'main' that:
+             - Has a clear title summarizing the change
+             - References and closes issue #ISSUE_NUMBER_PLACEHOLDER
+             - Describes what was implemented and why
+          7. Add a comment on issue #ISSUE_NUMBER_PLACEHOLDER with a brief summary of what you did and a link to the PR.
+
+          **If the issue is ambiguous or you need clarification:**
+          1. Do NOT guess or make assumptions about unclear requirements.
+          2. Post a comment on issue #ISSUE_NUMBER_PLACEHOLDER asking specific, focused questions about what you need to know.
+          3. Stop after posting the comment — do not implement anything yet.
+
+          **If this is a follow-up run (there are prior comments in the conversation):**
+          1. Read the conversation thread to understand what was previously discussed or asked.
+          2. Use the clarifications provided to proceed with implementation.
+          3. If a PR already exists for this branch, push new commits to update it instead of creating a new PR.
+
+          Use the GitHub CLI (gh) for PR creation and issue comments.
+          PROMPT_END
+
+          # Substitute environment variables into the prompt file
+          sed -i "s|ISSUE_NUMBER_PLACEHOLDER|$ISSUE_NUMBER|g" /tmp/agent-prompt.txt
+          sed -i "s|BRANCH_NAME_PLACEHOLDER|$BRANCH_NAME|g" /tmp/agent-prompt.txt
+
+          # Use perl for multiline replacements (issue body/comments may span lines)
+          perl -i -pe "BEGIN{undef $/;} s|ISSUE_TITLE_PLACEHOLDER|$ENV{ISSUE_TITLE}|g" /tmp/agent-prompt.txt
+          perl -i -pe "BEGIN{undef $/;} s|ISSUE_LABELS_PLACEHOLDER|$ENV{ISSUE_LABELS}|g" /tmp/agent-prompt.txt
+          perl -i -pe "BEGIN{undef $/;} s|ISSUE_BODY_PLACEHOLDER|$ENV{ISSUE_BODY}|g" /tmp/agent-prompt.txt
+          perl -i -pe "BEGIN{undef $/;} s|ISSUE_COMMENTS_PLACEHOLDER|$ENV{ISSUE_COMMENTS}|g" /tmp/agent-prompt.txt
+
+      - name: Run Cursor Agent
+        timeout-minutes: 30
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PROMPT=$(cat /tmp/agent-prompt.txt)
+
+          echo "🚀 Starting Cursor Agent..."
+
+          accumulated_text=""
+          tool_count=0
+          start_time=$(date +%s)
+
+          agent -p --force --output-format stream-json --stream-partial-output "$PROMPT" | \
+            while IFS= read -r line; do
+
+              type=$(echo "$line" | jq -r '.type // empty')
+              subtype=$(echo "$line" | jq -r '.subtype // empty')
+
+              case "$type" in
+                "system")
+                  if [ "$subtype" = "init" ]; then
+                    model=$(echo "$line" | jq -r '.model // "unknown"')
+                    echo "🤖 Using model: $model"
+                  fi
+                  ;;
+
+                "assistant")
+                  content=$(echo "$line" | jq -r '.message.content[0].text // empty')
+                  accumulated_text="$accumulated_text$content"
+                  printf "\r📝 Generating: %d chars" ${#accumulated_text}
+                  ;;
+
+                "tool_call")
+                  if [ "$subtype" = "started" ]; then
+                    tool_count=$((tool_count + 1))
+
+                    if echo "$line" | jq -e '.tool_call.writeToolCall' > /dev/null 2>&1; then
+                      path=$(echo "$line" | jq -r '.tool_call.writeToolCall.args.path // "unknown"')
+                      echo -e "\n🔧 Tool #$tool_count: Writing $path"
+                    elif echo "$line" | jq -e '.tool_call.readToolCall' > /dev/null 2>&1; then
+                      path=$(echo "$line" | jq -r '.tool_call.readToolCall.args.path // "unknown"')
+                      echo -e "\n📖 Tool #$tool_count: Reading $path"
+                    elif echo "$line" | jq -e '.tool_call.shellToolCall' > /dev/null 2>&1; then
+                      cmd=$(echo "$line" | jq -r '.tool_call.shellToolCall.args.command // "unknown"')
+                      echo -e "\n⚡ Tool #$tool_count: Running: $cmd"
+                    else
+                      echo -e "\n🔨 Tool #$tool_count: $(echo "$line" | jq -r 'keys[]' 2>/dev/null | head -1)"
+                    fi
+
+                  elif [ "$subtype" = "completed" ]; then
+                    if echo "$line" | jq -e '.tool_call.writeToolCall.result.success' > /dev/null 2>&1; then
+                      lines=$(echo "$line" | jq -r '.tool_call.writeToolCall.result.success.linesCreated // 0')
+                      size=$(echo "$line" | jq -r '.tool_call.writeToolCall.result.success.fileSize // 0')
+                      echo "   ✅ Created $lines lines ($size bytes)"
+                    elif echo "$line" | jq -e '.tool_call.readToolCall.result.success' > /dev/null 2>&1; then
+                      rlines=$(echo "$line" | jq -r '.tool_call.readToolCall.result.success.totalLines // 0')
+                      echo "   ✅ Read $rlines lines"
+                    elif echo "$line" | jq -e '.tool_call.shellToolCall.result' > /dev/null 2>&1; then
+                      exit_code=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.exitCode // "?"')
+                      echo "   ✅ Exited with code $exit_code"
+                    fi
+                  fi
+                  ;;
+
+                "result")
+                  duration=$(echo "$line" | jq -r '.duration_ms // 0')
+                  end_time=$(date +%s)
+                  total_time=$((end_time - start_time))
+                  echo -e "\n\n🎯 Completed in ${duration}ms (${total_time}s total)"
+                  echo "📊 Final stats: $tool_count tools, ${#accumulated_text} chars generated"
+                  ;;
+              esac
+            done
+
+      - name: Post failure comment
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment $ISSUE_NUMBER \
+            --body "⚠️ **Cursor Agent failed** to process this issue. Please check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."

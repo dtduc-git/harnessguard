@@ -147,6 +147,52 @@ _Generated 2026-09-16T14:34:22.623413+00:00 with harnessguard 0.6.0. Same corpus
 
 <!-- remediation-scan:end -->
 
+<!-- pass4-scan:start -->
+
+## Fresh sample (pass 4)
+
+_Generated 2026-09-17T11:17:52.723061+00:00 with harnessguard 0.6.1. New code-search queries targeting MCP configuration, agentic-workflow surfacing and newer agent CLIs. Per-file rules only; repository-level chain rules (HG007–HG009) are measured by the scans above._
+
+| Query | Candidates selected |
+| --- | --- |
+| `mcpServers path:.github/workflows` | 85 |
+| `mcp-config path:.github/workflows` | 61 |
+| `"mcp-remote" path:.github/workflows` | 98 |
+| `"agentic workflow" path:.github/workflows` | 11 |
+| `claude-code-base-action path:.github/workflows` | 90 |
+| `"qwen-code" path:.github/workflows` | 96 |
+| `cursor-agent path:.github/workflows` | 63 |
+
+### Headline
+
+- Agent workflow files: **96** from **81** repos — **11** already present in the pass-1 corpus
+- **60.4%** have at least one rule-of-two finding
+- **41.7%** combine untrusted events with runner secrets or write permissions (HG001/HG003)
+- **3.1%** interpolate attacker-controlled event data into agent steps (HG002)
+- **3.1%** run an agent on `pull_request_target` (HG004)
+- **21.9%** launch unpinned MCP servers or plaintext MCP endpoints (HG010)
+
+### Findings by rule
+
+| Rule | Files affected | Share of agent files |
+| --- | --- | --- |
+| HG001 | 40 | 41.7% |
+| HG005 | 40 | 41.7% |
+| HG003 | 37 | 38.5% |
+| HG010 | 21 | 21.9% |
+| HG006 | 5 | 5.2% |
+| HG004 | 3 | 3.1% |
+| HG002 | 3 | 3.1% |
+
+### Caveats
+
+- New queries change what the sample selects; percentages are not directly comparable with pass 1 — compare rule shares, not absolute counts.
+- The MCP queries select files that *mention* MCP configuration even when no agent runs in them; only files with a detected agent step are counted.
+- HG010 fires on unpinned packages and non-loopback plaintext endpoints; pinned servers and loopback endpoints are not counted.
+- Best-match sampling; the corpus is fork-heavy, so repository counts overstate independent implementations.
+
+<!-- pass4-scan:end -->
+
 ## Caveats
 
 - GitHub code search returns best-match results, not a uniform random sample; popularity and recency skew the corpus.

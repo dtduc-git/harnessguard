@@ -1,0 +1,59 @@
+---
+name: CI/CD
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+  workflow_dispatch:  # checkov:skip=CKV_GHA_7:workflow_dispatch inputs are required for manual runs
+    inputs:
+      workflow:
+        required: true
+        type: choice
+        options:
+          - update
+        description: Choose the workflow to run
+        default: update
+jobs:
+  speckit-init:
+    if: >
+      github.event_name == 'push'
+      || github.event_name == 'pull_request'
+      || (github.event_name == 'workflow_dispatch' && inputs.workflow == 'update')
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: ./.github/workflows/speckit-init.yml
+    with:
+      ai-assistants: codex,agy,cursor-agent,copilot,opencode,claude
+      version-md-file-to-write: VERSION.md
+    secrets:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  markdown-lint:
+    if: >
+      github.event_name == 'push' || github.event_name == 'pull_request'
+    uses: dceoy/gha-for-devops/.github/workflows/markdown-lint.yml@main  # zizmor: ignore[unpinned-uses]
+    with:
+      search-path: .
+  dependabot-auto-merge:
+    if: >
+      github.event_name == 'pull_request' && github.actor == 'dependabot[bot]'
+    needs:
+      - markdown-lint
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+      checks: read
+      statuses: read
+    uses: dceoy/gha-for-devops/.github/workflows/dependabot-auto-merge.yml@main  # zizmor: ignore[unpinned-uses]
+    with:
+      unconditional: true
+    secrets:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

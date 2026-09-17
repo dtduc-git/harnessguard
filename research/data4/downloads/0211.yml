@@ -1,0 +1,640 @@
+name: Build & Deploy to AKS
+
+# Builds the three deployed images (backend, frontend, mcp-remote), pushes them
+# to GHCR, then rolls them out to the shared `aks-sparx-prod-cus` cluster in the
+# `kanninja` namespace.
+#
+# WHAT CHANGED, AND WHY IT IS NOT A REVERT. kanNINJA ran on AKS, moved to GKE in
+# 2026-06, and is moving back. The reason is not that GKE was worse: it is that
+# the DATABASE moved to Azure, and a private-endpoint Postgres cannot be reached
+# from a GKE pod at all. Once the data is in a VNet, the compute follows it or
+# the whole thing runs over the public internet with a firewall allow-list. See
+# docs/azure-migration-plan.md.
+#
+# Auth model (mirrors jotDOJO, the other co-tenant on this cluster):
+#   - Workload identity federation, no stored credential. Azure trusts a GitHub
+#     OIDC token whose subject is `repo:brandonkorous/kanninja:ref:refs/heads/main`.
+#     The three AZURE_* values below are repository VARIABLES, not secrets —
+#     they are public identifiers, and treating them as secrets only makes them
+#     harder to read in a failed run.
+#   - Secrets come from Key Vault at deploy time, NOT from ~60 GitHub Actions
+#     secrets. That list was unauditable and could only be rotated by whoever
+#     held repo admin. Adding a credential is now `az keyvault secret set`.
+#
+# The npm-distributed stdio MCP image (build-mcp) is unchanged: it is a public
+# artifact users pull, not a cluster workload.
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+    id-token: write # required for federated auth to Azure
+
+env:
+    RESOURCE_GROUP: rg-sparx-prod-cus
+    CLUSTER: aks-sparx-prod-cus
+    NAMESPACE: kanninja
+    # GHCR, matching jotDOJO and sparx. Nothing in k8s/ carries an
+    # imagePullSecret because the cluster pulls anonymously, which requires the
+    # packages to be public.
+    #
+    # THE NAMES ARE HYPHENATED — `kanninja-backend`, NOT `kanninja/backend`.
+    # These packages already exist and are already public, with tag history
+    # going back to the first AKS deployment; verified by an anonymous pull
+    # against ghcr.io, which is the same path the kubelet takes. A slash would
+    # address a DIFFERENT, non-existent package, and the first deploy would fail
+    # on a 401 that reads like a missing tag while the real images sat untouched
+    # beside it.
+    REGISTRY: ghcr.io/brandonkorous
+    IMAGE_OWNER: brandonkorous
+
+jobs:
+    # ------------------------------------------------------------------
+    # Lint + typecheck + unit tests. Gates every build job below — this
+    # pipeline shipped to production without running any of them for its first
+    # year, which is not a gap you want while migrating auth and the database
+    # at once.
+    # ------------------------------------------------------------------
+    verify:
+        name: Lint, typecheck & test
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: pnpm/action-setup@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: '22'
+                  cache: 'pnpm'
+            - run: pnpm install --frozen-lockfile
+            # BUILD THE LIBRARY PACKAGES FIRST — both of them.
+            #
+            # `@kanninja/shared` and `kanninja-mcp` both expose `./dist/*` in
+            # their package exports, so a consumer cannot typecheck against
+            # either until it has been built. This step used to be
+            # `pnpm build:shared`, which left `kanninja-mcp` unbuilt and made
+            # `mcp-remote` fail with TS2307 on `kanninja-mcp/api-client` and
+            # four siblings.
+            #
+            # IT PASSED LOCALLY AND ONLY EVER FAILED IN CI, which is the whole
+            # trap: a developer machine has a stale `mcp-server/dist` from some
+            # earlier build, so the imports resolve. A fresh checkout has
+            # nothing. Reproduce with `rm -rf mcp-server/dist && pnpm typecheck`.
+            #
+            # The Dockerfiles never had this problem because they build with
+            # `--filter <pkg>...` (trailing dots), which pulls in workspace
+            # dependencies topologically. This job typechecks every package at
+            # once, so it must build the libraries up front instead.
+            - run: pnpm build:deps
+            - run: pnpm typecheck
+            # `pnpm -r run test` is a no-op in packages without a test script,
+            # so this is backend's vitest suite today.
+            - run: pnpm test
+            # Lint gates the deploy from here on. It could not before: the
+            # frontend had no flat config of its own, so `next lint` fell back
+            # to the workspace one, found no Next.js plugins, and errored on
+            # every eslint-disable comment naming a rule it could not resolve.
+            # It failed on a clean checkout of main, which is why it was never
+            # wired in. Warnings do not fail the build; errors do.
+            - run: pnpm lint
+
+    # ------------------------------------------------------------------
+    # Build & push the three cluster images.
+    # ------------------------------------------------------------------
+    build:
+        name: Build ${{ matrix.name }}
+        runs-on: ubuntu-latest
+        needs: [verify]
+        permissions:
+            contents: read
+            packages: write
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: backend
+                      dockerfile: ./Dockerfile.backend
+                    - name: frontend
+                      dockerfile: ./Dockerfile.frontend
+                    - name: mcp-remote
+                      dockerfile: ./Dockerfile.mcp-remote
+        steps:
+            - uses: actions/checkout@v4
+            - uses: docker/setup-buildx-action@v3
+
+            - uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Docker metadata
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ env.REGISTRY }}/kanninja-${{ matrix.name }}
+                  tags: |
+                      type=sha,prefix=sha-,format=short
+                      type=raw,value=latest,enable={{is_default_branch}}
+
+            - name: Build & push
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: ${{ matrix.dockerfile }}
+                  push: true
+                  provenance: false
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  cache-from: type=gha,scope=${{ matrix.name }}
+                  cache-to: type=gha,mode=min,scope=${{ matrix.name }},ignore-error=true
+                  # Next.js bakes NEXT_PUBLIC_* at build time, so the frontend
+                  # needs them here and the other two ignore them. No auth or
+                  # Supabase build args: Better Auth is server-side on the API,
+                  # the browser client derives everything from NEXT_PUBLIC_API_URL,
+                  # and realtime is a WebSocket to that same origin.
+                  build-args: |
+                      NEXT_PUBLIC_API_URL=https://api.kanninja.com
+                      NEXT_PUBLIC_GA_MEASUREMENT_ID=G-2XYLPDDZ9K
+                      NEXT_PUBLIC_CLARITY_PROJECT_ID=wh11efmbfb
+
+    # ------------------------------------------------------------------
+    # The npm-published stdio MCP image. NOT a cluster workload — a public
+    # distribution artifact, kept on its own repository path.
+    # ------------------------------------------------------------------
+    build-mcp:
+        name: Build MCP server (stdio)
+        runs-on: ubuntu-latest
+        needs: [verify]
+        permissions:
+            contents: read
+            packages: write
+        steps:
+            - uses: actions/checkout@v4
+            - uses: docker/setup-buildx-action@v3
+            - uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+            - name: Docker metadata
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ghcr.io/${{ env.IMAGE_OWNER }}/kanninja-mcp
+                  tags: |
+                      type=sha,prefix=sha-,format=short
+                      type=raw,value=latest,enable={{is_default_branch}}
+            - name: Build & push
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: ./Dockerfile.mcp
+                  push: true
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  cache-from: type=gha,scope=mcp
+                  cache-to: type=gha,mode=max,scope=mcp,ignore-error=true
+
+    # ------------------------------------------------------------------
+    # Deploy. Ordered infrastructure -> secrets -> data -> containers, so
+    # that every stage is already true when the next one needs it.
+    # ------------------------------------------------------------------
+    deploy:
+        name: Deploy to AKS
+        runs-on: ubuntu-latest
+        needs: [build]
+        concurrency:
+            group: deploy-aks-prod
+            cancel-in-progress: false
+        # NOT bound to a GitHub Environment. Azure trusts two subjects for this
+        # repo — the `main` branch and a `prod` environment — so adding
+        # `environment: prod` here to get required reviewers works without any
+        # Azure change. It is left off because an environment that does not yet
+        # exist changes the subject GitHub mints, and the resulting failure
+        # ("no matching federated identity credential") names neither cause.
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: azure/login@v2
+              with:
+                  client-id: ${{ vars.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ vars.AZURE_TENANT_ID }}
+                  subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+            - name: Get cluster credentials
+              run: |
+                  set -euo pipefail
+                  az aks get-credentials \
+                    --resource-group "$RESOURCE_GROUP" \
+                    --name "$CLUSTER" \
+                    --overwrite-existing
+
+            # The namespace and ConfigMaps must exist before anything reads
+            # them — including the Jobs below, which run in the namespace and
+            # (for the migrator) read backend-config.
+            - name: Ensure namespace and config
+              run: |
+                  set -euo pipefail
+                  kubectl apply -f k8s/namespace.yaml
+                  kubectl apply -f k8s/configmap.yaml
+
+            # -----------------------------------------------------------------
+            # Secrets: Key Vault -> Kubernetes Secrets.
+            #
+            # Key Vault names allow only alphanumerics and hyphens, so the env
+            # var DATABASE_URL is stored as DATABASE-URL and mapped back here.
+            #
+            # A MISSING REQUIRED SECRET FAILS THE RELEASE, and that is the point
+            # of splitting the two lists rather than looping over everything the
+            # vault happens to hold. Every name in `required` has a failure that
+            # LOOKS FINE from the outside: an absent RESEND_API_KEY is a signup
+            # flow that accepts the form and never sends the code; an absent
+            # AZURE_STORAGE_KEY is an attachment upload that 500s only when a
+            # user tries one; an absent STRIPE_WEBHOOK_SECRET is a webhook
+            # endpoint that rejects every event while the deploy goes green.
+            #
+            # The ~25 integration OAuth pairs are genuinely optional: each one
+            # missing costs exactly one provider, the connect flow reports it,
+            # and nothing else degrades.
+            #
+            # The AZURE_OPENAI_* trio is required because Whisper transcription
+            # for voice capture (services/transcription.service.ts) is the ONLY
+            # model call left in the product. All three default to '' in env.ts,
+            # so their absence does not stop the server booting — voice capture
+            # simply fails at the moment a user speaks, which is precisely the
+            # silent-green failure this list exists to refuse.
+            #
+            # IT USED TO BE THE KEY ALONE, which refused nothing. config/
+            # azure-openai.ts needs ENDPOINT and SPEECH_DEPLOYMENT as well, and
+            # both had been carried by jotDOJO-shaped defaults in env.ts. When
+            # those defaults were correctly emptied, a deploy that read only the
+            # key would have left the pod with no endpoint and no deployment
+            # name: green rollout, healthy pods, and voice 503ing on first use
+            # — with the values sitting in the vault the whole time.
+            #
+            # API_VERSION is NOT here. It has a real default ('2024-06-01') that
+            # is correct unless Azure retires it, so it belongs in `optional`.
+            # -----------------------------------------------------------------
+            - name: Read secrets from Key Vault
+              env:
+                  VAULT: ${{ vars.AZURE_KEY_VAULT_NAME }}
+              run: |
+                  set -euo pipefail
+                  umask 077
+                  : > /tmp/backend.env
+
+                  required=(
+                    DATABASE_URL
+                    BETTER_AUTH_SECRET
+                    AZURE_STORAGE_ACCOUNT
+                    AZURE_STORAGE_KEY
+                    RESEND_API_KEY
+                    GOOGLE_AUTH_CLIENT_ID
+                    GOOGLE_AUTH_CLIENT_SECRET
+                    STRIPE_SECRET_KEY
+                    STRIPE_WEBHOOK_SECRET
+                    AZURE_OPENAI_ENDPOINT
+                    AZURE_OPENAI_API_KEY
+                    AZURE_OPENAI_SPEECH_DEPLOYMENT
+                    INTEGRATION_ENCRYPTION_KEY
+                    MCP_JWT_SECRET
+                    MCP_S2S_TOKEN
+                  )
+
+                  # DATABASE_ADMIN_URL is read separately below — it is used by
+                  # the migration Jobs and must NOT reach the running app, which
+                  # connects as the restricted `kanninja_app` role.
+                  optional=(
+                    # Vestigial: still declared in config/env.ts, read by
+                    # nothing since built-in AI was removed. Carried as optional
+                    # rather than deleted so an existing vault entry does not
+                    # become an error, and so deleting the env var later is a
+                    # one-line change here. It was briefly in `required`, which
+                    # would have failed every deploy on a secret that does
+                    # nothing.
+                    OPENAI_API_KEY
+                    # Real default in env.ts ('2024-06-01'), so a missing entry
+                    # is correct behaviour rather than a broken deploy. Set it
+                    # in the vault only to pin a different Azure API version.
+                    AZURE_OPENAI_API_VERSION
+                    GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET
+                    SLACK_CLIENT_ID SLACK_CLIENT_SECRET SLACK_SIGNING_SECRET
+                    GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET GITHUB_WEBHOOK_SECRET
+                    MICROSOFT_CLIENT_ID MICROSOFT_CLIENT_SECRET MICROSOFT_TENANT_ID
+                    ATLASSIAN_CLIENT_ID ATLASSIAN_CLIENT_SECRET
+                    GITLAB_CLIENT_ID GITLAB_CLIENT_SECRET GITLAB_INSTANCE_URL
+                    DISCORD_CLIENT_ID DISCORD_CLIENT_SECRET DISCORD_BOT_TOKEN DISCORD_PUBLIC_KEY
+                    NOTION_CLIENT_ID NOTION_CLIENT_SECRET
+                    FIGMA_CLIENT_ID FIGMA_CLIENT_SECRET
+                    LINEAR_CLIENT_ID LINEAR_CLIENT_SECRET
+                    DROPBOX_CLIENT_ID DROPBOX_CLIENT_SECRET
+                    LOOM_CLIENT_ID LOOM_CLIENT_SECRET
+                    ZENDESK_CLIENT_ID ZENDESK_CLIENT_SECRET
+                    INTERCOM_CLIENT_ID INTERCOM_CLIENT_SECRET
+                    HUBSPOT_CLIENT_ID HUBSPOT_CLIENT_SECRET
+                    SALESFORCE_CLIENT_ID SALESFORCE_CLIENT_SECRET
+                  )
+
+                  missing=()
+                  for name in "${required[@]}"; do
+                    kv_name="${name//_/-}"
+                    if value=$(az keyvault secret show --vault-name "$VAULT" \
+                                 --name "$kv_name" --query value -o tsv 2>/dev/null); then
+                      printf '%s=%s\n' "$name" "$value" >> /tmp/backend.env
+                    else
+                      missing+=("$kv_name")
+                    fi
+                  done
+
+                  if [ ${#missing[@]} -gt 0 ]; then
+                    echo "::error::Missing required secrets in $VAULT: ${missing[*]}"
+                    echo "Set one with: az keyvault secret set --vault-name $VAULT --name <NAME> --value '...'"
+                    exit 1
+                  fi
+
+                  for name in "${optional[@]}"; do
+                    kv_name="${name//_/-}"
+                    if value=$(az keyvault secret show --vault-name "$VAULT" \
+                                 --name "$kv_name" --query value -o tsv 2>/dev/null); then
+                      printf '%s=%s\n' "$name" "$value" >> /tmp/backend.env
+                      echo "optional secret present: $name"
+                    fi
+                  done
+
+                  # The owner credential, for the Jobs only.
+                  # printf %s with command substitution, NOT a plain redirect.
+                  #
+                  # `az ... -o tsv` terminates its output with a newline, and
+                  # `kubectl create secret --from-file` stores a file's bytes VERBATIM.
+                  # So `> file` produced a connection string ending in sslmode=require
+                  # plus a newline, and psql rejected it with:
+                  #
+                  #     psql: error: invalid sslmode value: "require<newline>"
+                  #
+                  # Command substitution strips trailing newlines and printf %s adds
+                  # none, so this writes exactly the bytes the vault holds.
+                  #
+                  # The same bug in KANNINJA_APP_PASSWORD is quieter and worse: the role
+                  # job would set a password ending in a newline while Terraform's
+                  # DATABASE-URL carries it without one. The job would report success,
+                  # and every backend pod would then fail to authenticate against a
+                  # password that looks identical in every log and dashboard.
+                  #
+                  # The --from-env-file path above is unaffected: it builds its lines
+                  # with value=$(az ...), and command substitution already strips it.
+                  printf '%s' "$(az keyvault secret show --vault-name "$VAULT" \
+                    --name DATABASE-ADMIN-URL --query value -o tsv)" > /tmp/admin-url
+                  printf '%s' "$(az keyvault secret show --vault-name "$VAULT" \
+                    --name KANNINJA-APP-PASSWORD --query value -o tsv)" > /tmp/app-password
+
+            - name: Apply the Secrets
+              run: |
+                  set -euo pipefail
+                  NS="$NAMESPACE"
+
+                  kubectl create secret generic backend-secrets -n "$NS" \
+                    --from-env-file=/tmp/backend.env \
+                    --dry-run=client -o yaml | kubectl apply -f -
+
+                  # Migration credentials, deliberately in a SEPARATE Secret
+                  # that no Deployment mounts. The running app connects as
+                  # `kanninja_app`, which cannot execute DDL; handing it the
+                  # owner URL through backend-secrets would silently undo that.
+                  kubectl create secret generic db-admin -n "$NS" \
+                    --from-file=DATABASE_ADMIN_URL=/tmp/admin-url \
+                    --from-file=KANNINJA_APP_PASSWORD=/tmp/app-password \
+                    --dry-run=client -o yaml | kubectl apply -f -
+
+                  # mcp-remote mints the JWTs the backend validates, so the two
+                  # share these. Re-read from the backend env file rather than
+                  # fetched twice.
+                  MCP_JWT_SECRET=$(grep '^MCP_JWT_SECRET=' /tmp/backend.env | cut -d= -f2-)
+                  MCP_S2S_TOKEN=$(grep '^MCP_S2S_TOKEN=' /tmp/backend.env | cut -d= -f2-)
+                  kubectl create secret generic mcp-secrets -n "$NS" \
+                    --from-literal=MCP_JWT_SECRET="$MCP_JWT_SECRET" \
+                    --from-literal=MCP_S2S_TOKEN="$MCP_S2S_TOKEN" \
+                    --dry-run=client -o yaml | kubectl apply -f -
+
+                  # Frontend holds nothing: its middleware only checks that a
+                  # session cookie is PRESENT and the authoritative check is an
+                  # API call. Created empty rather than deleted so the
+                  # Deployment's envFrom keeps resolving.
+                  kubectl create secret generic frontend-secrets -n "$NS" \
+                    --dry-run=client -o yaml | kubectl apply -f -
+
+                  rm -f /tmp/backend.env /tmp/admin-url /tmp/app-password
+                  echo "Applied backend-secrets, db-admin, mcp-secrets, frontend-secrets."
+
+            # -----------------------------------------------------------------
+            # DATA — migrations, as a Job INSIDE the cluster.
+            #
+            # THIS CANNOT RUN ON THE RUNNER, and that is a hard property rather
+            # than a preference. The Postgres server has
+            # `public_network_access_enabled = false` and lives in a delegated
+            # subnet, so a GitHub-hosted runner cannot reach it with any
+            # connection string or firewall rule. A pod is inside the VNet.
+            #
+            # This replaces running `pnpm db:migrate` from a laptop, which is
+            # what docs/deployment.md used to instruct and which stops being
+            # possible the moment the database is private.
+            #
+            # Runs THE BACKEND IMAGE AT THIS SHA rather than a purpose-built
+            # migrate image: that image already carries drizzle/ and the
+            # compiled migrator, so the schema applied is by construction the
+            # one the code being deployed expects.
+            #
+            # `backoffLimit: 0` — the drizzle migrator is idempotent (it records
+            # applied hashes and skips them), but a retry of a migration that
+            # failed PART WAY is not obviously safe. The right response is a
+            # human reading the error, not a second automatic attempt.
+            # -----------------------------------------------------------------
+            - name: Migrate the schema
+              run: |
+                  set -euo pipefail
+                  kubectl delete job db-migrate -n "$NAMESPACE" --ignore-not-found
+
+                  SHA_TAG="sha-${GITHUB_SHA::7}"
+                  kubectl apply -n "$NAMESPACE" -f - <<YAML
+                  apiVersion: batch/v1
+                  kind: Job
+                  metadata:
+                    name: db-migrate
+                  spec:
+                    backoffLimit: 0
+                    ttlSecondsAfterFinished: 600
+                    template:
+                      spec:
+                        restartPolicy: Never
+                        enableServiceLinks: false
+                        containers:
+                          - name: migrate
+                            image: ${REGISTRY}/kanninja-backend:${SHA_TAG}
+                            command: ['node', 'dist/db/migrate.js']
+                            env:
+                              # The MIGRATOR reads DATABASE_URL, so the owner
+                              # credential is injected under that name here and
+                              # only here. The running Deployment gets the
+                              # restricted role under the same variable.
+                              - name: DATABASE_URL
+                                valueFrom:
+                                  secretKeyRef: { name: db-admin, key: DATABASE_ADMIN_URL }
+                  YAML
+
+                  # Wait, and FAIL THE RELEASE if it fails. A migration whose
+                  # result is not awaited is the same as no migration at all —
+                  # discovered later, by a user, against code that assumed it ran.
+                  if ! kubectl wait --for=condition=complete job/db-migrate \
+                         -n "$NAMESPACE" --timeout=600s; then
+                    echo "::error::Migration job did not complete. Logs follow."
+                    kubectl logs job/db-migrate -n "$NAMESPACE" --tail=200 || true
+                    exit 1
+                  fi
+                  kubectl logs job/db-migrate -n "$NAMESPACE" --tail=50
+
+            # -----------------------------------------------------------------
+            # The application role.
+            #
+            # Azure will never run this for us: `docker/init/*.sql` is a Docker
+            # IMAGE ENTRYPOINT CONVENTION, not a Postgres feature, so a managed
+            # server has no equivalent hook. Without this step `kanninja_app`
+            # does not exist and every pod crashloops on an authentication
+            # failure that reads like a wrong password.
+            #
+            # CREATE-then-ALTER rather than plain CREATE, so the step is
+            # idempotent: the first deploy makes the role, every later one just
+            # keeps its password in step with the vault.
+            #
+            # The password arrives as a psql VARIABLE and is quoted with
+            # :'app_password' so psql escapes it. Interpolating it into the SQL
+            # string breaks on any password containing a quote - and the
+            # generated one contains plenty. THE SQL ARRIVES ON STDIN, NOT VIA
+            # -c: psql only expands :'var' while lexing input it reads, so a -c
+            # string reaches the server literally and fails with `syntax error
+            # at or near ":"`.
+            #
+            # THE DOLLAR-QUOTE TAG IS $do$, NOT $$, AND THAT IS NOT STYLE.
+            # Kubernetes expands $(VAR) in a container command/args, and it uses
+            # $$ as the escape for a literal $. So a plain $$ dollar-quote is
+            # collapsed to a single $ BEFORE sh ever runs, and psql receives
+            #
+            #     DO $   ->  ERROR: syntax error at or near "$"
+            #
+            # The heredoc is innocent: it is quoted (<<'SQL') and reproduces $$
+            # faithfully, which is why this only failed inside the cluster and
+            # looked like a bash quoting bug. A named tag contains no $$
+            # sequence at all, so nothing rewrites it. $$$$ would also work and
+            # is far harder to read.
+            # -----------------------------------------------------------------
+            - name: Ensure the application role
+              run: |
+                  set -euo pipefail
+                  kubectl delete job db-role -n "$NAMESPACE" --ignore-not-found
+                  kubectl apply -n "$NAMESPACE" -f - <<'YAML'
+                  apiVersion: batch/v1
+                  kind: Job
+                  metadata:
+                    name: db-role
+                  spec:
+                    backoffLimit: 1
+                    ttlSecondsAfterFinished: 600
+                    template:
+                      spec:
+                        restartPolicy: Never
+                        enableServiceLinks: false
+                        containers:
+                          - name: psql
+                            image: postgres:18-alpine
+                            command: ['sh', '-c']
+                            # The dollar-quote tag is $do$ rather than $$ on purpose:
+                            # Kubernetes collapses $$ to a single $ when it expands
+                            # $(VAR) references in args, so a plain $$ block reaches psql
+                            # as `DO $` and fails. A named tag has no $$ to rewrite.
+                            args:
+                              - |
+                                cat <<'SQL' | psql "$DATABASE_ADMIN_URL" -v ON_ERROR_STOP=1 -v app_password="$KANNINJA_APP_PASSWORD"
+                                DO $do$
+                                BEGIN
+                                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'kanninja_app') THEN
+                                    CREATE ROLE kanninja_app LOGIN;
+                                  END IF;
+                                END
+                                $do$;
+                                ALTER ROLE kanninja_app LOGIN PASSWORD :'app_password';
+                                GRANT CONNECT ON DATABASE kanninja TO kanninja_app;
+                                GRANT USAGE ON SCHEMA public TO kanninja_app;
+                                GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO kanninja_app;
+                                GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO kanninja_app;
+                                -- Tables created by FUTURE migrations, which run
+                                -- as the owner. Without this every new table is
+                                -- invisible to the app until someone re-grants
+                                -- by hand — a failure that appears one deploy
+                                -- after the migration that caused it.
+                                ALTER DEFAULT PRIVILEGES IN SCHEMA public
+                                  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO kanninja_app;
+                                ALTER DEFAULT PRIVILEGES IN SCHEMA public
+                                  GRANT USAGE, SELECT ON SEQUENCES TO kanninja_app;
+                                SQL
+                            env:
+                              - name: DATABASE_ADMIN_URL
+                                valueFrom:
+                                  secretKeyRef: { name: db-admin, key: DATABASE_ADMIN_URL }
+                              - name: KANNINJA_APP_PASSWORD
+                                valueFrom:
+                                  secretKeyRef: { name: db-admin, key: KANNINJA_APP_PASSWORD }
+                  YAML
+
+                  if ! kubectl wait --for=condition=complete job/db-role \
+                         -n "$NAMESPACE" --timeout=180s; then
+                    echo "::error::Role job did not complete. Logs follow."
+                    kubectl logs job/db-role -n "$NAMESPACE" --tail=100 || true
+                    exit 1
+                  fi
+
+            # -----------------------------------------------------------------
+            # CONTAINERS — last, so everything above is already true.
+            # -----------------------------------------------------------------
+            - name: Set up Kustomize
+              uses: imranismail/setup-kustomize@v2
+
+            - name: Pin image tags
+              working-directory: k8s
+              run: |
+                  set -euo pipefail
+                  SHA_TAG="sha-${GITHUB_SHA::7}"
+                  kustomize edit set image "${REGISTRY}/kanninja-backend=${REGISTRY}/kanninja-backend:${SHA_TAG}"
+                  kustomize edit set image "${REGISTRY}/kanninja-frontend=${REGISTRY}/kanninja-frontend:${SHA_TAG}"
+                  kustomize edit set image "${REGISTRY}/kanninja-mcp-remote=${REGISTRY}/kanninja-mcp-remote:${SHA_TAG}"
+                  echo "--- resolved kustomization.yaml ---"
+                  cat kustomization.yaml
+
+            - name: Apply manifests
+              working-directory: k8s
+              run: kubectl apply -k .
+
+            - name: Wait for rollout
+              run: |
+                  set -euo pipefail
+                  failed=0
+                  for svc in backend frontend mcp; do
+                    if ! kubectl rollout status -n "$NAMESPACE" "deploy/$svc" --timeout=600s; then
+                      echo "::error::Rollout of $svc did not complete."
+                      kubectl describe deploy "$svc" -n "$NAMESPACE" || true
+                      kubectl logs -n "$NAMESPACE" "deploy/$svc" --tail=100 || true
+                      failed=1
+                    fi
+                  done
+                  exit "$failed"
+
+            - name: Summary
+              if: always()
+              run: |
+                  {
+                    echo "### kanNINJA deployment"
+                    echo
+                    echo '```'
+                    kubectl -n "$NAMESPACE" get deploy,svc,job 2>&1 || true
+                    echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"

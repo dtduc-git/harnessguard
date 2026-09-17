@@ -1,0 +1,218 @@
+name: Release
+
+# Two ways in. The everyday one is the button: Actions > Release > Run workflow,
+# pick a bump level, and this does the version bump, the commit, the tag and the
+# release itself — nothing to do locally, and no second place to keep in sync.
+# Equivalently, `gh workflow run release.yml -f bump=patch`.
+#
+# Pushing a tag by hand still releases, for a release prepared locally. That path
+# cannot be folded into the first one: a push made with the default GITHUB_TOKEN
+# deliberately does not trigger further workflows, so a job that pushed a tag
+# would never set off a tag-triggered release. Hence one workflow that both
+# creates the tag and releases it, rather than two chained by the tag.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Exact version instead, e.g. 0.2.0 (wins over the bump level)
+        type: string
+
+  push:
+    tags: ['v*']
+
+# Two releases at once would race on the tag and on the version bump.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Tests run before anything is tagged, so a failing tree cannot become a
+  # release. This is what stands between a button press and a bad tag.
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv venv --allow-existing
+      - run: uv pip install -e ".[dev]"
+      - run: uv run pytest -q
+
+  prepare:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The bump commit belongs on the default branch, not on the detached
+          # HEAD a tag push checks out.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          BUMP: ${{ inputs.bump }}
+          EXPLICIT: ${{ inputs.version }}
+          PUSHED_TAG: ${{ github.ref_name }}
+        # Outputs are written to $GITHUB_OUTPUT from inside the script, not by
+        # redirecting it: git prints to stdout too, and its "[master abc] Release
+        # 0.1.1" would land in the output file as an invalid line.
+        run: |
+          python - <<'PY'
+          import os, pathlib, re, subprocess
+
+          out = pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a")
+          emit = lambda **kw: [print(f"{k}={v}", file=out) for k, v in kw.items()]
+
+          pyproject = pathlib.Path("pyproject.toml")
+          text = pyproject.read_text(encoding="utf-8")
+          current = re.search(r'^version = "(.+?)"', text, re.M).group(1)
+
+          if os.environ["EVENT"] == "push":
+              # The tag is the claim; pyproject has to back it up. Releasing a
+              # package that reports a version other than its tag is a bug worth
+              # making impossible rather than remembering.
+              version = os.environ["PUSHED_TAG"].removeprefix("v")
+              if version != current:
+                  raise SystemExit(
+                      f"::error::tag v{version} does not match pyproject version {current}"
+                  )
+              emit(tag=f"v{version}", version=version)
+              raise SystemExit(0)
+
+          explicit = os.environ.get("EXPLICIT", "").strip().removeprefix("v")
+          if explicit:
+              if not re.fullmatch(r"\d+\.\d+\.\d+", explicit):
+                  raise SystemExit(f"::error::'{explicit}' is not a X.Y.Z version")
+              version = explicit
+          else:
+              major, minor, patch = (int(p) for p in current.split("."))
+              bump = os.environ["BUMP"]
+              if bump == "major":
+                  major, minor, patch = major + 1, 0, 0
+              elif bump == "minor":
+                  minor, patch = minor + 1, 0
+              else:
+                  patch += 1
+              version = f"{major}.{minor}.{patch}"
+
+          tag = f"v{version}"
+          existing = subprocess.run(
+              ["git", "tag", "--list", tag], capture_output=True, text=True, check=True
+          ).stdout.split()
+          if existing:
+              raise SystemExit(f"::error::{tag} already exists")
+          if version == current:
+              raise SystemExit(f"::error::{version} is already the current version")
+
+          pyproject.write_text(
+              text.replace(f'version = "{current}"', f'version = "{version}"', 1),
+              encoding="utf-8",
+          )
+
+          # [skip ci] because the push-to-master CI run would only re-test what
+          # this workflow just tested, one commit earlier.
+          run = lambda *args: subprocess.run(args, check=True)
+          run("git", "config", "user.name", "github-actions[bot]")
+          run("git", "config", "user.email",
+              "41898282+github-actions[bot]@users.noreply.github.com")
+          run("git", "commit", "-am", f"Release {version} [skip ci]")
+          run("git", "tag", "-a", tag, "-m", f"mcp-remote-auth {version}")
+          run("git", "push", "--follow-tags")
+
+          emit(tag=tag, version=version)
+          PY
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      # The notes are the commit subjects since the previous tag, plus the
+      # dependency line to paste. Consumers pin this package by tag rather than
+      # by version until it is on PyPI, so the tag is the thing they need and
+      # this is where they find a real one rather than a placeholder.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          previous=$(git tag --sort=-version:refname | grep -A1 -x "$TAG" | tail -n1)
+          {
+            echo "Depend on this release:"
+            echo
+            echo '```toml'
+            echo "\"mcp-remote-auth @ git+https://github.com/${GITHUB_REPOSITORY}@${TAG}\""
+            echo '```'
+            echo
+            echo "## Changes"
+            echo
+            if [ -n "$previous" ] && [ "$previous" != "$TAG" ]; then
+              git log --no-merges --pretty='- %s' "${previous}..${TAG}"
+            else
+              git log --no-merges --pretty='- %s' "$TAG"
+            fi
+          } > notes.md
+          gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted publishing: PyPI verifies this workflow's OIDC identity, so no
+    # API token is stored anywhere. It needs a one-time publisher configured on
+    # PyPI first, so the step stays off until the repository variable
+    # PUBLISH_TO_PYPI is set to 'true' — otherwise every release would fail on
+    # a step that cannot yet succeed.
+    #
+    # Worth turning on before either consuming server is published: PyPI rejects
+    # a package whose dependencies include a direct git URL, so a server can
+    # only go there once this one has.
+    if: vars.PUBLISH_TO_PYPI == 'true'
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

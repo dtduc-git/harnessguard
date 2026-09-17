@@ -1,0 +1,270 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are tracked at @v4 (major tag) per PowerLaunch org convention,
+# matching the monorepo (PowerLaunch/apier). SHA-pinning was considered
+# (CodeRabbit) and deferred for org-wide consistency (PR #10).
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ['20', '22']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      # .registry/server.json is submitted to the MCP registry by hand — nothing
+      # in this repo publishes it, so an invalid manifest is only discovered at
+      # submission time. PR #37 shipped a 261-character description against the
+      # 100-character ServerDetail.description maxLength in the schema the file
+      # itself declares. This assertion is deliberately offline (no schema fetch)
+      # so CI never depends on registry availability; it encodes the one limit
+      # that actually bit us plus the version drift that would bite next.
+      - name: Sanity — .registry/server.json manifest
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const manifest = JSON.parse(fs.readFileSync(".registry/server.json", "utf8"));
+            const pkgVersion = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+            const MAX_DESCRIPTION = 100;
+            const errors = [];
+
+            if (typeof manifest.description !== "string") {
+              errors.push("description is missing or not a string");
+            }
+            const len = typeof manifest.description === "string" ? [...manifest.description].length : 0;
+            if (len > MAX_DESCRIPTION) {
+              errors.push(`description is ${len} characters, schema maxLength is ${MAX_DESCRIPTION}`);
+            }
+
+            // Every "version" key at any depth (top level and each packages[] entry)
+            // must track package.json, so a release bump cannot half-land.
+            const walk = (node, path) => {
+              if (Array.isArray(node)) { node.forEach((v, i) => walk(v, `${path}[${i}]`)); return; }
+              if (node === null || typeof node !== "object") return;
+              for (const [key, value] of Object.entries(node)) {
+                const here = path ? `${path}.${key}` : key;
+                if (key === "version" && value !== pkgVersion) {
+                  errors.push(`${here} is ${JSON.stringify(value)}, package.json version is ${JSON.stringify(pkgVersion)}`);
+                }
+                walk(value, here);
+              }
+            };
+            walk(manifest, "");
+
+            if (errors.length) {
+              console.error("ERROR: .registry/server.json failed manifest checks:");
+              for (const e of errors) console.error("  - " + e);
+              process.exit(1);
+            }
+            console.log(`OK — manifest parses, description ${len}/${MAX_DESCRIPTION} chars, all version fields match ${pkgVersion}`);
+          '
+      - name: Type-check
+        run: npm run lint
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Sanity — bin shebang present
+        run: |
+          set -euo pipefail
+          head -1 dist/cli.js | grep -q '^#!/usr/bin/env node' || {
+            echo "ERROR: dist/cli.js missing node shebang"
+            exit 1
+          }
+      - name: Sanity — version printed by --version matches package.json
+        run: |
+          set -euo pipefail
+          PKG_VER=$(node -p "require('./package.json').version")
+          CLI_VER=$(node dist/cli.js --version 2>&1 | tail -1 | tr -d '[:space:]')
+          if [ "$PKG_VER" != "$CLI_VER" ]; then
+            echo "ERROR: package.json version ($PKG_VER) != CLI --version ($CLI_VER)"
+            exit 1
+          fi
+
+  tarball-audit:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - name: Pack tarball
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pack
+          npm pack --pack-destination /tmp/pack
+          ls -la /tmp/pack/
+      - name: Extract tarball
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/unpack
+          tar -xzf /tmp/pack/*.tgz -C /tmp/unpack
+          echo "--- file list ---"
+          find /tmp/unpack -type f | sort
+      - name: Allowlist — only dist/, README.md, SECURITY.md, LICENSE, package.json
+        run: |
+          set -euo pipefail
+          BAD=$(find /tmp/unpack/package -type f \
+                | sed 's|/tmp/unpack/package/||' \
+                | grep -vE '^(dist/.*|README\.md|SECURITY\.md|LICENSE|package\.json)$' || true)
+          if [ -n "$BAD" ]; then
+            echo "ERROR: tarball contains files outside the allowlist:"
+            echo "$BAD"
+            exit 1
+          fi
+      - name: Blocklist — forbidden patterns must not appear anywhere
+        run: |
+          set -euo pipefail
+          if find /tmp/unpack -type f \
+              \( -name '.env*' -o -name '.npmrc' -o -name '*.pem' -o -name '*.key' \
+                 -o -name '*.local.*' -o -name '.DS_Store' \) | grep -q .; then
+            echo "ERROR: tarball contains forbidden filenames"
+            exit 1
+          fi
+          if grep -rEn \
+            'BEGIN [A-Z ]*PRIVATE KEY|apier_(live|test)_[A-Za-z0-9_-]{8,}|Bearer[[:space:]]+[A-Za-z0-9._+/=-]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}' \
+            /tmp/unpack/ ; then
+            echo "ERROR: tarball contents include a secret-shaped string"
+            exit 1
+          fi
+          echo "OK — tarball clean"
+
+  # Gated live-auth smoke job (PR-083b). Exercises the built CLI against the
+  # real www.apier.no MCP endpoint using a CI-only API key. Gating is split:
+  # the job-level `if:` is the canonical-repo guard; the smoke STEP's `if:`
+  # checks the secret via job-level env (CodeRabbit, Major: `secrets.*` is
+  # unavailable in a job-level `if:` expression, so the secret-present test
+  # must run at step level against env). The key is never `echo`'d — GitHub
+  # auto-masks it in logs — and it is forwarded to the CLI only via the
+  # APIER_API_KEY env var. The CLI scrubs that name from the child env and
+  # hands the bearer value onward in APIER_MCP_AUTH_HEADER, which mcp-remote
+  # expands into its Authorization header; the key never reaches the child's
+  # argv (issue #33).
+  live-auth:
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.repository == 'PowerLaunch/apier-mcp' }}
+    timeout-minutes: 5
+    env:
+      # Bind the secret to job-level env so the step-level `if:` below can
+      # test it. env declared at the SAME step is not yet in scope when that
+      # step's `if:` is evaluated, so the gating env MUST live at job level.
+      APIER_API_KEY_CI: ${{ secrets.APIER_API_KEY_CI }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Build
+        run: npm run build
+      - name: Live MCP smoke test against www.apier.no
+        # Skip cleanly on forks / contributors without access to the secret.
+        # On the canonical repo with the secret bound, env.APIER_API_KEY_CI is
+        # the real value; on forks it is the empty string and this step is
+        # skipped. The earlier steps (checkout/setup-node/install/build) still
+        # run on forks but are inexpensive no-ops without this smoke step.
+        if: ${{ env.APIER_API_KEY_CI != '' }}
+        shell: bash
+        env:
+          # The CLI reads APIER_API_KEY. Reuse the job-env binding instead of
+          # referencing secrets.* twice.
+          APIER_API_KEY: ${{ env.APIER_API_KEY_CI }}
+        run: |
+          set -euo pipefail
+          # mcp-remote treats stdin EOF as "client disconnected" and shuts down
+          # immediately. If we close stdin the instant printf finishes, the
+          # upstream initialize response never lands on stdout — that's exactly
+          # what failed run 26563021894 (proxy connected, forwarded the
+          # request, then shut down before the response could flow back).
+          #
+          # Fix: hold stdin open in a brace-group that polls /tmp/smoke.out for
+          # a JSON-RPC frame; break as soon as one appears. node's stdout is
+          # redirected to /tmp/smoke.out via the `>` on the RIGHT side of the
+          # pipe, so the loop reads a file the node process writes — the pipe
+          # carries stdin INTO node and the redirect carries stdout OUT to a
+          # file; the two flows don't share a buffer, so no deadlock. Outer
+          # `timeout 45` is the hard ceiling; inner poll caps at 30 × 1 s.
+          REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"apier-mcp-ci-smoke","version":"1.0.0"}}}'
+          # Pre-clear so we don't read frames from a previous job's leftover.
+          : > /tmp/smoke.out
+          : > /tmp/smoke.err
+          {
+            printf '%s\n' "$REQ"
+            for i in $(seq 1 30); do
+              # Poll-check mirrors cli.ts's createStdoutValidator: break as soon
+              # as ANY line in /tmp/smoke.out JSON.parses to a JSON-RPC 2.0 frame.
+              # The compact grep '"jsonrpc":"2.0"' missed RFC-8259-legal whitespace
+              # variants ({"jsonrpc": "2.0", ...}) that the CLI accepts, so a
+              # serializer change would have flipped this poll to a false miss
+              # (CodeRabbit, Major).
+              if node -e '
+                const fs=require("fs");
+                let lines=[]; try { lines=fs.readFileSync(process.argv[1],"utf8").split(/\r?\n/).filter(Boolean); } catch {}
+                for (const l of lines) { try { const o=JSON.parse(l); if (o && o.jsonrpc==="2.0") process.exit(0); } catch {} }
+                process.exit(1);
+              ' /tmp/smoke.out; then
+                break
+              fi
+              sleep 1
+            done
+          } | timeout 45 node dist/cli.js --endpoint=https://www.apier.no/api/mcp \
+            > /tmp/smoke.out 2> /tmp/smoke.err || true
+          echo "--- captured stdout ---"; cat /tmp/smoke.out
+          echo "--- captured stderr (redacted by proxy) ---"; cat /tmp/smoke.err
+          # Per-line JSON.parse classifier mirrors cli.ts's createStdoutValidator
+          # semantics exactly. PASS only on a JSON-RPC 2.0 frame with id:1 and a
+          # `result` field; loud FAIL on any -32001 error frame (auth OR idle
+          # timeout); loud FAIL if no initialize result ever lands (covers the
+          # empty-stdout case too). The previous compact-string grep
+          # '"jsonrpc":"2.0"' MISSED RFC-8259-legal whitespace after the colon —
+          # the CLI accepts that variant via JSON.parse and forwards it — so a
+          # serializer change would have flipped the gate to a false failure
+          # (CodeRabbit, Major).
+          node -e '
+            const fs=require("fs");
+            const lines=fs.readFileSync(process.argv[1],"utf8").split(/\r?\n/).filter(Boolean);
+            let sawInit=false, sawErr=false;
+            for (const l of lines) {
+              let o; try { o=JSON.parse(l); } catch { continue; }
+              if (o && o.jsonrpc==="2.0") {
+                if (o.error && o.error.code===-32001) sawErr=true;
+                if (o.id===1 && o.result!==undefined) sawInit=true;
+              }
+            }
+            if (sawErr) { console.error("FAIL: -32001 error frame on stdout (auth or timeout) — see captured output above"); process.exit(1); }
+            if (!sawInit) { console.error("FAIL: no initialize result frame in stdout — see captured output above"); process.exit(1); }
+            console.log("OK — live MCP handshake succeeded (initialize result received from upstream)");
+          ' /tmp/smoke.out

@@ -1,0 +1,321 @@
+name: Regression tests reusable
+
+on:
+  workflow_call:
+    inputs:
+      env-path:
+        required: false
+        type: string
+        default: ""
+      node_rev:
+        required: false
+        type: string
+        default: ""
+      cli_rev:
+        required: false
+        type: string
+        default: ""
+      dbsync_rev:
+        required: false
+        type: string
+        default: ""
+      cluster_era:
+        required: false
+        type: string
+        default: ""
+      markexpr:
+        required: false
+        type: string
+        default: ""
+      utxo_backend:
+        required: false
+        type: string
+        default: ""
+      consensus_mode:
+        required: false
+        type: string
+        default: ""
+      allow_unstable_error_msgs:
+        required: false
+        type: boolean
+        default: false
+      byron_cluster:
+        required: false
+        type: boolean
+        default: false
+      skip_deselect:
+        required: false
+        type: boolean
+        default: false
+      testrun_name:
+        required: false
+        type: string
+        default: ""
+      skip_passed:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      TCACHE_BASIC_AUTH:
+        required: false
+      TCACHE_URL:
+        required: false
+      CI_FAIL_MAILS:
+        required: false
+      GMAIL_USERNAME:
+        required: false
+      GMAIL_PASSWORD:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+
+env:
+  PY_COLORS: "1"
+  NODE_REV: ${{ inputs.node_rev }}
+  CARDANO_CLI_REV: ${{ inputs.cli_rev }}
+  DBSYNC_REV: ${{ inputs.dbsync_rev }}
+  MARKEXPR: ${{ inputs.markexpr }}
+  UTXO_BACKEND: ${{ inputs.utxo_backend }}
+  ALLOW_UNSTABLE_ERROR_MESSAGES: ${{ inputs.allow_unstable_error_msgs }}
+  CI_CLUSTER_ERA: ${{ inputs.cluster_era }}
+  CI_CONSENSUS_MODE: ${{ inputs.consensus_mode }}
+  CI_BYRON_CLUSTER: ${{ inputs.byron_cluster }}
+  CI_TESTRUN_NAME: ${{ inputs.testrun_name }}
+  CI_SKIP_PASSED: ${{ inputs.skip_passed }}
+
+jobs:
+  reusable_run:
+    runs-on: ubuntu-latest
+    # The `secrets` context is not available in step-level `if:` expressions,
+    # so promote secret-presence checks to job-level booleans (allowed here)
+    # and gate the steps on `env.HAS_*` instead.
+    env:
+      HAS_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      HAS_CI_FAIL_MAILS: ${{ secrets.CI_FAIL_MAILS != '' }}
+    steps:
+      - name: Maximize build space
+        uses: ublue-os/remove-unwanted-software@v9
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ= iohk.cachix.org-1:DpRUyj7h7V830dp/i6Nti+NEO2/nhblbov/8MW7Rqoo=
+            substituters = https://cache.nixos.org https://cache.iog.io https://iohk.cachix.org
+            allow-import-from-derivation = true
+      - name: Load extra env from file
+        if: inputs.env-path
+        env:
+          ENV_PATH: ${{ inputs.env-path }}
+        run: |
+          if [ -e "$ENV_PATH" ]; then cat "$ENV_PATH" >> "$GITHUB_ENV"; fi
+      - name: Clear deselect file
+        # Undo a `DESELECT_FROM_FILE` that came from the env file. Runs before
+        # the tcache step below, so `skip_passed` still wins if both are used.
+        if: inputs.skip_deselect
+        run: echo "DESELECT_FROM_FILE=" >> "$GITHUB_ENV"
+      - name: Get previous test results
+        if: inputs.testrun_name && inputs.skip_passed
+        env:
+          TCACHE_BASIC_AUTH: ${{ secrets.TCACHE_BASIC_AUTH }}
+          TCACHE_URL: ${{ secrets.TCACHE_URL }}
+        run: |
+          if [ -n "$TCACHE_BASIC_AUTH" ] && [ -n "$TCACHE_URL" ]; then
+            testrun_name_strip="${CI_TESTRUN_NAME//[!a-zA-Z0-9_-]/}"
+            # The tcache is best effort - on failure the testrun just doesn't skip
+            # any previously passed tests. `-f` so that an HTTP error body is not
+            # handed to pytest-select as a list of test names.
+            if ! curl -sf -u "$TCACHE_BASIC_AUTH" "$TCACHE_URL/${testrun_name_strip}/pypassed" \
+                   > deselected_tests.txt; then
+              # `DESELECT_FROM_FILE` is left alone here, so a value coming from
+              # the env file still applies.
+              echo "::warning::Could not fetch previous test results from the" \
+                   "tcache, not skipping previously passed tests."
+              rm -f deselected_tests.txt
+            elif [ -s deselected_tests.txt ]; then
+              echo "DESELECT_FROM_FILE=deselected_tests.txt" >> "$GITHUB_ENV"
+            else
+              # Expected on the first run of a testrun. The empty file is kept so
+              # that it is still archived with the other artifacts.
+              echo "The tcache reports no previously passed tests."
+            fi
+          fi
+      - name: ▶️ Run Regression Tests
+        id: testing-step
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # env
+          echo "::group::Script setup"
+          runner/regression.sh
+          echo "::endgroup::"
+      - name: Move deselected_tests.txt artifact
+        if: success() || failure()
+        run: |
+          if [ -f deselected_tests.txt ]; then
+            # The testing step can die before it creates run_workdir.
+            mkdir -p run_workdir
+            mv deselected_tests.txt run_workdir/
+          fi
+      - name: Load failure-analysis prompt
+        id: load-analysis-prompt
+        if: (success() || failure()) && steps.testing-step.outcome != 'success' && env.HAS_OAUTH_TOKEN == 'true'
+        run: |
+          {
+            echo 'ANALYSIS_PROMPT<<__EOF_PROMPT42__'
+            sed 's|{RUN_DIR}|run_workdir|g' agent_docs/failure_analysis_prompt.md
+            sed 's|{RUN_DIR}|run_workdir|g' agent_docs/ci_analysis_prompt.md
+            printf '\n__EOF_PROMPT42__\n'
+          } >> "$GITHUB_ENV"
+      - name: 🤖 Analyze test failures with Claude
+        id: analyze-failures
+        if: (success() || failure()) && steps.testing-step.outcome != 'success' && env.HAS_OAUTH_TOKEN == 'true'
+        continue-on-error: true
+        # The action has its own internal timeout, this is insurance against
+        # the action itself hanging - without it a stuck step would run into
+        # the job timeout, and a job timeout is a cancellation that skips the
+        # artifact upload and mail steps.
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-sonnet-5
+          max_turns: "80"
+          allowed_tools: "Read,Write,Glob,Grep,Bash(scripts/count_test_results.py:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(find:*),Bash(cut:*),Bash(sort:*),Bash(uniq:*),Bash(awk:*),Bash(jq:*),Bash(sqlite3:*)"
+          prompt: ${{ env.ANALYSIS_PROMPT }}
+      - name: Read failure analysis into env
+        id: read-analysis
+        # No `env.HAS_OAUTH_TOKEN` condition here - without the token, this step still has to
+        # set the FAILURE_ANALYSIS placeholder that the mail body renders.
+        if: (success() || failure()) && steps.testing-step.outcome != 'success'
+        env:
+          EXECUTION_FILE: ${{ steps.analyze-failures.outputs.execution_file }}
+          ANALYZE_OUTCOME: ${{ steps.analyze-failures.outcome }}
+        run: |
+          if [ "$HAS_OAUTH_TOKEN" != "true" ]; then
+            echo "FAILURE_ANALYSIS=(AI failure analysis not configured - the CLAUDE_CODE_OAUTH_TOKEN secret is not set)" >> "$GITHUB_ENV"
+            echo "::notice::AI failure analysis skipped - the CLAUDE_CODE_OAUTH_TOKEN secret is not set."
+            exit 0
+          fi
+
+          # When the analyze step did not finish cleanly (e.g. ran out of
+          # turns mid-write), the analysis file may be a partial draft - mark
+          # it as such everywhere it is surfaced.
+          partial_note=""
+          if [ "$ANALYZE_OUTCOME" != "success" ]; then
+            partial_note="**Note: the analyze step did not finish cleanly (outcome: ${ANALYZE_OUTCOME}) - the analysis below may be incomplete.**"
+          fi
+
+          if [ -s run_workdir/failure_analysis.md ]; then
+            {
+              echo 'FAILURE_ANALYSIS<<__EOF_ANALYSIS42__'
+              if [ -n "$partial_note" ]; then echo "$partial_note"; echo; fi
+              cat run_workdir/failure_analysis.md
+              # ensure delimiter is on its own line even if the file lacks a trailing newline
+              printf '\n__EOF_ANALYSIS42__\n'
+            } >> "$GITHUB_ENV"
+
+            # Surface the analysis in the workflow run UI itself: full content
+            # in a foldable log group, and a copy in the run summary so it's
+            # reachable without downloading the testrun-files artifact.
+            if [ -n "$partial_note" ]; then
+              echo "::warning::Analyze step outcome: ${ANALYZE_OUTCOME} - failure_analysis.md may be partial."
+              { echo "$partial_note"; echo; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::group::Preliminary failure analysis"
+            cat run_workdir/failure_analysis.md
+            echo
+            echo "::endgroup::"
+            cat run_workdir/failure_analysis.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "FAILURE_ANALYSIS=(no analysis produced; analyze step outcome: ${ANALYZE_OUTCOME})" >> "$GITHUB_ENV"
+            echo "::error::No run_workdir/failure_analysis.md produced by the analyze step (outcome: ${ANALYZE_OUTCOME})."
+          fi
+
+          # Keep the Claude execution log with the testrun files so failed or
+          # incomplete analysis runs can be debugged from the artifact alone.
+          # The testing step can die before it creates run_workdir.
+          if [ -f "${EXECUTION_FILE:-}" ]; then
+            mkdir -p run_workdir
+            cp "$EXECUTION_FILE" run_workdir/claude-execution-output.json
+          else
+            echo "::warning::No Claude execution log available (execution_file: '${EXECUTION_FILE:-}')."
+          fi
+      - name: Report test results
+        if: (success() || failure()) && inputs.testrun_name
+        env:
+          TCACHE_BASIC_AUTH: ${{ secrets.TCACHE_BASIC_AUTH }}
+          TCACHE_URL: ${{ secrets.TCACHE_URL }}
+        run: |
+          if [ -n "$TCACHE_BASIC_AUTH" ] && [ -n "$TCACHE_URL" ] && [ -e run_workdir/testrun-report.xml ]; then
+            testrun_name_strip="${CI_TESTRUN_NAME//[!a-zA-Z0-9_-]/}"
+            curl -s -X PUT --fail-with-body -u "$TCACHE_BASIC_AUTH" "$TCACHE_URL/${testrun_name_strip}/${{ github.run_number }}/import" -F "junitxml=@run_workdir/testrun-report.xml"
+          fi
+      - name: ↟ Upload testing artifacts on failure
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: testing-artifacts
+          path: run_workdir/testing_artifacts.tar.xz
+          compression-level: 0
+      - name: ↟ Upload Allure results
+        uses: actions/upload-artifact@v7
+        # When using `always()`, you lose ability to manually cancel the workflow.
+        # Use `success() || failure()` instead.
+        if: success() || failure()
+        with:
+          name: allure-results
+          path: run_workdir/allure-results.tar.xz
+          compression-level: 0
+      - name: ↟ Upload HTML report
+        uses: actions/upload-artifact@v7
+        if: success() || failure()
+        with:
+          name: testrun-report
+          path: run_workdir/testrun-report.html
+      - name: ↟ Upload testrun files
+        uses: actions/upload-artifact@v7
+        if: success() || failure()
+        with:
+          name: testrun-files
+          path: |
+            run_workdir/scheduling.log
+            run_workdir/errors_all.log
+            run_workdir/testrun-report.xml
+            run_workdir/deselected_tests.txt
+            run_workdir/requirements_coverage.json
+            run_workdir/monitor.log
+            run_workdir/failure_analysis.md
+            run_workdir/claude-execution-output.json
+      - name: ↟ Upload CLI coverage
+        uses: actions/upload-artifact@v7
+        if: success() || failure()
+        with:
+          name: cli-coverage
+          path: run_workdir/cli_coverage.json
+      - name: ✉ Mail failure report
+        uses: dawidd6/action-send-mail@v21
+        if: (success() || failure()) && steps.testing-step.outcome != 'success' && env.HAS_CI_FAIL_MAILS == 'true' && github.event_name == 'schedule'
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{secrets.GMAIL_USERNAME}}
+          password: ${{secrets.GMAIL_PASSWORD}}
+          subject: "Status: ${{ steps.testing-step.outcome }}; workflow: ${{ github.workflow }}"
+          to: ${{secrets.CI_FAIL_MAILS}}
+          from: 'Cardano GitHub Actions <${{secrets.GMAIL_USERNAME}}>'
+          convert_markdown: true
+          body: &mail_body |
+            Run URL: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}>
+
+            ────
+
+            ${{ env.FAILURE_ANALYSIS }}
+          html_body: *mail_body
+          reply_to: noreply@github.com
+          attachments: run_workdir/testrun-report.html

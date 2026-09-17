@@ -1,0 +1,30 @@
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  prompt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: astral-sh/setup-uv@v6
+      - name: Run Claude Code
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          prompt: "What are the tides in two days time in Fowey?"
+          claude_env: |
+            DEBUG: true
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allowed_tools: "mcp__uktides__get_tidal_times"
+          mcp_config: |
+            {
+              "mcpServers": {
+                "uktides": {
+                  "type": "stdio",
+                  "command": "uvx",
+                  "args": ["uk-tides-mcp"],
+                  "env": {
+                    "UKHO_API_KEY": "${{ secrets.UKHO_API_KEY }}"
+                  }
+                }
+              }
+            }

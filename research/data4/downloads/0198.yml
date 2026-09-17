@@ -1,0 +1,48 @@
+name: release
+
+# Builds the .mcpb bundle and attaches it to a GitHub Release.
+# Tag a commit (e.g. `git tag v0.1.0 && git push --tags`) to cut a release,
+# or run manually from the Actions tab to produce a downloadable artifact.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      # Production deps only: mcp-remote and its transitive deps are shipped in
+      # the bundle; the mcpb packer is run via npx and not bundled.
+      - run: npm ci --omit=dev
+
+      - name: Validate manifest
+        run: npx --yes @anthropic-ai/mcpb@2.1.2 validate manifest.json
+
+      - name: Pack .mcpb
+        run: |
+          mkdir -p dist
+          npx --yes @anthropic-ai/mcpb@2.1.2 pack . dist/polytomic-connector.mcpb
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: polytomic-connector-mcpb
+          path: dist/polytomic-connector.mcpb
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/polytomic-connector.mcpb

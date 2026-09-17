@@ -1,0 +1,56 @@
+name: Auditor Core — Cartera Largo Plazo
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Run Core Auditor
+        env:
+          FMP_API_KEY:        ${{ secrets.FMP_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python core_auditor.py
+
+      - name: Watchdog — verificar que el módulo corrió
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ ! -f core_health.json ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d text="WATCHDOG: el auditor core NO genero health.json. El script fallo por completo. Revisa GitHub Actions." || true
+          fi
+
+      - name: Commit resultados
+        if: always()
+        run: |
+          git config user.name  "Core Auditor Bot"
+          git config user.email "bot@geomacro.local"
+          git add core_audit.json core_health.json radar_watchlist.json core_thesis_state.json || true
+          git diff --staged --quiet || git commit -m "auditor core $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git pull --no-rebase --strategy-option=ours origin main || true
+          git push || true
+- name: Claude Code Base Action
+  uses: anthropics/claude-code-base-action@beta

@@ -1,0 +1,410 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  REPO: ${{ github.repository }}
+  SHA_TAG: sha-${{ github.sha }}
+
+jobs:
+  test-mcp:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build shared package
+        run: pnpm --filter @loomknot/shared build
+      - name: Test MCP transport
+        run: pnpm --filter @loomknot/mcp test
+      - name: Type-check MCP server
+        run: pnpm --filter @loomknot/mcp type-check
+      - name: Build MCP server
+        run: pnpm --filter @loomknot/mcp build
+      - name: Test one mcp-remote process across an MCP restart
+        run: pnpm --filter @loomknot/mcp smoke:desktop
+
+  # --- Build all images in parallel ---
+  build-web:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO }}/web:latest
+            ${{ env.REGISTRY }}/${{ env.REPO }}/web:${{ env.SHA_TAG }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
+
+  build-api:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO }}/api:latest
+            ${{ env.REGISTRY }}/${{ env.REPO }}/api:${{ env.SHA_TAG }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+  build-mcp:
+    needs: test-mcp
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/mcp/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO }}/mcp:latest
+            ${{ env.REGISTRY }}/${{ env.REPO }}/mcp:${{ env.SHA_TAG }}
+          cache-from: type=gha,scope=mcp
+          cache-to: type=gha,scope=mcp,mode=max
+
+  build-migrate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.migrate
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO }}/migrate:latest
+            ${{ env.REGISTRY }}/${{ env.REPO }}/migrate:${{ env.SHA_TAG }}
+          cache-from: type=gha,scope=migrate
+          cache-to: type=gha,scope=migrate,mode=max
+
+  # --- Deploy after all builds succeed ---
+  deploy:
+    needs: [build-web, build-api, build-mcp, build-migrate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Copy swarm compose BEFORE deploying
+      - name: Copy swarm compose to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: "docker-compose.swarm.yml"
+          target: "/opt/apps/loomknot/"
+
+      - name: Copy logging configuration to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: "deploy/logging/*"
+          target: "/opt/logging/"
+          strip_components: 2
+
+      - name: Copy Loki route to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: "deploy/traefik/dynamic/loki.yml"
+          target: "/opt/traefik/dynamic/"
+          strip_components: 3
+
+      - name: Copy Traefik stack configuration to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: "deploy/traefik/docker-compose.yml"
+          target: "/opt/traefik/"
+          strip_components: 2
+
+      # 2. Pull images, run migrations, deploy with warmup
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1
+        env:
+          SHA_TAG: ${{ env.SHA_TAG }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          envs: SHA_TAG,GHCR_TOKEN,GHCR_USER
+          command_timeout: 10m
+          script: |
+            set -e
+            APP_DIR=/opt/apps/loomknot
+            REGISTRY=${{ env.REGISTRY }}
+            REPO=${{ env.REPO }}
+            DOMAIN=${{ secrets.DOMAIN }}
+
+            echo "=== Updating logging infrastructure ==="
+            test -s /opt/logging/loki-users.htpasswd
+            install -d -o 10001 -g 10001 -m 0750 /var/lib/loomknot-loki
+            docker compose -f /opt/logging/docker-compose.yml up -d
+            docker stack deploy -c /opt/traefik/docker-compose.yml traefik
+
+            echo "=== GHCR Login ==="
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+
+            echo "=== Pulling images (${SHA_TAG}) ==="
+            docker pull ${REGISTRY}/${REPO}/web:${SHA_TAG}
+            docker pull ${REGISTRY}/${REPO}/api:${SHA_TAG}
+            docker pull ${REGISTRY}/${REPO}/mcp:${SHA_TAG}
+            docker pull ${REGISTRY}/${REPO}/migrate:${SHA_TAG}
+
+            echo "=== Running migrations ==="
+            # Automatic smoke rollback does not reverse schema changes or roll back the API.
+            # Migrations must remain compatible with both the previous and new service images.
+            docker run --rm \
+              --network loomknot-internal \
+              --env-file ${APP_DIR}/.env.backend \
+              ${REGISTRY}/${REPO}/migrate:${SHA_TAG}
+
+            echo "=== Deploying Swarm stack (rolling update, start-first) ==="
+            GITHUB_REPO=${{ github.repository }} \
+            DOMAIN=${DOMAIN} \
+            IMAGE_TAG=${SHA_TAG} \
+            docker stack deploy \
+              --resolve-image always \
+              --with-registry-auth \
+              -c ${APP_DIR}/docker-compose.swarm.yml \
+              loomknot
+
+            echo "=== Waiting for services to converge ==="
+            # Wait for each service to complete rolling update
+            for SVC in loomknot_web loomknot_api loomknot_mcp; do
+              echo "Waiting for ${SVC}..."
+              ATTEMPTS=0
+              MAX_ATTEMPTS=40  # 40 × 5s = 200s max
+              while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+                # Check if all replicas are running and up to date
+                REPLICAS=$(docker service ls --filter "name=${SVC}" --format "{{.Replicas}}" 2>/dev/null || echo "")
+                if [ -n "$REPLICAS" ]; then
+                  CURRENT=$(echo "$REPLICAS" | cut -d'/' -f1)
+                  DESIRED=$(echo "$REPLICAS" | cut -d'/' -f2)
+                  if [ "$CURRENT" = "$DESIRED" ] && [ "$DESIRED" != "0" ]; then
+                    # Verify no tasks are in pending/preparing/starting state
+                    UPDATING=$(docker service ps "${SVC}" --filter "desired-state=running" --format "{{.CurrentState}}" 2>/dev/null | grep -c -E "^(Pending|Preparing|Starting)" || true)
+                    if [ "$UPDATING" = "0" ]; then
+                      echo "${SVC}: ${CURRENT}/${DESIRED} replicas running ✓"
+                      break
+                    fi
+                  fi
+                fi
+                ATTEMPTS=$((ATTEMPTS + 1))
+                sleep 5
+              done
+              if [ $ATTEMPTS -eq $MAX_ATTEMPTS ]; then
+                echo "WARNING: ${SVC} did not converge in time"
+                docker service ps "${SVC}" --no-trunc
+              fi
+            done
+
+            echo "=== Health check warmup (waiting for Traefik to route) ==="
+            # Give Traefik a moment to pick up new containers
+            sleep 5
+
+            # Health checks with retries
+            check_health() {
+              local URL=$1
+              local NAME=$2
+              local ATTEMPTS=0
+              local MAX=12  # 12 × 5s = 60s
+              while [ $ATTEMPTS -lt $MAX ]; do
+                if curl -sf --max-time 5 "$URL" > /dev/null 2>&1; then
+                  echo "${NAME}: healthy ✓"
+                  return 0
+                fi
+                ATTEMPTS=$((ATTEMPTS + 1))
+                sleep 5
+              done
+              echo "ERROR: ${NAME} health check failed after 60s"
+              return 1
+            }
+
+            HEALTH_OK=true
+            check_health "https://${DOMAIN}/api/v1/health" "API" || HEALTH_OK=false
+            check_health "https://${DOMAIN}/api/health" "Web" || HEALTH_OK=false
+            check_health "https://${DOMAIN}/mcp/health" "MCP" || HEALTH_OK=false
+
+            if [ "$HEALTH_OK" = "false" ]; then
+              echo "=== Some health checks failed. Service status: ==="
+              docker stack services loomknot
+              docker service ps loomknot_web --no-trunc 2>/dev/null | head -10
+              docker service ps loomknot_api --no-trunc 2>/dev/null | head -10
+              docker service ps loomknot_mcp --no-trunc 2>/dev/null | head -10
+              exit 1
+            fi
+
+            echo "=== Deploy complete (${SHA_TAG}) ==="
+            docker stack services loomknot
+
+      - name: Smoke test deployed MCP transport and lk_bootstrap
+        id: mcp-smoke
+        continue-on-error: true
+        env:
+          MCP_SMOKE_URL: https://${{ secrets.DOMAIN }}/mcp
+          MCP_SMOKE_API_KEY: ${{ secrets.MCP_SMOKE_API_KEY }}
+          MCP_SMOKE_TIMEOUT_MS: "10000"
+        run: node apps/mcp/scripts/smoke.mjs
+
+      - name: Observe lk_bootstrap completion in Loki
+        if: steps.mcp-smoke.outcome == 'success'
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          command_timeout: 2m
+          script: |
+            if [ ! -s /opt/logging/loki-basic-auth.credentials ]; then
+              echo "WARNING: Loki credentials are unavailable; skipping post-deploy log evidence check"
+              exit 0
+            fi
+            LOKI_ADDR=$(cat /opt/logging/loki-basic-auth.credentials)
+            if ! curl -fsS --max-time 5 "${LOKI_ADDR}/ready" > /dev/null; then
+              echo "WARNING: Loki is unavailable; functional MCP smoke passed, so deployment remains healthy"
+              exit 0
+            fi
+            QUERY='{app="loomknot", service="mcp"} | json | event="mcp_tool_completed" | toolName="lk_bootstrap"'
+            ATTEMPTS=0
+            while [ $ATTEMPTS -lt 6 ]; do
+              RESPONSE=$(curl -fsSG "${LOKI_ADDR}/loki/api/v1/query_range" \
+                --data-urlencode "query=${QUERY}" \
+                --data-urlencode "since=10m" \
+                --data-urlencode "limit=20" \
+                --data-urlencode "direction=backward" 2>/dev/null || true)
+              if echo "$RESPONSE" | grep -Fq '"result":[{'; then
+                echo "Loki contains mcp_tool_completed for lk_bootstrap ✓"
+                exit 0
+              fi
+              ATTEMPTS=$((ATTEMPTS + 1))
+              sleep 5
+            done
+            echo "WARNING: Loki did not expose lk_bootstrap evidence within 30s; investigate log delivery separately"
+
+      - name: Roll back MCP and web after smoke failure
+        if: always() && steps.mcp-smoke.outcome == 'failure'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          command_timeout: 8m
+          script: |
+            set -e
+            DOMAIN=${{ secrets.DOMAIN }}
+
+            echo "=== MCP smoke failed; capturing diagnostics ==="
+            docker service logs loomknot_mcp --since 10m --tail 200 2>&1 || true
+            docker service ps loomknot_mcp --no-trunc || true
+            docker service ps loomknot_web --no-trunc || true
+
+            echo "=== Rolling back MCP and web together ==="
+            echo "Database schema and API are not rolled back; migrations must be backward-compatible."
+            docker service rollback loomknot_mcp
+            docker service rollback loomknot_web
+
+            wait_for_service() {
+              local SERVICE=$1
+              local ATTEMPTS=0
+              while [ $ATTEMPTS -lt 60 ]; do
+                REPLICAS=$(docker service ls --filter "name=${SERVICE}" --format "{{.Replicas}}")
+                CURRENT=$(echo "$REPLICAS" | cut -d'/' -f1)
+                DESIRED=$(echo "$REPLICAS" | cut -d'/' -f2)
+                UPDATING=$(docker service ps "$SERVICE" --filter "desired-state=running" --format "{{.CurrentState}}" | grep -c -E "^(Pending|Preparing|Starting)" || true)
+                if [ -n "$DESIRED" ] && [ "$DESIRED" != "0" ] && [ "$CURRENT" = "$DESIRED" ] && [ "$UPDATING" = "0" ]; then
+                  echo "${SERVICE}: rollback converged (${CURRENT}/${DESIRED}) ✓"
+                  return 0
+                fi
+                ATTEMPTS=$((ATTEMPTS + 1))
+                sleep 5
+              done
+              echo "ERROR: ${SERVICE} rollback did not converge"
+              docker service ps "$SERVICE" --no-trunc || true
+              return 1
+            }
+
+            wait_for_service loomknot_mcp
+            wait_for_service loomknot_web
+            curl -fsS --retry 12 --retry-delay 5 --max-time 10 "https://${DOMAIN}/api/v1/health" > /dev/null
+            curl -fsS --retry 12 --retry-delay 5 --max-time 10 "https://${DOMAIN}/api/health" > /dev/null
+            curl -fsS --retry 12 --retry-delay 5 --max-time 10 "https://${DOMAIN}/mcp/health" > /dev/null
+            docker stack services loomknot
+
+      - name: Fail deployment after smoke rollback
+        if: always() && steps.mcp-smoke.outcome == 'failure'
+        run: |
+          echo "MCP smoke failed. MCP and web rollback was requested; see the rollback step for convergence and health diagnostics."
+          exit 1

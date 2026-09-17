@@ -1,0 +1,153 @@
+name: Live harness matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      harness:
+        description: Supported harness to run
+        required: true
+        type: choice
+        options:
+          - all
+          - claude
+          - codex
+          - opencode
+          - antigravity
+          - hermes
+          - qwen
+          - cursor-agent
+          - pi
+        default: all
+      os_lane:
+        description: OS/provider lane
+        required: true
+        type: choice
+        options:
+          - all
+          - macos-agent-user
+          - linux-current-user
+          - linux-agent-user
+        default: all
+      provider:
+        description: Direct provider token to use
+        required: true
+        type: choice
+        options:
+          - auto
+          - anthropic
+          - openai
+          - antigravity
+          - gemini
+          - openrouter
+        default: auto
+  schedule:
+    - cron: "17 8 * * *"
+
+concurrency:
+  group: live-harness-matrix-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION_FILE: hazmat/go.mod
+  GO_CACHE_DEP: hazmat/go.sum
+
+jobs:
+  live-harness-matrix:
+    name: ${{ matrix.label }} live harness evidence
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os_lane: macos-agent-user
+            label: macOS agent-user
+            runs_on: '["self-hosted", "macOS", "ARM64", "hazmat-live"]'
+            live: true
+            distro: ""
+            artifact_suffix: native
+          - os_lane: linux-current-user
+            label: Linux current-user
+            runs_on: '["ubuntu-latest"]'
+            live: false
+            distro: ubuntu
+            artifact_suffix: ubuntu
+          - os_lane: linux-agent-user
+            label: Linux agent-user
+            runs_on: '["ubuntu-latest"]'
+            live: false
+            distro: ubuntu
+            artifact_suffix: ubuntu
+    env:
+      HAZMAT_LIVE_PROVIDER_ANTHROPIC_API_KEY: ${{ secrets.HAZMAT_LIVE_PROVIDER_ANTHROPIC_API_KEY }}
+      HAZMAT_LIVE_PROVIDER_OPENAI_API_KEY: ${{ secrets.HAZMAT_LIVE_PROVIDER_OPENAI_API_KEY }}
+      HAZMAT_LIVE_PROVIDER_ANTIGRAVITY_API_KEY: ${{ secrets.HAZMAT_LIVE_PROVIDER_ANTIGRAVITY_API_KEY }}
+      HAZMAT_LIVE_PROVIDER_GEMINI_API_KEY: ${{ secrets.HAZMAT_LIVE_PROVIDER_GEMINI_API_KEY }}
+      HAZMAT_LIVE_PROVIDER_OPENROUTER_API_KEY: ${{ secrets.HAZMAT_LIVE_PROVIDER_OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.os_lane == 'all' || github.event.inputs.os_lane == matrix.os_lane }}
+
+      - uses: actions/setup-go@v5
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.os_lane == 'all' || github.event.inputs.os_lane == matrix.os_lane }}
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache-dependency-path: ${{ env.GO_CACHE_DEP }}
+
+      - name: Validate live harness contract
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.os_lane == 'all' || github.event.inputs.os_lane == matrix.os_lane }}
+        run: bash scripts/check-live-harness-matrix.sh --validate-contract
+
+      - name: Build Hazmat
+        if: ${{ matrix.live && (github.event_name == 'schedule' || github.event.inputs.os_lane == 'all' || github.event.inputs.os_lane == matrix.os_lane) }}
+        working-directory: hazmat
+        run: make all
+
+      - name: Add checkout binary to PATH
+        if: ${{ matrix.live && (github.event_name == 'schedule' || github.event.inputs.os_lane == 'all' || github.event.inputs.os_lane == matrix.os_lane) }}
+        run: echo "$PWD/hazmat" >> "$GITHUB_PATH"
+
+      - name: Run live harness matrix
+        if: ${{ matrix.live && (github.event_name == 'schedule' || github.event.inputs.os_lane == 'all' || github.event.inputs.os_lane == matrix.os_lane) }}
+        env:
+          SELECTED_HARNESS: ${{ github.event.inputs.harness || 'all' }}
+          SELECTED_PROVIDER: ${{ github.event.inputs.provider || 'auto' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$PWD/live-harness-artifacts"
+          bash scripts/check-live-harness-matrix.sh \
+            --run \
+            --i-understand-this-runs-live-harness-matrix \
+            --harness "$SELECTED_HARNESS" \
+            --provider "$SELECTED_PROVIDER" \
+            --os-lane "${{ matrix.os_lane }}" \
+            --distro "${{ matrix.distro }}" \
+            --output-dir "$PWD/live-harness-artifacts"
+
+      - name: Emit typed skip evidence
+        if: ${{ !matrix.live && (github.event_name == 'schedule' || github.event.inputs.os_lane == 'all' || github.event.inputs.os_lane == matrix.os_lane) }}
+        env:
+          SELECTED_HARNESS: ${{ github.event.inputs.harness || 'all' }}
+          SELECTED_PROVIDER: ${{ github.event.inputs.provider || 'auto' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$PWD/live-harness-artifacts"
+          bash scripts/check-live-harness-matrix.sh \
+            --emit-skip-evidence \
+            --harness "$SELECTED_HARNESS" \
+            --provider "$SELECTED_PROVIDER" \
+            --os-lane "${{ matrix.os_lane }}" \
+            --distro "${{ matrix.distro }}" \
+            --output-dir "$PWD/live-harness-artifacts"
+
+      - name: Upload live harness evidence
+        if: ${{ always() && (github.event_name == 'schedule' || github.event.inputs.os_lane == 'all' || github.event.inputs.os_lane == matrix.os_lane) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-harness-${{ matrix.os_lane }}-${{ matrix.artifact_suffix }}
+          path: live-harness-artifacts
+          if-no-files-found: warn
+          retention-days: 30

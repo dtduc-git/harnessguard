@@ -1,0 +1,47 @@
+name: Update Market Newsletter
+
+on:
+  schedule:
+    - cron: '0 22 * * *'   # 매일 UTC 22:00 = 한국시간(KST) 07:00
+  workflow_dispatch:        # Actions 탭에서 수동 실행 버튼도 생김
+
+jobs:
+  update-newsletter:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Run Claude Code to research & rewrite newsletter.html
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            newsletter.html은 미국·유럽 전일 경제/금융 뉴스를 정리한 한국어 뉴스레터야.
+
+            전일(미국 동부시간 기준 정규장 마감 및 유럽 장 마감 이후 ~ 오늘 한국시간
+            새벽까지) 미국·유럽 주요 경제/금융 뉴스를 웹서치로 새로 조사해서
+            newsletter.html의 내용을 최신 데이터로 갱신해줘.
+
+            섹션 구성(오늘의 한줄 요약 → 간단 시황 브리핑 → 주요 경제지표 발표 →
+            주요 경제 뉴스 → 한국시간 기준 오늘의 주요 일정 → 주요 기업 실적발표)과
+            CSS/디자인은 그대로 유지하고, 각 섹션의 텍스트·숫자만 새로 조사한 내용으로
+            교체해줘. 출처가 불분명한 수치는 쓰지 말고 확인된 정보만 사용해줘.
+          allowed_tools: "Read,Write,Edit,WebSearch,WebFetch"
+          max_turns: "60"
+
+      - name: Commit and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add newsletter.html
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update newsletter $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git pull --rebase origin main
+            git push origin main
+          fi

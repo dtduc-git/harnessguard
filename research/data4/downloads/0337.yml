@@ -1,0 +1,44 @@
+name: Design doc pipeline
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+    paths: ["docs/designs/**.md"]
+
+jobs:
+  docgen:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Claude Code to generate test spec & release procedure
+        uses: anthropics/claude-code-base-action@beta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          prompt: |
+            マージされた設計ドキュメントを ${{ github.event.pull_request.title }} から特定し、
+            test-spec-writer と release-procedure-writer の両skillを実行してください。
+            完了したら新しいブランチを切ってコミットし、PRを作成してください。
+          model: claude-sonnet-5
+          allowed_tools: "Bash(git:*),Bash(gh pr create:*),Read,Write,Edit"
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+  # Devinは未契約なのでスタブ。契約したらcurl部分のコメントを外すだけで有効化できる。
+  devin-stub:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: (Dry run) show what would be sent to Devin
+        run: |
+          echo "-- Devin未契約のためドライラン --"
+          echo "target_repo と implementation_prompt をここでfrontmatterから抽出予定"
+          # curl -s -X POST "https://api.devin.ai/v3/organizations/$DEVIN_ORG_ID/sessions" \
+          #   -H "Authorization: Bearer $DEVIN_API_KEY" \
+          #   -H "Content-Type: application/json" \
+          #   -d "{\"prompt\": \"...\"}"

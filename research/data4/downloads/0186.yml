@@ -1,0 +1,912 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI — validation gate for pull requests.
+#
+# This is where tests run, on PRs targeting main. It runs on `pull_request`
+# only (not `push`) so a PR branch is validated exactly once per commit instead
+# of twice (a push event + a pull_request event both firing). `main` is handled
+# by deploy.yml, which trusts these required checks and does NOT re-run the suite.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+# One run per PR; a newer push cancels the in-flight run to save minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # ── Detect what changed ──────────────────────────────────────────────────────
+  #    `code`   — any non-docs file touched → gates the `check` job.
+  #    `api`    — API/backend paths → gates the (expensive) `integration` job.
+  #    `plugin` — Claude-plugin paths → gates the `plugin` smoke job.
+  #    `web`    — dashboard paths (broad) → gates the `web-test` Storybook job.
+  #    `web_preview` — the narrower, Vercel-quota-metered subset → gates
+  #               `web-preview`. Two filters, not one, because the test job is
+  #               free CI compute and the preview is a metered deployment.
+  #    `deploy` — the deploy pipeline + its scope resolver → gates `deploy-scope`.
+  #
+  #    A skipped required check is treated as passing by branch protection, so
+  #    docs- or web-only PRs sail through without booting any toolchain.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      api: ${{ steps.filter.outputs.api }}
+      plugin: ${{ steps.filter.outputs.plugin }}
+      web: ${{ steps.filter.outputs.web }}
+      web_preview: ${{ steps.filter.outputs.web_preview }}
+      preview_filter: ${{ steps.filter.outputs.preview_filter }}
+      migrations: ${{ steps.filter.outputs.migrations }}
+      bench: ${{ steps.filter.outputs.bench }}
+      deploy: ${{ steps.filter.outputs.deploy }}
+      seed: ${{ steps.filter.outputs.seed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Compare changed paths against the API globs
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE="$PR_BASE"
+          else
+            BASE="$BEFORE"
+          fi
+          # Fall back to the parent commit for first pushes / missing base SHAs.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          echo "Comparing ${BASE}...HEAD"
+          CHANGED="$(git diff --name-only "${BASE}" HEAD)"
+          echo "$CHANGED"
+          # Any non-docs source file → run typecheck/test/lint.
+          # Docs-only changes (*.md, *.mdx, docs/, assets/) are excluded so a
+          # README-only PR does not spin up the full toolchain.
+          if printf '%s\n' "$CHANGED" | grep -qvE '^(|.*\.mdx?|docs/|assets/|\.github/CODEOWNERS|LICENSE)$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$CHANGED" | grep -qE '^(packages/mcp-core/|packages/smoke-tests/|supabase/functions/|supabase/migrations/|supabase/tests/|supabase/config\.toml|package\.json|pnpm-lock\.yaml|scripts/smoke/smoke-mcp-stdio\.mjs|scripts/ci/deno-check-functions|\.github/workflows/ci\.yml)'; then
+            echo "api=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "api=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Plugin smoke gate: the Claude marketplace bundle, its vendored skill
+          # source, the hook engine it shells out to, and the sync/smoke scripts.
+          if printf '%s\n' "$CHANGED" | grep -qE '^(plugins/|\.claude-plugin/|packages/cli/skill/|packages/cli/src/|packages/cli/bin/|scripts/codegen/sync-plugin-skill\.mjs|scripts/smoke/smoke-plugin\.sh|\.github/workflows/ci\.yml)'; then
+            echo "plugin=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "plugin=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Web TEST gate: the Next.js dashboard, the workspace packages it
+          # compiles in, plus the workspace files that change how it installs or
+          # is configured. Drives the Storybook interaction + visual-regression
+          # job so it never boots a browser on unrelated PRs.
+          #
+          # `packages/schemas/` belongs here because packages/web declares
+          # `@lorekit/schemas` as a `workspace:*` dependency and imports it
+          # throughout src/ — a schemas-only change alters the built dashboard,
+          # so omitting it silently skipped the visual tests.
+          #
+          # Deliberately BROADER than the `web_preview` gate below: this job is
+          # free CI compute, so it should be jumpy — `pnpm-lock.yaml` moves the
+          # rendered output whenever a dep bump reaches the dashboard, and that
+          # is precisely what the visual baselines are for. `ci.yml` is here for
+          # the same reason as in every sibling gate: so an edit to this job runs
+          # the job.
+          if printf '%s\n' "$CHANGED" | grep -qE '^(packages/web/|packages/schemas/|package\.json$|pnpm-lock\.yaml$|nx\.json$|\.github/workflows/ci\.yml$)'; then
+            echo "web=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "web=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Web PREVIEW gate: a Vercel deployment, metered against a per-day
+          # quota, so this asks the narrower question — can this change alter
+          # what the deployed dashboard looks like, or how it gets deployed?
+          #
+          # COPY of scripts/ci/web-preview-filter.mjs (the canonical definition,
+          # which documents why `ci.yml` and `pnpm-lock.yaml` are NOT on it) and
+          # of web-preview-deploy.yml's `web-path-filter` default. This job stays
+          # dependency-free like its siblings, so the string is duplicated and
+          # held in place by scripts/ci/web-preview-filter.test.mjs — which fails
+          # when any of the three drifts.
+          if printf '%s\n' "$CHANGED" | grep -qE '^(packages/web/|packages/schemas/|package\.json$|nx\.json$|scripts/ci/web-preview-comment\.mjs$|\.github/actions/vercel-preview-deploy/|\.github/workflows/(web-preview|web-preview-deploy)\.yml$)'; then
+            echo "web_preview=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "web_preview=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Preview-filter gate: the canonical filter module, its test, and the
+          # two workflows that carry a copy of the ERE — the test asserts all
+          # three agree, so it must run when ANY of them moves.
+          # `scripts/ci/web-preview-filter` (no extension) matches both the module
+          # and its `.test.mjs`, same trick as the migration guards above.
+          # `scripts/ci/web-preview-comment` rides along: it is the OTHER
+          # preview-machinery module unit-tested by this job, and its test reads
+          # web-preview-deploy.yml (already on this filter) to prove the workflow
+          # still renders the comment through it.
+          # `scripts/ci/vercel-deploy-shell` likewise, plus the composite action
+          # it reads: that guard asserts the deploy step's `shell:` still opts
+          # out of `-e`, so it must run when EITHER half moves.
+          if printf '%s\n' "$CHANGED" | grep -qE '^(scripts/ci/(web-preview-(filter|comment)|vercel-deploy-shell)|\.github/(actions/vercel-preview-deploy/|workflows/(ci|web-preview-deploy)\.yml$))'; then
+            echo "preview_filter=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "preview_filter=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Migration-order gate: run when a migration is added/changed, or when
+          # the guard/CI itself changes (so the guard is exercised on its own PR).
+          # `scripts/migrations/check-migration-order` (no extension) matches BOTH the guard
+          # and its `.test.mjs` — so a test-only edit still triggers this job.
+          # `scripts/migrations/check-remote-migration-drift` (no extension) likewise matches
+          # the deploy-time drift classifier and its `.test.mjs`, unit-tested by
+          # this same job.
+          if printf '%s\n' "$CHANGED" | grep -qE '^(supabase/migrations/|scripts/migrations/check-migration-order|scripts/migrations/check-remote-migration-drift|\.github/workflows/ci\.yml)'; then
+            echo "migrations=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "migrations=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Deploy-scope gate: the resolver that decides which halves deploy.yml
+          # promotes to production, its test, and the two workflows that consume
+          # it. `scripts/**` is outside `nx affected`, so the `check` job never
+          # runs this test — without this job the decision that gates production
+          # would ship unexercised.
+          if printf '%s\n' "$CHANGED" | grep -qE '^(\.github/workflows/deploy\.yml|scripts/ci/resolve-deploy-scope(\.test)?\.mjs|\.github/workflows/ci\.yml)'; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Preview-seed gate: the pure dataset/SQL builders `/preview --seed`
+          # runs against the shared preview project. `scripts/**` is outside
+          # `nx affected`, so without this job a change here would ship with
+          # its own tests never having run.
+          if printf '%s\n' "$CHANGED" | grep -qE '^(scripts/seed/|\.github/workflows/(preview|rebuild-preview|ci)\.yml)'; then
+            echo "seed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "seed=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Benchmark gate: the row-scaling sweep and the load test, and the
+          # pure modules their unit tests protect. Its own filter — naming its
+          # own scripts, the way `deploy` above names resolve-deploy-scope —
+          # because these tests previously rode along in `migration-order`,
+          # whose filter is migrations-only. A PR touching just
+          # `scripts/telemetry/sweep-telemetry.mjs` therefore did not re-run the tests
+          # that guard it, and the coverage was silently decorative.
+          #
+          # `load-test-cleanup` earns its place here loudly: its guards decide
+          # which USER ACCOUNTS a sweep deletes from a live project, so a change
+          # to it that skips its tests is a change that can destroy real data.
+          if printf '%s\n' "$CHANGED" | grep -qE '^(scripts/migrations/sweep-rows(\.test)?\.mjs|scripts/telemetry/sweep-telemetry(\.test)?\.mjs|scripts/load-test/load-test(\.test)?\.mjs|scripts/load-test/load-test-lib(\.test)?\.mjs|scripts/telemetry/load-telemetry(\.test)?\.mjs|scripts/load-test/load-test-cleanup(\.test)?\.mjs|scripts/telemetry/otlp-export(\.test)?\.mjs|supabase/tests/row-scaling-sweep\.sql|\.github/workflows/(ci|load-test)\.yml)'; then
+            echo "bench=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bench=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Typecheck + Test + Lint (only affected packages) ─────────────────────────
+  #    Skipped entirely on docs-only PRs (no source code changed). When it does
+  #    run, `nx affected` further scopes work to the packages actually touched.
+  check:
+    name: Typecheck, Test & Lint (affected)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0 # NX affected needs history to diff against the base
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          # 22, not 20: `@lorekit/evals` imports `@lorekit/core`'s TypeScript
+          # source directly and relies on Node's native type stripping (stable
+          # since 22.18, which is the package's declared `engines` floor). On
+          # Node 20 `evals:test` dies with ERR_UNKNOWN_FILE_EXTENSION.
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `--output-style=stream` is deliberate: NX's default CI renderer wraps
+      # each task's output in a GitHub Actions log group (`::group::`), which the
+      # web UI COLLAPSES by default — so a failing task's errors/warnings are
+      # hidden inside a collapsed block and invisible to a human or agent scanning
+      # the run. `stream` pipes every task's stdout/stderr flat and inline
+      # (task-name-prefixed), so all errors and warnings are always visible.
+      - name: NX — typecheck, test, lint (affected)
+        run: pnpm nx affected -t typecheck,test,lint --parallel=3 --output-style=stream
+        env:
+          NX_BASE: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}
+          NX_HEAD: ${{ github.sha }}
+
+  # ── Plugin smoke — the Claude marketplace plugin installs + enables ──────────
+  #    Runs the real `claude` CLI install flow end-to-end (validate → marketplace
+  #    add → install → assert enabled → hook engine smoke) via
+  #    scripts/smoke/smoke-plugin.sh. Gated on plugin-relevant paths so unrelated PRs
+  #    skip it; a skipped required check is treated as passing by branch
+  #    protection. The frameworks unit test only *validates* the manifest (and
+  #    skips when the CLI is absent) — this job proves an actual install works.
+  plugin:
+    name: Plugin smoke (install + enable)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.plugin == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Install the Claude CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Plugin install smoke
+        run: bash scripts/smoke/smoke-plugin.sh
+
+  # ── Web — Storybook interaction + visual-regression tests ────────────────────
+  #    Runs the dashboard's stories as browser tests via `@storybook/addon-vitest`
+  #    (interaction/`play` functions) plus the visual-regression snapshot hook
+  #    (`toMatchScreenshot`). Gated on web-relevant paths, so unrelated PRs skip
+  #    it entirely (a skipped required check passes branch protection).
+  #
+  #    Diff-optimized: `vitest --changed <base>` runs ONLY the stories whose
+  #    module graph touches a file changed in the PR, so a one-component edit
+  #    re-tests one component, not the whole dashboard. `--passWithNoTests` keeps
+  #    a web change that touches no story (e.g. a lib-only edit) green.
+  #
+  #    This runs Vitest directly rather than through `nx` on purpose: the browser
+  #    provider keeps a child process alive that deadlocks `nx run-commands`'
+  #    output capture. The `changes` path filter already gives the coarse gate
+  #    `nx affected` would, and `--changed` gives finer, file-level selection.
+  web-test:
+    name: Web — Storybook interaction + visual tests (changed)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.web == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0 # `vitest --changed <base>` needs history to diff
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Key the browser cache on the resolved Playwright version so a bump busts
+      # it. The version is pinned (packages/web → playwright 1.56.0) so the
+      # Chromium build matches the one the visual baselines were generated with.
+      - name: Resolve Playwright version
+        id: pw
+        working-directory: packages/web
+        run: echo "version=$(node -p "require('playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Playwright Chromium (+ OS deps)
+        run: pnpm --filter @lorekit/web exec playwright install --with-deps chromium
+
+      # Cache the Vite/Storybook dep-optimizer so a warm run skips the cold
+      # pre-bundle (the slow part of the first browser boot).
+      - name: Cache Vite/Storybook optimizer
+        uses: actions/cache@v6
+        with:
+          path: |
+            packages/web/node_modules/.vite
+            packages/web/node_modules/.cache/storybook
+          key: web-vite-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'packages/web/.storybook/**', 'packages/web/vitest.storybook.config.ts') }}
+
+      # Invoked via `npx` (not `pnpm exec` / `nx`): those wrap the process and
+      # keep the Playwright browser child's stdio open, so the run never returns.
+      # `npx` execs Vitest directly. `--changed <base>` is the diff-optimizer.
+      - name: Storybook tests (interaction + visual, changed only)
+        working-directory: packages/web
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: npx vitest run --config vitest.storybook.config.ts --changed="$BASE" --passWithNoTests
+
+  # ── Web preview — deploy a Vercel preview, ONLY when web paths changed ────────
+  #    Replaces Vercel's native Git integration for the dashboard project. That
+  #    integration deployed a preview on EVERY PR/branch push — even docs- or
+  #    backend-only ones — and each deployment counts against the Vercel Hobby
+  #    quota even when the dashboard's Ignored Build Step skips the actual build.
+  #    Here the preview is gated on the `web_preview` path filter, so a PR with
+  #    no web changes creates no Vercel deployment at all. The reusable workflow
+  #    ALSO skips redeploying when a new commit changed no web file SINCE this
+  #    PR's last preview, so a burst of non-web commits on a web PR spends one
+  #    deployment, not one per push.
+  #
+  #    `web_preview`, NOT the broader `web` that gates the Storybook job: that
+  #    one includes `ci.yml` and `pnpm-lock.yaml`, so every unrelated CI edit and
+  #    every dependency bump anywhere in the monorepo used to spend a deployment
+  #    on a dashboard nobody changed. See scripts/ci/web-preview-filter.mjs.
+  #
+  #    The whole job body now lives in .github/workflows/web-preview-deploy.yml
+  #    so the `/web-preview` command workflow can run the exact same flow. This
+  #    caller passes `force: false` — the quota-friendly, incremental behaviour.
+  #    `/web-preview` passes `force: true` to redeploy on demand.
+  #
+  #    `github.event.pull_request.head.*` (not `github.sha` / the default
+  #    checkout ref, which on a `pull_request` are the synthetic
+  #    `refs/pull/N/merge` merge commit) so the commit we build is the PR head.
+  #
+  #    Non-blocking by design: it is deliberately NOT in the `summary` gate's
+  #    `needs`, so a transient Vercel failure can never block a merge (the old
+  #    Vercel preview check wasn't a merge gate either). It self-skips green on a
+  #    fork PR where the Vercel secrets are unavailable. A deploy Vercel BLOCKS
+  #    (e.g. the commit author's email isn't matched to a GitHub account) now
+  #    fails FAST — bounded by a `vercel deploy` timeout instead of hanging to the
+  #    job default — and posts the reason as a sticky PR comment.
+  web-preview:
+    name: Web — Vercel preview (changed)
+    needs: [changes]
+    if: needs.changes.outputs.web_preview == 'true'
+    uses: ./.github/workflows/web-preview-deploy.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      pr-number: ${{ github.event.pull_request.number }}
+      head-sha: ${{ github.event.pull_request.head.sha }}
+      head-ref: ${{ github.head_ref }}
+      force: false
+    secrets:
+      vercel-token: ${{ secrets.VERCEL_TOKEN }}
+      vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+      vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+
+  # ── Migration-order guard — reject out-of-order migration prefixes ───────────
+  #    Fails a PR that ADDS a migration numbered <= the highest already on the
+  #    base branch — the collision that later wedges `supabase db push` on deploy
+  #    ("migration files to be inserted before the last migration on remote").
+  #    Sequential integer prefixes don't survive parallel PRs; this catches it at
+  #    review time. Path-gated, so unrelated PRs skip it (a skipped required check
+  #    is treated as passing by branch protection). See scripts/migrations/check-migration-order.mjs.
+  migration-order:
+    name: Migration order (no out-of-order prefixes)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.migrations == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0 # need base + HEAD history to diff the added migrations
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      # Self-test the guard's pure logic first (node's built-in runner, zero deps)
+      # so a regression in the ordering check is caught here, not by letting a bad
+      # migration through or blocking a good PR.
+      - name: Unit-test the guard
+        run: node --test scripts/migrations/check-migration-order.test.mjs
+
+      # The deploy-time counterpart: the PR-time guard above stops an
+      # out-of-order file from landing, while the drift classifier decides what
+      # deploy.yml does when the SHARED preview project's migration history is
+      # ahead of the ref being deployed. Its verdict gates a `supabase db push`,
+      # so it is unit-tested here too.
+      - name: Unit-test the remote-migration-drift classifier
+        run: node --test scripts/migrations/check-remote-migration-drift.test.mjs
+
+
+      - name: Check migration ordering against the base branch
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: node scripts/migrations/check-migration-order.mjs "$BASE"
+
+  # ── Benchmark harness logic — the sweep and the load test ────────────────────
+  #    Both harnesses are manual: the sweep grows a table to 100k rows, and the
+  #    load test provisions real users against a real project. Neither belongs on
+  #    a PR. Their PURE modules do, and for the same reason as the deploy-scope
+  #    resolver below: `scripts/**` is outside `nx affected`, so the `check` job
+  #    would never execute these.
+  #
+  #    Gated on its own `bench` filter rather than riding along in
+  #    `migration-order`, which is where these tests first landed. That filter is
+  #    migrations-only, so a PR touching just `scripts/telemetry/sweep-telemetry.mjs` did
+  #    not re-run the tests protecting it — coverage that looked present and was
+  #    decorative.
+  #
+  #    Two of these guard behaviour that is silently DESTRUCTIVE rather than
+  #    merely wrong: the OTLP payload shapes fail as a remote 400 whose only
+  #    symptom is a dashboard that never gains a datapoint, and
+  #    `load-test-cleanup`'s anchored pattern and age floor decide which user
+  #    accounts a sweep deletes from a live project.
+  bench-tests:
+    name: Benchmark harness tests
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.bench == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      # Node's built-in runner, zero deps — these modules are dependency-free on
+      # purpose so they can run before any install.
+      - name: Unit-test the sweep's OTLP payloads
+        run: node --test scripts/telemetry/sweep-telemetry.test.mjs
+
+      - name: Unit-test the load test's logic
+        run: |
+          node --test scripts/load-test/load-test-lib.test.mjs
+          node --test scripts/telemetry/load-telemetry.test.mjs
+          node --test scripts/load-test/load-test-cleanup.test.mjs
+
+  # ── Deploy-scope resolver — the decision that gates production ───────────────
+  #    deploy.yml's `changes` job diffs each half (API / web) against the commit
+  #    that half is actually SERVING, not against the push. A wrong `false` there
+  #    promotes one half past the other — it did once, and every production Lore
+  #    Explorer read answered 405 until the web was rolled back by hand. So the
+  #    decision lives in a module with a test rather than in a shell block, and
+  #    that test runs here: `scripts/**` is outside `nx affected`, so the `check`
+  #    job would never execute it. Same treatment, same reason, as the migration
+  #    guards above.
+  deploy-scope:
+    name: Deploy-scope resolver (unit)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.deploy == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      # node's built-in runner, zero deps — no install step needed.
+      - name: Unit-test the deploy-scope resolver
+        run: node --test scripts/ci/resolve-deploy-scope.test.mjs
+
+  seed-tests:
+    name: Preview-seed dataset/SQL builders (unit)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.seed == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      # node's built-in runner, zero deps — no install step needed.
+      - name: Unit-test the seed dataset, SQL builders, and CLI
+        run: node --test scripts/seed/preview-dataset.test.mjs scripts/seed/preview-sql.test.mjs scripts/seed/seed-preview.test.mjs
+
+  # ── Web-preview filter — the decision that spends Vercel quota ───────────────
+  #    The filter deciding whether a push deploys a dashboard preview exists in
+  #    THREE places: the canonical `scripts/ci/web-preview-filter.mjs`, the
+  #    `changes` job's `web_preview` grep above, and web-preview-deploy.yml's
+  #    `web-path-filter` default. Neither workflow can import the module (one
+  #    runs before any toolchain setup, the other before its checkout), so the
+  #    copies are held in place by this test instead — it reads both YAML files
+  #    and fails on drift, and cross-checks `grep -E` against the JS `RegExp`
+  #    since the one ERE is consumed by both engines.
+  #
+  #    Drift is silent in both directions: too broad and every unrelated CI edit
+  #    burns a deployment from the daily quota (it did — that is why the filter
+  #    moved here), too narrow and a dashboard change ships with no preview to
+  #    review. Same reason as `deploy-scope` above: `scripts/**` is outside
+  #    `nx affected`, so the `check` job would never run this.
+  preview-filter:
+    name: Web-preview filter (unit)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.preview_filter == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Unit-test the web-preview path filter
+        run: node --test scripts/ci/web-preview-filter.test.mjs
+
+      # The sticky comment's BODY, for the same reason: it is a Vercel-shaped
+      # contract with tooling outside this repo (a `| Project | Deployment |
+      # Actions | Updated |` table whose Actions cell carries `[Preview](…)`),
+      # plus this repo's own `sha=` marker that the incremental redeploy check
+      # reads back. Both are held by assertion rather than by discipline.
+      - name: Unit-test the web-preview comment body
+        run: node --test scripts/ci/web-preview-comment.test.mjs
+
+      # The deploy step's `shell:`, for a third variant of the same reason: it
+      # is spelled out (`bash --noprofile --norc {0}`) precisely to opt OUT of
+      # the `-e` that `shell: bash` implies, and the difference is invisible on
+      # a green run. Under `-e` the step's `code=$?` and every fail() branch
+      # below it are unreachable, so a BLOCKED deploy reports no reason and
+      # writes no vercel-deploy-error.txt for the caller to quote — which is how
+      # a quota block read as an unexplained timeout on #643. The guard proves
+      # the bash semantics rather than asserting them, then holds the YAML to
+      # them.
+      - name: Unit-test the Vercel deploy step's shell semantics
+        run: node --test scripts/ci/vercel-deploy-shell.test.mjs
+
+  # ── Edge typecheck — `deno check` over every Edge Function, ratcheted ────────
+  #    Until this job existed, `supabase/functions/**` was typechecked by
+  #    NOTHING: no `deno check` anywhere, no tsconfig covering the tree, and no
+  #    nx target. The only thing exercising it was `integration`'s
+  #    `supabase start`, which proves modules RESOLVE and functions BOOT — not
+  #    that any type is correct.
+  #
+  #    That gap is load-bearing now. The MCP dispatch map is generated from the
+  #    tool catalog and binds each op name to a handler imported from
+  #    `mcp/tools.ts`; a source scan can confirm the handler is EXPORTED, but
+  #    only a typechecker can confirm it is exported with the right SIGNATURE.
+  #    Passing `(db, args, span)` where `(db, args, userId, span)` is expected
+  #    still resolves, still exports, still passes every unit test — and then
+  #    throws at runtime on the first `span.setAttributes`, on a surface no
+  #    smoke test calls.
+  #
+  #    The first run over the tree found errors that predate this gate, so the
+  #    check is a RATCHET rather than a clean gate: each function's existing
+  #    count is written down in `supabase/deno-check-baseline.json` and the job
+  #    fails the moment one goes UP. See scripts/ci/deno-check-functions.mjs for
+  #    why blocking on zero was not an option (the debt is in `_shared/` modules
+  #    every function imports, so narrowing the gate does not avoid it either).
+  edge-typecheck:
+    name: Edge typecheck (deno check)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.api == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # The runner's own Node runs these; the ratchet script is dependency-free
+      # on purpose so this job needs no pnpm/Node setup and stays fast.
+      - name: Unit-test the ratchet
+        run: node --test scripts/ci/deno-check-functions.test.mjs
+
+      # One implementation, called by BOTH this job and the `supabase:deno:check`
+      # nx target, so a contributor running it locally sees exactly what CI sees.
+      # It previously lived twice — once here and once in the target — and the
+      # two had already drifted on what a failure looks like.
+      - name: Typecheck every Edge Function
+        run: node scripts/ci/deno-check-functions.mjs
+
+  # ── Integration smoke — live stack wiring on a local Supabase ────────────────
+  #    Boots a full local stack (migrations applied → serves the real Edge
+  #    Functions) and asserts an authenticated MCP tools/list returns 200. That
+  #    proves migrations apply, the functions boot/import/serve, and auth is
+  #    wired end-to-end — the checks that translate faithfully from local to prod.
+  #
+  #    The full write/read/list/search/delete round-trip runs in deploy.yml's
+  #    smoke-staging against the real staging project. It is intentionally NOT run
+  #    here: the local edge runtime bundles an older PostgREST that can't resolve
+  #    the `UNIQUE NULLS NOT DISTINCT (user_id, scope, key)` upsert arbiter for
+  #    service-role writes (user_id null) — a local-only quirk. Real writes use a
+  #    non-null user_id (lk_rw token / JWT), covered by mcp-core unit tests here
+  #    and by smoke-staging against current PostgREST.
+  integration:
+    name: Integration smoke (local Supabase)
+    runs-on: ubuntu-latest
+    needs: [check, changes]
+    # Only run when API/backend code changed. A skipped required check is treated
+    # as passing by branch protection, so this does not block docs/web-only PRs.
+    if: needs.changes.outputs.api == 'true'
+    permissions:
+      contents: read
+    env:
+      # ── Smoke telemetry (job-wide) ────────────────────────────────────────────
+      # Same knobs as deploy.yml / preview.yml so the tagging is uniform, AND —
+      # unlike a plain `supabase start` — the local edge is given an OTLP endpoint
+      # (the "Configure local edge OTLP export" step below) so its smoke spans
+      # actually export to Dash0, tagged `deployment.environment.name=test`. Every
+      # smoke request also carries `X-LoreKit-Deployment-Environment: test` (via
+      # the CLI's `restFetch`, the REST/MCP smoke specs, and the tools/list curl).
+      # LOREKIT_TELEMETRY_TOKEN is the Dash0 ingest-only token, used both to write
+      # that edge .env and (were a traced CLI command to run here) for CLI export.
+      # Fork PRs get no secret → the edge .env step self-skips → graceful
+      # no-export, exactly as before.
+      LOREKIT_TELEMETRY_TOKEN: ${{ secrets.LOREKIT_TELEMETRY_TOKEN }}
+      DEPLOYMENT_ENVIRONMENT: test
+      LOREKIT_CORRELATION_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v3
+        with:
+          # Pinned, not `latest`: CLI v2.116.0 changed the local stack's default
+          # privileges so `anon` gains EXECUTE on SECURITY DEFINER functions that
+          # migration 00041 only revokes from PUBLIC, tripping the
+          # `lorekit_org_members_list must not be granted to anon` assertion in
+          # migrations.test.sql. v2.115.0 is the last release with the prior
+          # behaviour. Revisit once the CLI's grant change is understood.
+          version: 2.115.0
+
+      # Give the LOCAL edge runtime an OTLP endpoint so its smoke spans actually
+      # export to Dash0 (tagged `deployment.environment.name=test`), instead of
+      # being dark as they are under a plain `supabase start`. The CLI loads
+      # `supabase/functions/.env` into the edge runtime at `supabase start`, so
+      # write it there from the ingest-only token secret. The endpoint is the
+      # same public Dash0 ingress the CLI bakes in as its default; the token is
+      # ingest-only (POST spans, no read/manage). `.env` is gitignored, and the
+      # file is only ever created on the runner, never committed. Fork PRs have
+      # no secret → skip → the edge stays dark (unchanged behaviour), never a
+      # broken start. Must run BEFORE `supabase start` so the runtime picks it up.
+      # The GITHUB_* lines give the edge its `service.version` + `vcs.*` resource
+      # attrs (`_shared/otel.ts` reads GITHUB_SHA/REPOSITORY/REF_NAME); the edge
+      # isolate does not inherit the runner env — that is the same reason the
+      # OTLP endpoint has to be written here — so without them these spans land
+      # unattributed (`service.version=unknown`, no `vcs.*`).
+      - name: Configure local edge OTLP export (Dash0)
+        env:
+          LOREKIT_TELEMETRY_TOKEN: ${{ secrets.LOREKIT_TELEMETRY_TOKEN }}
+        run: |
+          if [ -z "$LOREKIT_TELEMETRY_TOKEN" ]; then
+            echo "::warning::LOREKIT_TELEMETRY_TOKEN unavailable (fork PR?) — local edge telemetry export is disabled for this run."
+            exit 0
+          fi
+          {
+            echo "OTEL_EXPORTER_OTLP_ENDPOINT=https://ingress.europe-west4.gcp.dash0-dev.com"
+            echo "OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer ${LOREKIT_TELEMETRY_TOKEN}"
+            echo "DASH0_DATASET=default"
+            echo "DEPLOYMENT_ENVIRONMENT=test"
+            echo "GITHUB_SHA=${GITHUB_SHA}"
+            echo "GITHUB_REPOSITORY=${GITHUB_REPOSITORY}"
+            echo "GITHUB_REF_NAME=${GITHUB_REF_NAME}"
+          } > supabase/functions/.env
+          echo "Wrote supabase/functions/.env — local edge will export to Dash0 as deployment.environment.name=test, attributed to ${GITHUB_REPOSITORY}@${GITHUB_SHA}."
+
+      - name: Start local Supabase (applies migrations, serves functions)
+        run: supabase start
+
+      - name: Lint database schema (informational)
+        run: supabase db lint --level warning || true
+
+      - name: Capture local service-role key
+        id: supabase
+        run: |
+          supabase status -o json > /tmp/status.json
+          # The service-role key the edge runtime injects as SUPABASE_SERVICE_ROLE_KEY.
+          # Field name varies by CLI version (legacy SERVICE_ROLE_KEY/SECRET_KEY vs
+          # newer 'Secret', the sb_secret_... format key).
+          KEY="$(jq -r '.SERVICE_ROLE_KEY // .SECRET_KEY // .service_role_key // .Secret // empty' /tmp/status.json)"
+          if [ -z "$KEY" ]; then
+            echo "::error::No service-role/secret key in supabase status. Available keys:"
+            jq -r 'keys[]' /tmp/status.json
+            exit 1
+          fi
+          echo "::add-mask::$KEY"
+          echo "service_role_key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke — authenticated MCP tools/list returns 200
+        env:
+          TOKEN: ${{ steps.supabase.outputs.service_role_key }}
+        run: |
+          for i in $(seq 1 40); do
+            CODE=$(curl -s --max-time 30 -o /tmp/mcp.out -w '%{http_code}' \
+              -X POST http://127.0.0.1:54321/functions/v1/mcp \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json, text/event-stream" \
+              -H "x-lorekit-deployment-environment: ${DEPLOYMENT_ENVIRONMENT}" \
+              -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' || echo 000)
+            if [ "$CODE" = "200" ]; then
+              echo "MCP stack healthy (migrations applied, functions serving, auth OK, tools/list → 200)"
+              exit 0
+            fi
+            echo "attempt $i: HTTP $CODE"
+            sleep 3
+          done
+          echo "::error::MCP endpoint did not return 200 for an authenticated tools/list"
+          echo '--- last response body ---'; cat /tmp/mcp.out || true
+          echo '--- edge runtime logs ---'; docker logs supabase_edge_runtime_lorekit 2>&1 | tail -80 || true
+          exit 1
+
+      # The robust stdio transport (`lorekit mcp`) is the offline-friendly
+      # alternative to `npx -y mcp-remote` that a `.mcp.json` can point at.
+      # Spawn it against the live local stack and assert the handshake +
+      # tools/list + a memory.list that actually reaches the backend — proving
+      # the transport we recommend launches and passes traffic end-to-end.
+      - name: Smoke — robust stdio transport handshakes against the live stack
+        env:
+          TOKEN: ${{ steps.supabase.outputs.service_role_key }}
+        run: node scripts/smoke/smoke-mcp-stdio.mjs "http://127.0.0.1:54321/functions/v1/mcp" "$TOKEN"
+
+      # The orgs suite needs a Supabase USER JWT — every `lorekit_org_*` RPC is
+      # SECURITY DEFINER and resolves the actor as `auth.uid()`, so the
+      # service-role key and `lk_*` tokens are both rejected. A JWT cannot be a
+      # stored secret (it expires: `jwt_expiry` is 86400s locally, 3600s hosted,
+      # and an expired one makes the suite self-skip green), so it is minted
+      # per run against the throwaway local stack.
+      - name: Mint a user JWT for the orgs smoke suite
+        id: smokejwt
+        env:
+          SUPABASE_URL: http://127.0.0.1:54321
+          SUPABASE_SERVICE_ROLE_KEY: ${{ steps.supabase.outputs.service_role_key }}
+        run: |
+          JWT="$(node scripts/smoke/mint-smoke-jwt.mjs)"
+          echo "::add-mask::$JWT"
+          echo "jwt=$JWT" >> "$GITHUB_OUTPUT"
+
+      # Exercise the REST Edge Functions end-to-end against the live local
+      # stack. These specs self-skip without their credential, so wiring
+      # them here is what actually makes them a merge gate — without this step
+      # they exist but never run, and report a pass. They prove the `memories`
+      # and `orgs` functions boot, authenticate, and honour their request
+      # contracts (including the OR+AND `filter` on POST /memories/search),
+      # and read `audit_log` back to prove the audit trail is really written.
+      - name: Smoke — REST API (memories + orgs) against the live stack
+        env:
+          LOREKIT_SMOKE_TOKEN: ${{ steps.supabase.outputs.service_role_key }}
+          LOREKIT_SMOKE_JWT: ${{ steps.smokejwt.outputs.jwt }}
+          LOREKIT_REST_BASE_URL: http://127.0.0.1:54321/functions/v1
+        run: node scripts/smoke/smoke-rest.mjs
+
+      - name: Smoke cleanup — sweep leftover artefacts (self-test of the sweeper)
+        if: always()
+        env:
+          LOREKIT_SMOKE_TOKEN: ${{ steps.supabase.outputs.service_role_key }}
+          LOREKIT_SMOKE_JWT: ${{ steps.smokejwt.outputs.jwt }}
+          LOREKIT_SWEEP_SERVICE_ROLE_KEY: ${{ steps.supabase.outputs.service_role_key }}
+          LOREKIT_REST_BASE_URL: http://127.0.0.1:54321/functions/v1
+        run: node scripts/smoke/smoke-cleanup.mjs --min-age-minutes 0 --allow-service-role --strict
+
+      - name: Diagnose — edge runtime logs (on failure)
+        if: failure()
+        run: |
+          echo '--- containers ---'
+          docker ps -a --format '{{.Names}}\t{{.Status}}' || true
+          echo '--- supabase_edge_runtime_lorekit ---'
+          docker logs supabase_edge_runtime_lorekit 2>&1 | tail -200 || true
+          echo '--- supabase status ---'
+          supabase status || true
+
+      # Assert the business rules that live only in SQL — the cap/rate triggers
+      # and RPCs, RLS isolation, memory_write's created_at semantics, and the
+      # webhook-secret constraints. Runs directly on Postgres (not PostgREST),
+      # so it exercises the raw migration logic the mocked unit tests can only
+      # assume. See supabase/tests/migrations.test.sql.
+      - name: Migration DB tests (triggers, RPCs, RLS, constraints)
+        run: |
+          DB_URL="$(supabase status -o json | jq -r '.DB_URL // empty')"
+          [ -n "$DB_URL" ] || DB_URL="postgresql://postgres:postgres@127.0.0.1:54322/postgres"
+          echo "Running supabase/tests/migrations.test.sql against the local database"
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/migrations.test.sql
+
+      - name: Stop local Supabase
+        if: always()
+        run: supabase stop --no-backup
+
+  # ── CI Summary — the single required status check ────────────────────────────
+  #    Aggregates the result of every job above into ONE pass/fail check plus a
+  #    human-readable table in the run summary. Make THIS the only required check
+  #    in branch protection: it fails if any job failed or was cancelled, and
+  #    passes when every job either succeeded or was *intentionally skipped* (the
+  #    path-gated `plugin`/`integration` jobs on unrelated PRs). GitHub's native
+  #    "required check" treats a skipped job as pending forever, which would wedge
+  #    docs/web-only PRs — this job collapses that ambiguity into a real verdict.
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    # `always()` so the gate still runs (and reports) even when an upstream job
+    # failed, was cancelled, or was skipped — otherwise it would be skipped too.
+    if: always()
+    needs: [changes, check, plugin, integration, web-test, migration-order, deploy-scope, seed-tests, preview-filter, bench-tests, edge-typecheck]
+    permissions: {}
+    steps:
+      - name: Aggregate job results into a pass/fail gate
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          echo "### CI Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | ------ |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Name each failed job in a `::error::` annotation. Branch protection
+          # surfaces THIS job as the single required check, so an agent inspecting
+          # the check needs to know exactly which upstream job to open — a generic
+          # "one or more jobs failed" gives it nowhere to look. Annotations render
+          # at the top of the run and are returned by the checks API verbatim.
+          failed=0
+          failed_jobs=""
+          while read -r job result; do
+            case "$result" in
+              success)   icon="✅ success" ;;
+              skipped)   icon="⏭️ skipped (not applicable)" ;;
+              failure)   icon="❌ failure";   failed=1; failed_jobs="${failed_jobs}${job} "
+                         echo "::error::Job '${job}' failed — open the '${job}' job's logs for the full error/warning output." ;;
+              cancelled) icon="🚫 cancelled"; failed=1; failed_jobs="${failed_jobs}${job} "
+                         echo "::error::Job '${job}' was cancelled." ;;
+              *)         icon="❓ $result";    failed=1; failed_jobs="${failed_jobs}${job} "
+                         echo "::error::Job '${job}' ended in an unexpected state: ${result}." ;;
+            esac
+            echo "| \`$job\` | $icon |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(printf '%s' "$NEEDS_JSON" | jq -r 'to_entries[] | "\(.key) \(.value.result)"')
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$failed" -eq 1 ]; then
+            echo "**CI failed** — the following job(s) did not succeed: \`${failed_jobs% }\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "Open each failed job above and read its step logs for the concrete errors/warnings." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::CI failed — job(s) did not succeed: ${failed_jobs% }. Open each failed job's logs for the concrete errors."
+            exit 1
+          fi
+          echo "**CI passed** — every job succeeded or was intentionally skipped." >> "$GITHUB_STEP_SUMMARY"

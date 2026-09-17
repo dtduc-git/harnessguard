@@ -1,0 +1,190 @@
+name: Release Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: release-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  release-check:
+    name: release-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/tinygeniushub?schema=public
+      REDIS_URL: redis://127.0.0.1:6379
+      SESSION_SECRET: ci-session-secret-with-at-least-thirty-two-characters
+      BETTER_AUTH_SECRET: ci-better-auth-secret-with-at-least-thirty-two-characters
+      ADMIN_AUTH_SECRET: ci-admin-auth-secret-with-at-least-thirty-two-characters
+      ADMIN_EMAILS: demo.admin@tinygeniushubvn.tech
+      BILLING_WEBHOOK_SECRET: ci-webhook-secret
+      NODE_ENV: test
+      NEXT_TELEMETRY_DISABLED: "1"
+      CI: "true"
+      RATE_LIMIT_TRUST_PROXY: "true"
+      COURSE_PAYMENT_PROVIDER: payos
+      PAYOS_CLIENT_ID: e2e-payos-client-id
+      PAYOS_API_KEY: e2e-payos-api-key
+      PAYOS_CHECKSUM_KEY: e2e-payos-checksum-key
+      ALLOW_PROD_MOCK_CHECKOUT_CALLBACK: "false"
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: tinygeniushub
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tinygeniushub"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Grapuco flow quality warning gate
+        env:
+          GRAPUCO_API_KEY: ${{ secrets.GRAPUCO_API_KEY }}
+        run: |
+          if [ -z "${GRAPUCO_API_KEY}" ]; then
+            echo "GRAPUCO_API_KEY secret is not set. Skip Grapuco flow quality check."
+            exit 0
+          fi
+
+          mkdir -p .codex
+          cat > .codex/.mcp.json <<EOF
+          {
+            "mcpServers": {
+              "grapuco": {
+                "command": "npx",
+                "args": [
+                  "-y",
+                  "mcp-remote",
+                  "https://api.grapuco.com/mcp",
+                  "--header",
+                  "X-Api-Key: ${GRAPUCO_API_KEY}"
+                ],
+                "env": {},
+                "disabled": false
+              }
+            }
+          }
+          EOF
+
+          pnpm grapuco:quality-report \
+            -- --stack codex \
+            --baseline-file scripts/grapuco/flow-quality-baseline.json \
+            --report-file reports/grapuco/flow-quality-latest.json \
+            --summary-file reports/grapuco/flow-quality-summary.md
+
+      - name: Prepare database
+        run: |
+          pnpm prisma migrate deploy
+          pnpm db:seed
+          pnpm tsx prisma/scripts/import-three-courses-bootstrap.ts --publish
+          ADMIN_EMAILS=demo.admin@tinygeniushubvn.tech ADMIN_SEED_PASSWORD=DemoAdmin123! pnpm admin:seed-super
+          node -e "const { PrismaClient } = require('@prisma/client'); const prisma = new PrismaClient(); const controls = { ddosMode: 'normal', globalLimitMultiplier: 1, blockedIpCidrs: [], readinessAllowlistCidrs: [], parentEmailVerificationRequired: false, parentEmailVerificationTokenTtlMinutes: 15 }; prisma.adminSecuritySettings.upsert({ where: { id: 'default' }, update: { securityControls: controls, updatedByActorId: 'ci-release-check' }, create: { id: 'default', rateLimitPolicies: {}, securityControls: controls, updatedByActorId: 'ci-release-check' } }).then(() => prisma.\$disconnect()).catch(async (error) => { console.error(error); await prisma.\$disconnect(); process.exit(1); });"
+
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run release gates
+        run: pnpm release:check
+
+      - name: Run P0 e2e journey
+        env:
+          E2E_SKIP_BUILD: "1"
+        run: pnpm test:e2e:p0
+
+      - name: Run lesson player video layout guard
+        continue-on-error: true
+        run: pnpm test:e2e:video-layout
+
+      - name: Run security abuse e2e
+        env:
+          E2E_SKIP_BUILD: "1"
+          E2E_ADMIN_EMAIL: demo.admin@tinygeniushubvn.tech
+          E2E_ADMIN_PASSWORD: DemoAdmin123!
+        run: pnpm test:e2e:security
+
+      - name: Publish evidence summary
+        if: always()
+        run: |
+          echo "## Release Evidence" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f reports/security/latest-summary.md ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Security Baseline" >> "$GITHUB_STEP_SUMMARY"
+            cat reports/security/latest-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Security summary was not generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f reports/perf/latest.json ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Performance Report" >> "$GITHUB_STEP_SUMMARY"
+            node -e 'const fs=require("node:fs");const report=JSON.parse(fs.readFileSync("reports/perf/latest.json","utf8"));console.log(`- Threshold: ${report.thresholdMs}ms`);for (const result of report.results){console.log(`- ${result.path}: p95 ${result.p95.toFixed(2)}ms, avg ${result.average.toFixed(2)}ms`);}' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Performance report was not generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f reports/grapuco/flow-quality-summary.md ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Grapuco Flow Quality" >> "$GITHUB_STEP_SUMMARY"
+            cat reports/grapuco/flow-quality-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Grapuco flow quality summary was not generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload release evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            reports/security/latest-summary.md
+            reports/security/security-baseline-*.json
+            reports/perf/latest.json
+            reports/grapuco/flow-quality-latest.json
+            reports/grapuco/flow-quality-summary.md
+            test-results/playwright-report
+            test-results/playwright-artifacts

@@ -1,0 +1,82 @@
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read # Required for Claude to read CI results on PRs
+    steps:
+      - name: Checkout repository
+        # Pin to specific SHA for supply chain security
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        # Pin to specific version for supply chain security
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --model claude-sonnet-4-6
+            --mcp-config ${{ github.workspace }}/.github/claude-mcp-config.json
+            --allowedTools Bash(pre-commit:*),Bash(terraform:*),Bash(terraform-docs:*),mcp__terraform-server__get_provider_details,mcp__terraform-server__search_providers,mcp__terraform-server__search_modules,mcp__terraform-server__get_module_details,mcp__context7__resolve-library-id,mcp__context7__get-library-docs
+
+          # This is an optional setting that allows Claude to read CI results on PRs
+          additional_permissions: |
+            actions: read
+
+          # MCP config and allowed tools are passed through claude_args for claude-code-action v1.0.74+.
+
+          # Optional: Specify model (defaults to Claude Sonnet 4, uncomment for Claude Opus 4)
+          # model: "claude-sonnet-4-6"
+
+          # Optional: Customize the trigger phrase (default: @claude)
+          # trigger_phrase: "/claude"
+
+          # Optional: Trigger when specific user is assigned to an issue
+          # assignee_trigger: "claude-bot"
+
+          # Subagent routing for specialized expertise
+          prompt: |
+            You have access to specialized subagents for this Terraform AWS Cognito User Pool module. Use them for relevant questions:
+
+            **Subagent Routing Rules:**
+            - For Cognito User Pool configurations, resource setup, MFA, security features, authentication flows, identity providers: use @terraform-cognito
+            - For testing questions, Terratest, test development, validation, CI/CD testing: use @terraform-testing
+            - For security analysis, compliance, vulnerability assessment, hardening recommendations: use @terraform-security
+            - For migrations, upgrades, version transitions, breaking changes: use @cognito-migration
+            - For documentation, examples, README updates, user guides: use @module-documentation
+
+            **Auto-routing Keywords:**
+            - MFA, authentication, password policy, advanced security → @terraform-security
+            - test, testing, terratest, validation, CI/CD → @terraform-testing
+            - migration, upgrade, version, breaking change → @cognito-migration
+            - user pool, client, domain, identity provider, schema → @terraform-cognito
+            - documentation, example, README, guide → @module-documentation
+
+            Always leverage the specialized knowledge in these subagents for better, more accurate responses.
+
+          # Optional: Custom environment variables for Claude
+          # claude_env: |
+          #   NODE_ENV: test

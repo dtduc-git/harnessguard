@@ -1,0 +1,46 @@
+﻿# Cost Reporter (ACTIVATED v1)
+name: cost-reporter
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+permissions:
+  issues: write
+jobs:
+  report:
+    if: vars.FLEET_PAUSED != 'true'
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_DEFAULT_SONNET_MODEL: claude-sonnet-4-6
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+      - name: Load bot-cost prompt
+        id: prompt
+        run: |
+          {
+            echo 'prompt<<EOFPROMPT'
+            cat .github/agents/bot-cost.md
+            echo
+            cat .github/agents/_TEMPLATE.md
+            echo
+            echo "Compute weekly burn: Anthropic, Vercel, AWS, Pinecone, Supabase."
+            echo "Update the cost: weekly burn pinned issue."
+            echo 'EOFPROMPT'
+          } >> "$GITHUB_OUTPUT"
+      - name: Generate cost report via Claude Code
+        uses: anthropics/claude-code-base-action@beta
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          allowed_tools: "Bash(gh:*),Bash(curl:*),Read"
+          max_turns: 10

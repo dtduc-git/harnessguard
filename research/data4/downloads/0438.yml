@@ -1,0 +1,58 @@
+name: Qwen Assistant
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Issue or PR number'
+        required: true
+      is_pr:
+        description: 'Is this a PR?'
+        required: false
+        default: 'false'
+      comment:
+        description: 'User instruction'
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  assist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Qwen Code
+        uses: qwenlm/qwen-code-action@main
+        with:
+          qwen_api_key: ${{ secrets.QWEN_API_KEY }}
+          prompt: |
+            You are Qwen Code, FI-003 of the arifOS federation.
+            Respond to this request: ${{ inputs.comment }}
+
+            Rules:
+            - Be concise and direct
+            - If the request touches code, produce a concrete diff or suggestion
+            - If the request is about governance/policy, reference the APEX-ZEN framework
+            - Never claim authority you don't have
+            - End with a clear action item or answer
+
+      - name: Post Response
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const target = parseInt('${{ inputs.target }}');
+            const isPr = '${{ inputs.is_pr }}' === 'true';
+            const summary = process.env.QWEN_SUMMARY || 'Response generated';
+            const endpoint = isPr ? 'pullRequests' : 'issues';
+            if (target) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: target,
+                body: `## 🤖 Qwen Code\n\n${summary}`
+              });
+            }

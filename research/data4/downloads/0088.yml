@@ -1,0 +1,41 @@
+name: MCP Config CLI Smoke
+
+on:
+  push:
+    paths:
+      - 'mcp_config.py'
+      - '.github/workflows/ci-mcp-config.yml'
+      - 'README.md'
+  pull_request:
+    paths:
+      - 'mcp_config.py'
+      - '.github/workflows/ci-mcp-config.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Validate CLI help
+        shell: pwsh
+        run: python mcp_config.py --help
+
+      - name: Show JSON output
+        shell: pwsh
+        run: python mcp_config.py show --json

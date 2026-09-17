@@ -226,6 +226,33 @@ def test_cursor_agent_cli_detected() -> None:
     assert not is_agent_step(Step(name="run", raw={"run": "cursor-agent models"}))
 
 
+def test_scoped_mcp_packages_detected_with_pin_state() -> None:
+    from harnessguard.facts import mcp_launch_packages, mcp_unpinned
+
+    pinned = (
+        'claude_args: \'--mcp-config {"mcpServers": {"fs": {"command": "npx", '
+        '"args": ["-y", "@modelcontextprotocol/server-filesystem@0.6.2"]}}}\''
+    )
+    packages = mcp_launch_packages(pinned)
+    assert packages == ["@modelcontextprotocol/server-filesystem@0.6.2"]
+    assert mcp_unpinned(packages[0]) is False
+
+    unpinned = (
+        'claude_args: \'--mcp-config {"mcpServers": {"think": {"command": "npx", '
+        '"args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]}}}\''
+    )
+    packages = mcp_launch_packages(unpinned)
+    assert packages == ["@modelcontextprotocol/server-sequential-thinking"]
+    assert mcp_unpinned(packages[0]) is True
+
+
+def test_mcp_tool_permission_tokens_ignored() -> None:
+    from harnessguard.facts import mcp_launch_packages
+
+    text = 'allowed_tools: "Bash(npx *) mcp__sequential-thinking__sequentialthinking"'
+    assert mcp_launch_packages(text) == []
+
+
 def test_secretless_agent_callee_not_flagged() -> None:
     result = _scan("clean-repo")
     chains = [f for f in result.findings if f.workflow.name == "reusable-open-caller.yml"]

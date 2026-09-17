@@ -1,0 +1,719 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [22.x, 24.x, 25.x]
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch main branch for Nx affected
+        if: github.event_name == 'pull_request'
+        run: git fetch origin main:main
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Format Check
+        run: pnpm format:check
+
+      - name: Lint
+        run: pnpm nx ${{ github.event_name == 'pull_request' && 'affected' || 'run-many' }} -t lint
+
+      - name: TypeScript Strict Check
+        run: pnpm nx run-many -t typecheck
+
+      - name: Test
+        run: pnpm nx ${{ github.event_name == 'pull_request' && 'affected' || 'run-many' }} -t test --coverage
+
+      - name: Compilation Matrix
+        if: matrix.node-version == '25.x'
+        run: pnpm nx test compiler --testNamePattern="Compilation matrix smoke tests"
+
+      - name: Golden Files Drift Check
+        if: matrix.node-version == '25.x'
+        run: |
+          pnpm nx test formatters --testNamePattern="Golden Files"
+          if [ -n "$(git status --porcelain packages/formatters/src/__tests__/__golden__)" ]; then
+            echo "::error::Golden files are out of date. Run 'UPDATE_GOLDEN=true pnpm nx test formatters' locally and commit the changes."
+            git diff packages/formatters/src/__tests__/__golden__
+            exit 1
+          fi
+
+      - name: Schema Drift Check
+        if: matrix.node-version == '25.x'
+        run: |
+          pnpm schema:generate
+          if [ -n "$(git status --porcelain schema/)" ]; then
+            echo "::error::JSON Schema is out of sync with TypeScript types. Run 'pnpm schema:generate' locally and commit the changes."
+            git diff schema/
+            exit 1
+          fi
+
+      - name: Formatter Docs Drift Check
+        if: matrix.node-version == '25.x'
+        run: |
+          if ! pnpm docs:formatters:check; then
+            echo "::error::Generated formatter docs are out of date. Run 'pnpm docs:formatters' locally and commit the changes."
+            exit 1
+          fi
+
+      - name: Validate documentation examples
+        if: matrix.node-version == '25.x'
+        run: pnpm docs:validate:check
+
+      - name: Documentation Highlighting Check
+        if: matrix.node-version == '25.x'
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check pygments
+          pnpm docs:highlight:check
+
+      - name: Build
+        run: pnpm nx ${{ github.event_name == 'pull_request' && 'affected' || 'run-many' }} -t build
+
+      - name: Analyze CLI bundle
+        if: matrix.node-version == '25.x'
+        run: pnpm nx run cli:analyze-bundle
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Find unused code (Knip)
+        run: npx knip -W 'packages/*'
+        if: matrix.node-version == '25.x'
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v7
+        if: matrix.node-version == '25.x'
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && matrix.node-version == '25.x' }}
+        uses: codecov/codecov-action@v7
+        with:
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload CLI artifact
+        if: matrix.node-version == '25.x'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-dist
+          path: dist/packages/cli
+          retention-days: 1
+
+  cli-smoke-test:
+    name: CLI Smoke Test (Node ${{ matrix.node-version }})
+    needs: build
+    runs-on: ubuntu-latest
+    container:
+      image: node:${{ matrix.node-version }}-slim
+
+    strategy:
+      matrix:
+        node-version: ['22', '24', '25']
+
+    steps:
+      - name: Install git
+        run: |
+          apt-get update && apt-get install -y git
+          git --version
+
+      - name: Download CLI artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: cli-dist
+          path: cli-package
+
+      - name: Install dependencies
+        working-directory: cli-package
+        run: npm install
+
+      - name: Smoke test - version
+        working-directory: cli-package
+        run: |
+          VERSION=$(node bin/prs.js --version)
+          echo "CLI version: $VERSION"
+          # Fail if version is 0.0.0 (indicates package.json not found)
+          if [ "$VERSION" = "0.0.0" ]; then
+            echo "::error::Version detection failed - got 0.0.0"
+            exit 1
+          fi
+          # Verify version matches semver pattern
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Version does not match semver pattern: $VERSION"
+            exit 1
+          fi
+
+      - name: Smoke test - help
+        working-directory: cli-package
+        run: node bin/prs.js --help
+
+      - name: Smoke test - init and compile
+        run: |
+          mkdir -p /tmp/test-project
+          cd /tmp/test-project
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name smoke-test --targets github
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js validate
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile
+          # Verify output file exists and has PromptScript marker
+          test -f .github/copilot-instructions.md
+          grep -q "<!-- PromptScript" .github/copilot-instructions.md
+          grep -q "GitHub Copilot Instructions" .github/copilot-instructions.md
+
+      - name: Smoke test - agent platform and build profiles
+        run: |
+          mkdir -p "/tmp/test-agent-platform/.promptscript/scripts"
+          mkdir -p /tmp/test-agent-platform/.promptscript/skills/security-review/references
+          mkdir -p /tmp/test-agent-platform/.promptscript/skills/security-review/bin
+          cd /tmp/test-agent-platform
+
+          cat > promptscript.yaml << 'EOF'
+          version: '1'
+          project:
+            id: agent-platform-smoke
+          input:
+            entry: .promptscript/project.prs
+          targets:
+            - claude:
+                version: full
+            - cursor:
+                version: full
+            - codex:
+                version: full
+            - factory:
+                version: full
+            - gemini:
+                version: full
+            - github:
+                version: multifile
+            - grok:
+                version: full
+            - windsurf:
+                version: full
+          builds:
+            factory-package:
+              entry: .promptscript/project.prs
+              output: build-output
+              targets:
+                - factory:
+                    version: full
+          EOF
+
+          cat > .promptscript/project.prs << 'EOF'
+          @meta {
+            id: "agent-platform-smoke"
+            syntax: "1.4.0"
+          }
+
+          @identity {
+            """
+            You are a platform engineering assistant.
+            """
+          }
+
+          @skills {
+            security-review: {}
+          }
+
+          @mcpServers {
+            issue-tracker: {
+              transport: "stdio"
+              command: ["node", "./tools/issues.mjs"]
+            }
+          }
+
+          @agents {
+            reviewer: {
+              description: "Review pull requests"
+              skills: ["security-review"]
+              mcpServers: ["issue-tracker"]
+              content: "Review code, tests, and security."
+            }
+          }
+
+          @hooks {
+            validate-types: {
+              event: "post-tool-use"
+              matcher: "Edit|Write"
+              script: {
+                path: ".promptscript/scripts/validate script.mjs"
+                interpreter: "node"
+                args: ["--strict"]
+              }
+              cwd: "project"
+            }
+          }
+
+          @workflows {
+            release: {
+              description: "Prepare release"
+              content: "Run validation and summarize changes."
+            }
+          }
+
+          @plugins {
+            engineering: {
+              description: "Engineering capabilities"
+              version: "1.0.0"
+              skills: ["security-review"]
+              hooks: ["validate-types"]
+              mcpServers: ["issue-tracker"]
+            }
+          }
+          EOF
+          cat > ".promptscript/scripts/validate script.mjs" << 'EOF'
+          import { writeFileSync } from 'node:fs';
+          if (!process.argv.includes('--strict')) process.exit(2);
+          writeFileSync('.promptscript/hook-cwd.txt', process.cwd());
+          EOF
+
+          cat > .promptscript/skills/security-review/SKILL.md << 'EOF'
+          ---
+          name: security-review
+          description: Review code security
+          references:
+            - references/checklist.md
+          scripts:
+            - bin/check.sh
+            - bin/report.sh
+          ---
+
+          Inspect changes for security risks.
+          EOF
+          printf '# Security checklist\n' > .promptscript/skills/security-review/references/checklist.md
+          printf '#!/bin/sh\necho checking\n' > .promptscript/skills/security-review/bin/check.sh
+          printf '#!/bin/sh\necho report\n' > .promptscript/skills/security-review/bin/report.sh
+          chmod +x .promptscript/skills/security-review/bin/check.sh
+
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js validate --strict
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile
+
+          test -f .claude/agents/reviewer.md
+          test -f .claude/skills/security-review/SKILL.md
+          test -f .claude/workflows/release.md
+          test -f .claude/settings.json
+          test -f .mcp.json
+          test -f .cursor/agents/reviewer.md
+          test -f .cursor/hooks.json
+          test -f .cursor/mcp.json
+          test -f .cursor/plugins.json
+          test -f .codex/hooks.json
+          test -f .factory/droids/reviewer.md
+          test -f .factory/mcp.json
+          test -f .factory/hooks.json
+          test -f .factory/plugins.json
+          test -f .github/hooks/promptscript.json
+          test -f .gemini/settings.json
+          test -f .grok/hooks/promptscript.json
+          test -f .windsurf/hooks.json
+          test -f .factory/skills/security-review/references/checklist.md
+          test -x .factory/skills/security-review/scripts/check.sh
+          test ! -x .factory/skills/security-review/scripts/report.sh
+          grep -q "issue-tracker" .factory/mcp.json
+          grep -q "engineering" .factory/plugins.json
+          node -e 'const h=require("./.factory/hooks.json");const x=h.hooks.PostToolUse?.[0]?.hooks?.[0];if(!x?.command?.includes("node \"$FACTORY_PROJECT_DIR\"/"))process.exit(1)'
+          node -e "const h=require('./.github/hooks/promptscript.json');const x=h.hooks.postToolUse?.[0];if(h.version!==1||!x?.bash||!x?.powershell||x.cwd!=='.')process.exit(1)"
+          mkdir -p packages/nested
+          node -e 'const{spawnSync}=require("node:child_process");const h=require("./.factory/hooks.json");const c=h.hooks.PostToolUse[0].hooks[0].command;const r=spawnSync("/bin/sh",["-c",c],{cwd:"packages/nested",env:{...process.env,FACTORY_PROJECT_DIR:process.cwd()},stdio:"inherit"});process.exit(r.status??1)'
+          test "$(cat .promptscript/hook-cwd.txt)" = "$(pwd)"
+
+          chmod -x .factory/skills/security-review/scripts/check.sh
+          chmod +x .factory/skills/security-review/scripts/report.sh
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile
+          test -x .factory/skills/security-review/scripts/check.sh
+          test ! -x .factory/skills/security-review/scripts/report.sh
+
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile --all-builds
+          test -f build-output/AGENTS.md
+          test -f build-output/.factory/droids/reviewer.md
+          test -f build-output/.factory/mcp.json
+          test -f build-output/.factory/hooks.json
+          test -f build-output/.factory/plugins.json
+          test -f build-output/.factory/skills/security-review/references/checklist.md
+          test -x build-output/.factory/skills/security-review/scripts/check.sh
+          test ! -x build-output/.factory/skills/security-review/scripts/report.sh
+
+      - name: Smoke test - init with --migrate flag
+        run: |
+          mkdir -p /tmp/test-migrate
+          cd /tmp/test-migrate
+
+          # Test --migrate with all targets
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name migrate-test --targets github claude cursor antigravity --migrate -y
+
+          # Verify base files exist
+          test -f promptscript.yaml
+          test -f .promptscript/project.prs
+
+          # Verify migration skill installed to .promptscript/skills/
+          test -f .promptscript/skills/promptscript/SKILL.md
+          grep -q "promptscript" .promptscript/skills/promptscript/SKILL.md
+
+          # Verify compilation still works after --migrate
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js validate
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile
+
+      - name: Smoke test - init without --migrate (verify skill always installed)
+        run: |
+          mkdir -p /tmp/test-no-migrate
+          cd /tmp/test-no-migrate
+
+          # Init without --migrate
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name no-migrate-test --targets github claude -y
+
+          # Verify base files exist
+          test -f promptscript.yaml
+          test -f .promptscript/project.prs
+
+          # Verify PromptScript skill is always installed (fresh start installs skill)
+          test -f .promptscript/skills/promptscript/SKILL.md
+
+      - name: Smoke test - all targets compilation
+        run: |
+          mkdir -p /tmp/test-all-targets
+          cd /tmp/test-all-targets
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name all-targets --targets github claude cursor antigravity -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile
+
+          # Verify all target outputs exist
+          test -f .github/copilot-instructions.md
+          test -f CLAUDE.md
+          test -f .cursor/rules/project.mdc
+          test -f .agent/rules/project.md
+
+      - name: Smoke test - validate with --strict flag
+        run: |
+          mkdir -p /tmp/test-strict
+          cd /tmp/test-strict
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name strict-test --targets github -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js validate --strict
+
+      - name: Smoke test - diff command
+        run: |
+          mkdir -p /tmp/test-diff
+          cd /tmp/test-diff
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name diff-test --targets github -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile
+
+          # Modify source and check diff
+          echo '# Extra content' >> .promptscript/project.prs
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js diff || true
+
+      - name: Smoke test - check command
+        run: |
+          mkdir -p /tmp/test-check
+          cd /tmp/test-check
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name check-test --targets github -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js check
+
+      - name: Smoke test - update-check command
+        run: |
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js update-check || true
+
+      - name: Smoke test - verbose and quiet flags
+        run: |
+          mkdir -p /tmp/test-flags
+          cd /tmp/test-flags
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name flags-test --targets github -y
+
+          # Test verbose
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js validate --verbose
+
+          # Test quiet
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile --quiet
+
+      - name: Smoke test - pull command (registry)
+        run: |
+          mkdir -p /tmp/test-pull
+          cd /tmp/test-pull
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name pull-test --targets github -y
+
+          # Pull should work (downloads registry)
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js pull || echo "Pull completed or registry not configured"
+
+      - name: Smoke test - registry init and validate
+        run: |
+          mkdir -p /tmp/test-registry-init
+          cd /tmp/test-registry-init
+
+          # Initialize a new registry with defaults
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js registry init my-registry -y
+
+          # Verify scaffold structure
+          test -f my-registry/registry-manifest.yaml
+          test -f my-registry/README.md
+          test -f my-registry/.gitignore
+          test -f my-registry/@core/base.prs
+          test -f my-registry/@core/quality.prs
+          test -f my-registry/@core/security.prs
+          test -f my-registry/@stacks/.gitkeep
+          test -f my-registry/@fragments/.gitkeep
+
+          # Validate the scaffolded registry
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js registry validate my-registry
+
+          # Validate with --format json
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js registry validate my-registry --format json | grep '"valid": true'
+
+      - name: Smoke test - registry init --no-seed
+        run: |
+          mkdir -p /tmp/test-registry-noseed
+          cd /tmp/test-registry-noseed
+
+          # Initialize without seed configs
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js registry init bare-registry -y --no-seed
+
+          # @core should have .gitkeep instead of seed files
+          test -f bare-registry/@core/.gitkeep
+          test ! -f bare-registry/@core/base.prs
+
+      - name: Smoke test - registry list command
+        run: |
+          mkdir -p /tmp/test-reg-list
+          cd /tmp/test-reg-list
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name reg-list-test --targets github -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js registry list
+
+      - name: Smoke test - registry add command
+        run: |
+          mkdir -p /tmp/test-reg-add
+          cd /tmp/test-reg-add
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name reg-add-test --targets github -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js registry add @company github.com/acme/promptscript-registry
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js registry list | grep -q company
+
+      - name: Smoke test - lock command (no remote imports)
+        run: |
+          mkdir -p /tmp/test-lock
+          cd /tmp/test-lock
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name lock-test --targets github -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js lock
+
+      - name: Smoke test - update command (no remote imports)
+        run: |
+          mkdir -p /tmp/test-update
+          cd /tmp/test-update
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name update-test --targets github -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js update || true
+
+      - name: Smoke test - vendor check (no lockfile)
+        run: |
+          mkdir -p /tmp/test-vendor
+          cd /tmp/test-vendor
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name vendor-test --targets github -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js vendor check || true
+
+      - name: Smoke test - resolve command
+        run: |
+          mkdir -p /tmp/test-resolve
+          cd /tmp/test-resolve
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name resolve-test --targets github -y
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js resolve @company/base 2>&1 || true
+
+      - name: Smoke test - compile with watch disabled
+        run: |
+          mkdir -p /tmp/test-watch
+          cd /tmp/test-watch
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js init --name watch-test --targets github claude -y
+
+          # Compile without watch (default)
+          timeout 5 node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile || true
+          test -f .github/copilot-instructions.md
+          test -f CLAUDE.md
+
+      - name: Smoke test - template interpolation
+        run: |
+          mkdir -p /tmp/test-templates/.promptscript
+          cd /tmp/test-templates
+
+          # Create template file with params (heredoc content must not be indented)
+          cat > .promptscript/base-template.prs << 'EOF'
+          @meta {
+            id: "base-template"
+            syntax: "1.0.0"
+            params: {
+              projectName: string
+              framework: string = "react"
+            }
+          }
+
+          @identity {
+            """
+            You are working on {{projectName}}.
+            Framework: {{framework}}
+            Follow {{framework}} best practices.
+            """
+          }
+          EOF
+
+          # Create child file that uses template
+          cat > .promptscript/project.prs << 'EOF'
+          @meta {
+            id: "my-project"
+            syntax: "1.0.0"
+          }
+
+          @inherit ./base-template(projectName: "smoke-test-app", framework: "vue")
+
+          @context {
+            """
+            Additional context for the project.
+            """
+          }
+          EOF
+
+          # Create config
+          cat > promptscript.yaml << 'EOF'
+          version: "1.0"
+          project:
+            name: template-test
+          targets:
+            - github
+            - claude
+          EOF
+
+          # Remove leading whitespace from files (heredoc preserves indentation)
+          # Use temp file approach for cross-platform compatibility
+          for f in .promptscript/*.prs promptscript.yaml; do
+            sed 's/^          //' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          done
+
+          # Compile
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js validate
+          node $GITHUB_WORKSPACE/cli-package/bin/prs.js compile
+
+          # Verify output files exist
+          test -f .github/copilot-instructions.md
+          test -f CLAUDE.md
+
+          # Verify interpolation happened (values substituted)
+          grep -q "smoke-test-app" CLAUDE.md
+          grep -q "vue" CLAUDE.md
+          grep -q "Follow vue best practices" CLAUDE.md
+
+          # Verify NO template syntax remains in output
+          if grep -q "{{projectName}}" CLAUDE.md; then
+            echo "::error::Template variable {{projectName}} was not interpolated"
+            exit 1
+          fi
+          if grep -q "{{framework}}" CLAUDE.md; then
+            echo "::error::Template variable {{framework}} was not interpolated"
+            exit 1
+          fi
+
+          echo "Template interpolation working correctly"
+
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: typescript
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v5
+        with:
+          allow-ghsas: GHSA-48c2-rrv3-qjmp, GHSA-fv7c-fp4j-7gwp, GHSA-q3j6-qgpj-74h6, GHSA-v39h-62p7-jpjc
+
+  docker-build:
+    name: Docker Build & Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: promptscript:ci-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: promptscript:ci-test
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Smoke test Docker image
+        run: |
+          # Test --version
+          VERSION=$(docker run --rm promptscript:ci-test --version)
+          echo "CLI version: $VERSION"
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION"
+            exit 1
+          fi
+
+          # Test --help
+          docker run --rm promptscript:ci-test --help | grep -q "prs"
+
+          # Test init + compile
+          mkdir -p /tmp/docker-test
+          chmod 777 /tmp/docker-test
+          cd /tmp/docker-test
+          docker run --rm -v "$(pwd):/workspace" promptscript:ci-test init --name test --targets github -y
+          docker run --rm -v "$(pwd):/workspace" promptscript:ci-test validate
+          docker run --rm -v "$(pwd):/workspace" promptscript:ci-test compile
+          test -f .github/copilot-instructions.md
+          echo "Docker smoke test passed"

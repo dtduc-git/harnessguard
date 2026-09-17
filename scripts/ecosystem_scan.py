@@ -26,6 +26,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,7 @@ QUERIES: list[str] = [
 MAX_FILE_BYTES = 200_000
 SEARCH_SLEEP_SECONDS = 7.0
 FETCH_SLEEP_SECONDS = 0.05
+FETCH_WORKERS = 8
 OWN_REPO = "dtduc-git/harnessguard"
 PASS1_RAW = Path("research/data/raw.json")
 SECTION_START = "<!-- pass4-scan:start -->"
@@ -414,16 +416,20 @@ def main() -> None:
     parsed_paths: list[Path] = []
     pairs: list[tuple[dict[str, Any], Path]] = []
     failures = 0
-    for index, item in enumerate(selected):
-        text = fetch_raw(item)
-        time.sleep(FETCH_SLEEP_SECONDS)
-        if text is None:
-            failures += 1
-            continue
-        local_path = downloads_dir / f"{index:04d}.yml"
-        local_path.write_text(text, encoding="utf-8")
-        parsed_paths.append(local_path)
-        pairs.append((item, local_path))
+
+    def download(job: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any], str | None]:
+        index, item = job
+        return index, item, fetch_raw(item)
+
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        for index, item, text in pool.map(download, enumerate(selected)):
+            if text is None:
+                failures += 1
+                continue
+            local_path = downloads_dir / f"{index:04d}.yml"
+            local_path.write_text(text, encoding="utf-8")
+            parsed_paths.append(local_path)
+            pairs.append((item, local_path))
 
     print(f"downloaded: {len(parsed_paths)} / {len(selected)}", file=sys.stderr)
 

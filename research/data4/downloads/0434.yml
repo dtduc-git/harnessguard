@@ -1,0 +1,57 @@
+name: Qwen PR Review
+on:
+  pull_request:
+    types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+      comment:
+        description: 'Review instruction'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Qwen Code
+        uses: qwenlm/qwen-code-action@main
+        with:
+          qwen_api_key: ${{ secrets.QWEN_API_KEY }}
+          prompt: |
+            You are reviewing a pull request for arifos-lab — an APEX-ZEN governance laboratory.
+            Review the diff for:
+            1. Correctness — does the code do what it claims?
+            2. Security — any secrets, injection, or unsafe patterns?
+            3. Governance — does it respect the authority model (no self-escalation, no unauthorized remote writes)?
+            4. Tests — are changes covered?
+            5. Evidence — would this pass the adversarial test suite?
+
+            Be concise. Flag issues by severity: CRITICAL / WARNING / INFO.
+            End with: APPROVE, REQUEST_CHANGES, or COMMENT.
+
+      - name: Post Review
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = process.env.QWEN_SUMMARY || 'Review completed';
+            const pr = context.payload.pull_request?.number || ${{ inputs.pr_number || 0 }};
+            if (pr) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr,
+                body: `## 🔍 Qwen Code Review\n\n${summary}`
+              });
+            }

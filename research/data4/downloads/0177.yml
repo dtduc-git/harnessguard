@@ -1,0 +1,161 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - feature/**
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify
+        run: make verify
+
+  spec-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install spec dependencies
+        run: pip install -r spec/requirements.txt
+      - name: Validate spec examples
+        run: cd spec && python3 scripts/validate_examples.py
+
+  conformance-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install conformance dependencies
+        run: pip install -r conformance/requirements.txt
+      - name: Run conformance checks
+        run: cd conformance && python3 scripts/run_conformance.py --schema-root ../spec/schemas
+
+  product-test-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Product-test smoke (validate infra configs)
+        run: make product-test-smoke
+
+  product-test-fleet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run reproducible fleet matrix lanes
+        run: make product-test-fleet
+      - name: Upload fleet artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-test-fleet-artifacts
+          path: /tmp/open-cli-fleet
+          if-no-files-found: error
+
+  product-test-fleet-mcp-remote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run MCP remote fleet lane
+        run: make product-test-fleet-mcp-remote
+      - name: Upload MCP remote fleet artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-test-fleet-mcp-remote-artifacts
+          path: /tmp/open-cli-fleet
+          if-no-files-found: warn
+
+  product-test-website-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run website review campaign
+        run: make product-test-website-review
+
+  product-test-authentik:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run Authentik reference product test
+        run: cd product-tests && make test-runtime-auth-authentik
+
+  docs-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install docs dependencies
+        run: npm ci
+      - name: Typecheck docs site
+        run: npm run typecheck
+      - name: Build docs site
+        run: npm run build
+
+  admin-build-lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: admin/package-lock.json
+      - name: Install admin dependencies
+        run: npm ci
+      - name: Lint admin app
+        run: npm run lint
+      - name: Build admin app
+        run: npm run build

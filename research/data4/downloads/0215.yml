@@ -1,0 +1,1734 @@
+name: Fast Feedback (<5 min)
+
+# Lightweight pre-check that gates every PR in under 5 minutes.
+# Runs parallel jobs covering lint, type-check, shell validation, schema drift,
+# and non-Swift unit tests so agents get actionable signal before the 45-min
+# macOS build completes.
+#
+# This workflow is the PRIMARY CI feedback signal for PRs.
+# The full macOS build (openburnbar-pr-harness.yml) provides deeper coverage
+# but is not suited to fast iteration loops.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  merge_group:
+    branches: [main]
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: fast-feedback-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # `npm ci` audits every install by default, which makes each install block on
+  # the npm advisory endpoint. That endpoint has outages (2026-09-04: every Node
+  # job in this workflow timed out inside `npm ci`), and it is not what these
+  # jobs exist to check: the dedicated npm-audit job in security-pr.yml owns
+  # that verdict and still runs `npm audit` explicitly. Installs stay offline
+  # from the advisory service; the audit gate keeps its own timeout budget.
+  NPM_CONFIG_AUDIT: "false"
+  NPM_CONFIG_FUND: "false"
+
+jobs:
+  classify:
+    uses: ./.github/workflows/ci-impact.yml
+
+  # ── Vendor binary integrity ───────────────────────────────────────────────
+  # This is deliberately a small always-on job: the manifest covers only the
+  # tracked Vendor AARs, so it completes in seconds and exercises the same
+  # verification path used by the local tamper test.
+  vendor-checksums:
+    name: Vendor binary checksums
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - name: Verify Vendor binary checksums
+        run: bash scripts/supply-chain/verify-vendor-checksums.sh
+
+      - name: Vendor checksum manifest controls
+        run: bash scripts/supply-chain/verify-vendor-checksums.test.sh
+
+      - name: Verify supply-chain provenance documentation matrix
+        run: node --test scripts/ci/verify-supply-chain-doc-matrix.test.mjs
+
+  # ── Functions: lint + typecheck + unit tests ──────────────────────────────
+  functions-fast:
+    name: Functions (lint + types + unit tests)
+    needs: classify
+    if: needs.classify.outputs.functions == 'true'
+    runs-on: ubuntu-latest
+    # 15 rather than 10: the job's own work takes ~3 min, but this job hit the
+    # same slow-fetch pathology as functions-correctness (see its comment
+    # below): actions/checkout alone took 8m30s+ on two consecutive
+    # pull_request attempts on run 31023061437 (most sibling jobs fetched the
+    # same commit in <30s), leaving vitest under a minute before the 10-minute
+    # cap cancelled it. The work is unchanged; only the fetch is slow.
+    # 2026-09-03/04 npm registry degradation: this job was killed at its
+    # hard cap with clean partial output (see PR #2507 CI history), so a
+    # slow registry was reported as a job failure. 30m rides out the
+    # degradation; the gate itself is unchanged.
+    timeout-minutes: 30
+    steps:
+      # This job only reads the worktree, so history is unnecessary weight.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      - name: Install functions dependencies
+        run: npm ci --prefix functions
+
+      - name: Build Signal envelope contracts
+        run: bash scripts/build-signal-envelope-contracts.sh
+
+      - name: Build entitlements contracts
+        run: bash scripts/build-entitlements.sh
+
+      # Catalog contract tests + firestore.rules drift gate: the three rules
+      # entitlement allowlists are GENERATED from packages/entitlements
+      # (tools/gen-rules-entitlements.mjs); fail red if firestore.rules
+      # diverges from a regenerate or the catalog drifts from its fixture.
+      - name: Entitlement catalog tests (node --test)
+        run: node --test packages/entitlements/lib/
+
+      - name: firestore.rules entitlement allowlists are generated (no drift)
+        run: node tools/gen-rules-entitlements.mjs --check
+
+      - name: TypeScript type check
+        run: cd functions && npx tsc --noEmit
+
+      - name: ESLint
+        run: npm run lint --prefix functions
+
+      - name: Unit tests (vitest)
+        run: npm run test:unit --prefix functions
+
+      - name: Callable input validation ratchet
+        run: |
+          node --test scripts/ci/check-callable-validation.test.mjs
+          node scripts/ci/check-callable-validation.mjs
+
+      - name: Guard parser regressions (test-guards.mjs)
+        run: npm run test:guards --prefix functions
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### Functions Fast Check"
+            echo "- TypeScript: ✓"
+            echo "- ESLint: ✓"
+            echo "- Unit tests: ✓"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Extension: lint + typecheck + unit tests ─────────────────────────────
+  extension-fast:
+    name: Extension (lint + types + unit tests)
+    needs: classify
+    if: needs.classify.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: extensions/openburnbar/package-lock.json
+
+      - name: Install extension dependencies
+        run: npm ci --prefix extensions/openburnbar
+
+      - name: TypeScript type check
+        run: cd extensions/openburnbar && npx tsc --noEmit
+
+      - name: ESLint
+        run: npm run lint --prefix extensions/openburnbar
+
+      - name: Unit tests (vitest)
+        run: npm run test --prefix extensions/openburnbar
+
+  # ── Safari web extension: the full self-contained npm gate ───────────────
+  # This project builds extensions/safari/dist, which the OpenBurnBarSafariExtension
+  # appex embeds verbatim, so it rides the macos lane (see classify-ci-impact.mjs).
+  # `test:ci` is the project's own door: typecheck (including the no-DOM
+  # background service-worker config), lint, format, knip, dependency-cruiser,
+  # vitest coverage, build, and size-limit.
+  safari-extension-fast:
+    name: Safari extension (types + lint + tests + build)
+    needs: classify
+    if: needs.classify.outputs.macos == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: extensions/safari/package-lock.json
+
+      - name: Install Safari extension dependencies
+        run: npm ci --prefix extensions/safari
+
+      - name: Full check suite (types, lint, knip, deps, tests, build, size)
+        run: npm run test:ci --prefix extensions/safari
+
+      # The committed dist/ is the appex payload. If a source change lands
+      # without its rebuilt bundle, the shipped extension silently diverges
+      # from the reviewed source, so require the tree to be reproducible.
+      - name: Committed dist must match a clean rebuild
+        run: |
+          set -euo pipefail
+          # --porcelain reports modified AND untracked paths, so this catches a
+          # stale bundle and a newly emitted asset that was never committed.
+          if [ -n "$(git status --porcelain -- extensions/safari/dist)" ]; then
+            git status --porcelain -- extensions/safari/dist >&2
+            git diff -- extensions/safari/dist >&2 || true
+            echo "::error::extensions/safari/dist does not match a clean rebuild — run 'npm run build' in extensions/safari and commit the result." >&2
+            exit 1
+          fi
+          echo "dist/ reproduces byte-for-byte from source."
+
+      # The MV3 background runs as a service worker where `window` does not
+      # exist. tsconfig.background.json is the compile-time guard; this is the
+      # belt-and-braces check on the actual shipped bundle (BurnBar PR #2283,
+      # where window.setTimeout truncated every streamed Ask answer).
+      - name: Background bundle must not reference window
+        run: |
+          set -euo pipefail
+          count="$(grep -c 'window\.' extensions/safari/dist/background.js || true)"
+          if [ "$count" != "0" ]; then
+            echo "::error::extensions/safari/dist/background.js has ${count} window.* references; the MV3 service worker has no window." >&2
+            grep -n -o 'window\.[A-Za-z_$]*' extensions/safari/dist/background.js | head -20 >&2
+            exit 1
+          fi
+          echo "background.js has zero window.* references."
+
+  # ── Diff coverage: changed TypeScript lines must be ≥80% covered ──────────
+  # Re-armed diff-coverage gate for the TS surface (functions + extension),
+  # where vitest + @vitest/coverage-v8 already run. It computes REAL per-line
+  # coverage from the v8/istanbul coverage-final.json and intersects it with
+  # the added runtime lines of `git diff origin/main HEAD` — NOT test-file
+  # presence. Presence-based carve-outs are exactly the anti-pattern that let
+  # PR #303 flip a 3.2% red check green (DILIGENCE_REPORT_2026-06-11 §5.1,
+  # finding CG-1); scripts/diff-coverage-ts.sh fails closed on missing per-line
+  # evidence and has no presence fallback.
+  #
+  # The check-run name is "diff-coverage (PR)" to match the parked context in
+  # governance/branch-protection.main.json (_pending_required_status_checks).
+  # This job EMITS that context on every PR; promoting it to a REQUIRED check
+  # is a separate, operator-only branch-protection change (see that file and
+  # governance/README.md § "The diff-coverage (PR) placeholder").
+  #
+  # This is a standalone context — intentionally NOT in the Fast Feedback Gate
+  # aggregate's needs: — so it can be promoted to required independently
+  # without silently gating merges through the already-required aggregate
+  # before the operator flips it on.
+  #
+  # TS changes are detected first so Swift-only / docs-only PRs report a fast
+  # pass (the parked context still resolves on every PR — required-safe — but
+  # pays no vitest cost when no functions/extension TS changed).
+  diff-coverage-ts:
+    name: diff-coverage (PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          # Full history so `git diff origin/main HEAD` sees the true merge base
+          # for changed-line detection (a shallow clone truncates it).
+          fetch-depth: 0
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            functions/package-lock.json
+            extensions/openburnbar/package-lock.json
+
+      - name: Resolve diff base (origin/main)
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+
+      # Positive control: prove the gate still fails on uncovered changed lines
+      # and rejects stale evidence before trusting its verdict on the real diff.
+      - name: Self-test the diff-coverage gate
+        run: bash scripts/diff-coverage-ts-self-test.sh
+
+      - name: Detect changed TypeScript surfaces
+        id: ts
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only origin/main HEAD -- \
+            'functions/src/**/*.ts' \
+            'extensions/openburnbar/src/**/*.ts' \
+            2>/dev/null || true)"
+          if [ -n "$changed" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Changed TypeScript files:"
+            echo "$changed"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No functions/extension TypeScript changed — diff coverage is vacuously satisfied."
+          fi
+
+      # Only install + run vitest coverage when the surface actually changed.
+      # diff-coverage-ts.sh installs missing package deps itself, but doing it
+      # here keeps the coverage run cached and lets the functions contract build
+      # (prebuild dependency) run once, up front.
+      - name: Install functions dependencies
+        if: steps.ts.outputs.changed == 'true'
+        run: npm ci --prefix functions
+
+      - name: Install extension dependencies
+        if: steps.ts.outputs.changed == 'true'
+        run: npm ci --prefix extensions/openburnbar
+
+      - name: Build Signal envelope contracts
+        if: steps.ts.outputs.changed == 'true'
+        run: bash scripts/build-signal-envelope-contracts.sh
+
+      - name: Build entitlements contracts
+        if: steps.ts.outputs.changed == 'true'
+        run: bash scripts/build-entitlements.sh
+
+      - name: Compute TypeScript diff coverage (≥80% of changed lines)
+        env:
+          COVERAGE_THRESHOLD: "80"
+          DIFF_COVERAGE_OUTPUT: ${{ github.workspace }}/ts-diff-coverage.json
+        run: |
+          set -euo pipefail
+          ./scripts/diff-coverage-ts.sh origin/main
+
+      - name: Post diff-coverage summary
+        if: always()
+        run: |
+          {
+            echo "### TypeScript diff coverage"
+            echo ""
+            if [ "${{ steps.ts.outputs.changed }}" != "true" ]; then
+              echo "No functions/extension TypeScript changed — gate vacuously satisfied."
+            elif [ -f ts-diff-coverage.json ]; then
+              threshold=$(jq -r '.diffCoverage.threshold // 80' ts-diff-coverage.json)
+              percent=$(jq -r '.diffCoverage.percent // 0.0' ts-diff-coverage.json)
+              passed=$(jq -r '.diffCoverage.passed // false' ts-diff-coverage.json)
+              method=$(jq -r '.diffCoverage.method // "n/a"' ts-diff-coverage.json)
+              lines=$(jq -r '.diffCoverage.changedLines // 0' ts-diff-coverage.json)
+              echo "Diff coverage: **${percent}%** (threshold: ${threshold}%, method: ${method})"
+              echo "Changed executable lines gated: ${lines}"
+              if [ "$passed" = "true" ]; then echo "Status: passed"; else echo "Status: failed — new TypeScript below threshold"; fi
+              echo ""
+              echo "| File | Executable | Covered | % |"
+              echo "|------|-----------|---------|---|"
+              jq -r '.details[]? | "| \(.file) | \(.executableLines) | \(.coveredLines) | \(.percent) |"' ts-diff-coverage.json | head -50
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diff-coverage verdict
+        if: always() && steps.ts.outputs.changed == 'true' && !env.ACT
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0 (node24-native)
+        with:
+          name: ts-diff-coverage
+          path: ts-diff-coverage.json
+
+  # ── Website: typecheck + lint ─────────────────────────────────────────────
+  website-fast:
+    name: Website (types + lint + format)
+    needs: classify
+    if: needs.classify.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install website dependencies
+        run: npm ci --prefix website
+
+      - name: Astro type check
+        run: npm run check --prefix website
+
+      - name: Prettier format check
+        run: npm run format:check --prefix website
+
+      - name: Link attestation source contract
+        run: npm run test:link-attestation --prefix website
+
+  # ── OpenBurnBar Cursor Marketplace plugin: fail-closed structural gate ────
+  # Dedicated job (not folded into website-fast / extension-fast) so a
+  # plugin-only diff still gets the package validator on the cheap web lane.
+  # The plugin tree has NO package.json (that would force full CI), so this
+  # job runs `node plugins/openburnbar/scripts/validate.mjs` directly — no
+  # npm ci, no lockfile cache — and stays under the fast-feedback budget.
+  plugin-fast:
+    name: OpenBurnBar plugin (validate.mjs)
+    needs: classify
+    if: needs.classify.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      - name: Validate Cursor marketplace plugin package
+        run: node plugins/openburnbar/scripts/validate.mjs
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### OpenBurnBar plugin package check"
+            echo "- validate.mjs: node stdlib only, no package.json, no npm ci"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── TypeScript package surfaces: ESLint + typecheck floors ───────────────
+  typescript-surfaces-lint:
+    name: TypeScript package lint floors
+    runs-on: ubuntu-latest
+    # 2026-09-03/04 npm registry degradation: this job was killed at its
+    # hard cap with clean partial output (see PR #2507 CI history), so a
+    # slow registry was reported as a job failure. 30m rides out the
+    # degradation; the gate itself is unchanged.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            services/hermes-realtime-relay/package-lock.json
+            services/hosted-mcp/package-lock.json
+            tools/openburnbar-mcp-remote/package-lock.json
+            packages/libsignal-bridge/package-lock.json
+            packages/libsignal-protocol/package-lock.json
+            packages/signal-envelope-contracts/package-lock.json
+            apps/linux-desktop/package-lock.json
+
+      - name: Install TypeScript package dependencies
+        run: |
+          set -euo pipefail
+          for dir in \
+            services/hermes-realtime-relay \
+            services/hosted-mcp \
+            tools/openburnbar-mcp-remote \
+            packages/libsignal-bridge \
+            packages/libsignal-protocol \
+            packages/signal-envelope-contracts \
+            apps/linux-desktop
+          do
+            echo "::group::npm ci --prefix ${dir}"
+            npm ci --prefix "${dir}"
+            echo "::endgroup::"
+          done
+
+      - name: ESLint + typecheck package floors
+        run: |
+          set -euo pipefail
+          for dir in \
+            services/hermes-realtime-relay \
+            services/hosted-mcp \
+            tools/openburnbar-mcp-remote \
+            packages/libsignal-protocol \
+            packages/signal-envelope-contracts \
+            apps/linux-desktop
+          do
+            echo "::group::npm run lint --prefix ${dir}"
+            npm run lint --prefix "${dir}"
+            echo "::endgroup::"
+          done
+
+      - name: Linux desktop TypeScript typecheck floor
+        run: npm run typecheck --prefix apps/linux-desktop
+
+  # ── Shell scripts: syntax validation ────────────────────────────────────
+  sqlite-schema-doc:
+    name: SQLite schema doc drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          filter: blob:none
+          # Directory-level pins (not file pins) so split/renamed migration
+          # files and the AgentLens↔OpenBurnBarData byte-identical mirror
+          # pairs stay visible. File pins missed
+          # OpenBurnBarDatabase+MemoryMigrations.swift after it landed in
+          # OpenBurnBarData (ENOENT on the mirror-pair check).
+          sparse-checkout: |
+            AgentLens/Services/DataStore
+            OpenBurnBarCore/Sources/OpenBurnBarData
+            OpenBurnBarDaemon/Sources/OpenBurnBarDaemon/ProjectCodeMemory
+            docs/SCHEMA_SQLITE.sql
+            scripts/ci/verify-sqlite-schema-doc.mjs
+            tools/openburnbar-mcp/project_code_memory.py
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      - name: Verify SQLite schema doc covers migration sources
+        run: node scripts/ci/verify-sqlite-schema-doc.mjs
+
+  migrator-parity:
+    name: Swift↔Windows↔Linux migrator parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          filter: blob:none
+          # Directory-level pins (not file pins) so file renames inside these
+          # trees do not break the sparse checkout; the script itself fails
+          # loudly if an expected file disappears.
+          sparse-checkout: |
+            OpenBurnBarCore/Sources/OpenBurnBarData
+            OpenBurnBarCore/Tests/OpenBurnBarDataTests
+            AgentLens/Services/DataStore
+            AgentLensTests/Fixtures/DBByteCompat
+            windows/storage/OpenBurnBar.Storage
+            scripts/linux-port
+            scripts
+            budgets
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      # Extracts the ordered migration identifiers + endpoint schema surface
+      # (tables/columns/indexes/triggers + FTS5 config incl. the standalone
+      # conversations_fts ftsRowid trigger contract) from the canonical Swift
+      # migrator and asserts the AgentLens copy, the Windows port's
+      # windows-migration-journal + SchemaStatements, and the Linux pins all
+      # match — or are explicitly annotated in budgets/migrator-parity-baseline.json.
+      - name: Migrator parity unit + golden tests
+        run: node --test scripts/check-migrator-parity.test.mjs
+
+      - name: Swift↔Windows↔Linux migrator parity ratchet
+        run: node scripts/check-migrator-parity.mjs
+
+  sqlcipher-codec-policy:
+    name: SQLCipher codec policy
+    runs-on: ubuntu-latest
+    # Checkout can consume 6-7 minutes during GitHub fetch degradation (observed
+    # Aug 2026); leave enough time for the required policy check to run afterward.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - name: Verify SQLCipher codec wiring policy
+        run: bash scripts/ci/verify-sqlcipher-codec.sh
+
+  agpl-compliance:
+    name: AGPL compliance
+    runs-on: ubuntu-latest
+    # 3 minutes started timing out as the tree grew (checkout + verify ran
+    # 2m18s-3m15s in July 2026), and GitHub fetch degradation pushed checkout
+    # alone to 6-7 minutes in Aug 2026; job timeout reports as "cancelled" in
+    # the UI.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      - name: Verify license metadata, libsignal pin, and source offer
+        run: |
+          bash scripts/ci/verify-agpl-compliance-self-test.sh
+          bash scripts/ci/verify-agpl-compliance.sh
+
+  # ── Signal crypto proof: package load + envelope harness ─────────────────
+  libsignal-bridge:
+    name: Signal crypto proof
+    runs-on: ubuntu-latest
+    # 2026-09-03/04 npm registry degradation: this job was killed at its
+    # hard cap with clean partial output (see PR #2507 CI history), so a
+    # slow registry was reported as a job failure. 30m rides out the
+    # degradation; the gate itself is unchanged.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            packages/libsignal-bridge/package-lock.json
+            packages/libsignal-protocol/package-lock.json
+            packages/signal-envelope-contracts/package-lock.json
+
+      - name: Install libsignal bridge dependencies
+        run: npm ci --prefix packages/libsignal-bridge
+
+      - name: Install Signal envelope contract dependencies
+        run: npm ci --prefix packages/signal-envelope-contracts
+
+      - name: Install libsignal protocol dependencies
+        run: npm ci --prefix packages/libsignal-protocol
+
+      - name: Test official libsignal bridge
+        run: npm test --prefix packages/libsignal-bridge
+
+      - name: Run Signal envelope crypto proof harness
+        run: node scripts/ci/crypto-proof-harness.mjs
+
+      # ADR-001 §7.2: the committed CryptoKit ⇄ libsignal at-rest interop
+      # vectors must keep opening. This (Linux) leg verifies the libsignal
+      # side + tamper fail-closed; the CryptoKit side runs in
+      # CryptoKitAtRestInteropTests.swift on the macOS PR harness.
+      - name: Verify committed CryptoKit-libsignal interop vectors
+        run: node scripts/ci/generate-cryptokit-interop-vector.mjs
+
+  # ── Shell scripts: syntax validation ────────────────────────────────────
+  shell-syntax:
+    name: Shell syntax validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - name: Runbook topology guard
+        run: |
+          set -euo pipefail
+          node scripts/ci/check-runbook-topology.mjs
+          # Negative controls: the guard must reject its own fixtures (exit 1).
+          for fixture in bad-project-id bad-firebaserc; do
+            if node scripts/ci/check-runbook-topology.mjs --fixture "$fixture"; then
+              echo "::error::runbook topology guard accepted the $fixture fixture"
+              exit 1
+            fi
+          done
+
+      - name: Validate all shell scripts
+        run: |
+          set -euo pipefail
+          ERRORS=0
+          while IFS= read -r -d '' script; do
+            if ! bash -n "$script"; then
+              echo "::error file=${script}::Shell syntax error in ${script}"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done < <(find scripts/ -name '*.sh' -print0 2>/dev/null)
+          if [[ $ERRORS -gt 0 ]]; then
+            echo "::error::${ERRORS} shell script(s) have syntax errors."
+            exit 1
+          fi
+          echo "All shell scripts pass syntax validation."
+          node scripts/ci/verify-cross-platform-ios-runner.test.mjs
+
+      - name: Test SwiftPM lock retry isolation
+        run: bash scripts/ci/check-openburnbar-app-swiftpm-lock.test.sh
+
+      - name: Release config injection safety tests
+        run: |
+          set -euo pipefail
+          bash scripts/ci/sentry_dsn.test.sh
+          bash scripts/ci/inject-sentry-config-ios.test.sh
+          bash scripts/ci/inject-sentry-config-android.test.sh
+          bash scripts/ci/inject-firebase-config.test.sh
+          bash scripts/ci/verify-apple-release-firebase-config.test.sh
+          bash scripts/ci/inject-sentry-config-extension.test.sh
+          bash scripts/ci/verify-windows-release-signing-preflight.test.sh
+          bash scripts/ci/verify-iroh-release-artifact.test.sh
+
+      - name: Install ShellCheck
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+        run: |
+          set -euo pipefail
+          archive="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          # github.com/*/releases/download intermittently answers 504 under load,
+          # which failed this gate on the FIRST and only attempt. --retry alone
+          # does not cover HTTP error responses on every curl build, so pair it
+          # with --retry-all-errors. The SHA256 check below still pins the bits.
+          curl -fsSLO \
+            --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 15 \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${archive}"
+          printf '%s  %s\n' "${SHELLCHECK_SHA256}" "${archive}" | sha256sum -c -
+          tar -xJf "${archive}"
+          sudo install -m 0755 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      - name: ShellCheck
+        run: ./scripts/ci/run-shellcheck.sh
+
+      - name: Remote Config credential argv safety tests
+        run: bash scripts/cutover-n0-hosted-relay.test.sh
+
+      - name: Source rollback target safety tests
+        run: bash scripts/rollback.test.sh
+
+      - name: Revision rollback safety tests
+        run: bash scripts/ops/rollback-revision.test.sh
+
+      - name: macOS appcast rollback safety tests
+        run: bash scripts/ops/rollback-macos-appcast.test.sh
+
+      - name: Local agent config symlink guard
+        run: |
+          bash scripts/ci/verify-no-local-agent-config-symlinks.test.sh
+          bash scripts/ci/verify-no-local-agent-config-symlinks.sh
+
+      - name: Dev macOS tmux launcher boundary
+        run: bash scripts/ci/verify-dev-mac-tmux-boundary.sh
+
+  # ── Python scripts: Ruff defect floor + formatter gate ───────────────────
+  python-lint:
+    name: Python lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ruff
+        run: python -m pip install ruff==0.15.17
+
+      - name: Ruff check
+        run: ruff check scripts tools/openburnbar-mcp
+
+      - name: Ruff format check
+        run: ruff format --check scripts tools/openburnbar-mcp
+
+  # ── Schema sync drift check ───────────────────────────────────────────────
+  schema-drift:
+    name: Schema sync drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: tools/schema-sync/package-lock.json
+
+      - name: Install schema-sync toolchain (@typespec/compiler)
+        run: npm --prefix tools/schema-sync ci
+
+      # check-drift.sh also compiles the TypeSpec canon and asserts the
+      # compiled model set matches the emitted generated interfaces
+      # (tools/schema-sync/check-tsp-canon.mjs), so the canon cannot rot.
+      - name: Check schema sync drift + TypeSpec canon
+        run: ./tools/schema-sync/check-drift.sh
+
+  # ── Wiki / Pensieve verbatim chunker parity ──────────────────────────────
+  chunker-parity:
+    name: Verbatim chunker parity (wiki + Pensieve)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      # Proves scripts/lib/verbatim-chunker.mjs still reproduces every committed
+      # droid-wiki chunk byte-identically (zero-write reconcile). The same chunker
+      # powers per-member Pensieve ingestion, so drift here would silently change
+      # both the maintainer mem0 mirror and members' encrypted knowledge.
+      - name: Chunker golden + unit tests
+        run: node --test scripts/lib/verbatim-chunker.test.mjs
+
+      - name: Maintainer mem0 reconcile is a no-op
+        run: |
+          node scripts/wiki/mem0-sync.mjs --all --dry-run | tee /tmp/reconcile.log
+          grep -q "already in sync - zero writes" /tmp/reconcile.log
+
+  # ── Prime Agent gateway proxy auth contract ───────────────────────────────
+  prime-agent-proxy-auth:
+    name: Prime Agent proxy token resolution
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      # Non-interactive shells (SSH, CI, subagents) cannot prompt the macOS
+      # Keychain, so the emitted apiKey resolver must check
+      # $OPENBURNBAR_GATEWAY_AUTH_TOKEN before plist/keychain lookups and land
+      # on the harmless placeholder otherwise. Also locks the --token/--api-key
+      # static-embedding contract and proves credential material never reaches
+      # stdout. The resolver string is executed under a real POSIX sh in the
+      # env-first and headless-fallback shapes.
+      - name: Prime Agent proxy token-resolution tests
+        run: node --test scripts/prime-agent-openburnbar-proxy.test.mjs
+
+  # ── Control Center foundations (data-domain registry + design tokens) ──────
+  control-center-foundations:
+    name: Control Center foundations (registry + tokens)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      # Registry validation + codegen freshness + firestore.rules drift check:
+      # every users/{uid}/ collection must be registered or explicitly excluded.
+      - name: Data-domain registry (codegen + drift)
+        run: cd packages/data-domains && node codegen.mjs && node driftcheck.mjs && node --test
+
+      # Hermes/iroh wire protocol: ONE canonical protocol.json -> generated TS
+      # (consumed by the relay) + Swift/Kotlin/Rust references, plus a parity gate
+      # that fails if any hand-written language surface drifts from canon. This is
+      # the contract iOS + Android + macOS all encode/decode, so a silent interop
+      # break here (a renamed wire string, a changed ALPN or frame cap) would
+      # otherwise ship green to all three apps.
+      - name: Hermes wire protocol (codegen drift + parity + tests)
+        run: |
+          # Tracked-file guard: a PR that DELETES a generated file must fail too.
+          git ls-files --error-unmatch \
+            services/hermes-realtime-relay/src/generated/wireProtocol.ts \
+            packages/hermes-wire-protocol/gen/HermesWireProtocol.swift \
+            packages/hermes-wire-protocol/gen/HermesWireProtocol.kt \
+            packages/hermes-wire-protocol/gen/wire_protocol.rs \
+            android/openburnbar-iroh-relay/src/main/java/com/openburnbar/irohrelay/Generated/HermesRealtimeRelayGeneratedTypes.kt \
+            OpenBurnBarCore/Sources/OpenBurnBarKernel/SharedModels/Generated
+          node packages/hermes-wire-protocol/codegen.mjs
+          # codegen.mjs writes ALL generated surfaces (the gen/ references AND the real
+          # consumed payload types: Kotlin android Generated/ + Swift SharedModels/Generated/).
+          # Diff every one of them so a stale committed payload type fails CI — without the
+          # real Generated dirs here, drift only surfaces inside the apps (silent interop break).
+          git diff --exit-code -- \
+            services/hermes-realtime-relay/src/generated/wireProtocol.ts \
+            packages/hermes-wire-protocol/gen \
+            android/openburnbar-iroh-relay/src/main/java/com/openburnbar/irohrelay/Generated \
+            OpenBurnBarCore/Sources/OpenBurnBarKernel/SharedModels/Generated \
+            || { echo "::error::Hermes wire-protocol generated files are stale — run 'node packages/hermes-wire-protocol/codegen.mjs' and commit."; exit 1; }
+          node packages/hermes-wire-protocol/parity.mjs
+          node --test packages/hermes-wire-protocol/protocol.test.mjs
+          # Kotlin emitter byte-faithfulness: every generatable type's emitter output must
+          # match the committed Kotlin (hand-written remainder + Generated/). Complements the
+          # protocol.test.mjs @EncodeDefault validator (override-vs-schema) above.
+          node packages/hermes-wire-protocol/migrate/kotlin-roundtrip.mjs --faithful
+
+      # DTCG tokens build to CSS/Swift/Kotlin and stay one source of truth.
+      - name: Design tokens (Style Dictionary build + tests)
+        run: |
+          cd packages/design-tokens
+          npm ci
+          npm test
+
+      # Belt-and-suspenders to the registry.test.mjs / tokens.test.mjs Android
+      # assertions: re-sync the in-tree Android copies from the (now freshly
+      # regenerated) gen/ + dist/ outputs and fail if anything moved. Catches a
+      # hand-edit committed straight into the Android tree that bypassed the
+      # codegen path — the exact failure mode that mislabeled server-readable
+      # chat as end-to-end encrypted.
+      - name: Android generated sources are in sync (no drift)
+        run: |
+          cp packages/data-domains/gen/DataDomains.kt \
+            android/app/src/main/java/com/openburnbar/data/domains/DataDomains.kt
+          cp packages/design-tokens/dist/compose/PensieveTokens.kt \
+            android/app/src/main/java/com/openburnbar/ui/tokens/PensieveTokens.kt
+          git diff --exit-code -- \
+            android/app/src/main/java/com/openburnbar/data/domains/DataDomains.kt \
+            android/app/src/main/java/com/openburnbar/ui/tokens/PensieveTokens.kt \
+            || { echo "::error::Android generated sources are stale — run ./gradlew :app:syncGeneratedSources and commit the result."; exit 1; }
+
+      # Same guarantee for the public marketing site: burnbar.ai/trust renders
+      # every encryption-tier claim from website/src/data/trust.generated.ts,
+      # which codegen emits from registry.json (+ the Pensieve tier colors). Fail
+      # red if the committed copy drifts so the website can never overstate the
+      # product — the exact failure mode that mislabeled server-readable chat as
+      # end-to-end encrypted, now gated for the website too.
+      - name: Website trust copy is in sync (no drift)
+        run: |
+          # ls-files guard: a PR that DELETES the generated file must fail too —
+          # `git diff --exit-code` alone is blind to untracked regenerations.
+          git ls-files --error-unmatch website/src/data/trust.generated.ts
+          node packages/data-domains/codegen.mjs
+          git diff --exit-code -- website/src/data/trust.generated.ts \
+            || { echo "::error::website/src/data/trust.generated.ts is stale — run 'node packages/data-domains/codegen.mjs' and commit the result."; exit 1; }
+
+      # Same mechanism for the encryption-architecture claims: burnbar.ai/trust
+      # renders its crypto claim/not-claim copy from
+      # website/src/data/crypto-claims.generated.ts, which the generator emits
+      # from docs/security/crypto-architecture-policy.json + the CI-enforced
+      # libsignal pin + the fail-closed runtime-readiness gate. `--check` fails
+      # on a stale, hand-edited, or DELETED file — and the generator itself
+      # fails when runtime readiness flips, so "not activated in production"
+      # copy cannot outlive the rollout it describes.
+      - name: Website crypto-claims copy is in sync (no drift)
+        run: node website/scripts/generate-crypto-claims.mjs --check
+
+  # ── Web console (app.burnbar.ai): lint + types + tests + static build ──────
+  console-web:
+    name: Console (lint + types + tests + build)
+    needs: classify
+    if: needs.classify.outputs.console == 'true'
+    runs-on: ubuntu-latest
+    # 15 rather than 8: every step of real work here takes 50 seconds total,
+    # but actions/checkout alone consumed 7m21s of the old 8-minute budget on a
+    # merge_group ref and the static build was cancelled 16 seconds in (run
+    # 31049085466), failing the REQUIRED Fast Feedback Gate and ejecting the
+    # queue candidate on a fetch rather than on code.
+    timeout-minutes: 15
+    steps:
+      # Only apps/console is built; the two domain-core profile scripts read
+      # config/domain-core-build-profiles.json, their scripts/lib helpers, and
+      # crates/openburnbar-domain-core/union-abi-manifest.json.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          filter: blob:none
+          sparse-checkout: |
+            apps/console
+            scripts
+            config
+            crates/openburnbar-domain-core
+            packages/data-domains
+            packages/design-tokens
+            packages/gl-engine
+            tests/fixtures/domain-core
+            docs/analytics
+          # firebase.json (csp.test.ts) needs no entry: cone-mode sparse
+          # checkout always materializes repo-root files, and a leading-slash
+          # pattern is rejected outright in cone mode ("specify directories
+          # rather than patterns").
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/console/package-lock.json
+
+      - name: Resolve signed console domain-core candidate
+        run: |
+          node scripts/ci/resolve-domain-core-build-profile.mjs --profile public-production --expected-candidate-commit "$GITHUB_SHA" --format github-env-web >> "$GITHUB_ENV"
+          node scripts/ci/resolve-domain-core-build-profile.mjs --profile public-production --expected-candidate-commit "$GITHUB_SHA" --format json --output apps/console/public/domain-core-build-profile.json
+
+      - name: Install console dependencies
+        run: npm ci --prefix apps/console
+
+      # build/test scripts auto-run sync:domains (prebuild/pretest) to refresh the
+      # generated registry + token copies from packages/.
+      - name: Lint
+        run: npm run lint --prefix apps/console
+
+      - name: Type check
+        run: npm run typecheck --prefix apps/console
+
+      - name: Unit tests (incl. Swift<->WebCrypto escrow interop)
+        run: npm test --prefix apps/console
+
+      - name: Static build (next export)
+        run: npm run build --prefix apps/console
+
+      - name: Verify signed console runtime artifact
+        run: node scripts/ci/verify-domain-core-build-profile-artifact.mjs --profile public-production --expected-candidate-commit "$GITHUB_SHA" --console-dir apps/console/out
+
+  # ── Version consistency ────────────────────────────────────────────────────
+  version-consistency:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            CHANGELOG.md
+            README.md
+            SECURITY.md
+            project.yml
+            extensions/openburnbar/package.json
+            extensions/safari/package.json
+            extensions/safari/manifest.json
+            extensions/safari/dist/manifest.json
+            homebrew/burnbar.rb
+            OpenBurnBarDaemon/Sources/OpenBurnBarDaemon/OpenBurnBarDaemonConfiguration.swift
+            windows/app/OpenBurnBar.App/app.manifest
+            scripts/update-homebrew.sh
+            scripts/verify-version-consistency.sh
+
+      - name: Verify version consistency
+        run: ./scripts/verify-version-consistency.sh
+
+  # ── AGENTS.md validation ───────────────────────────────────────────────────
+  agents-md-fast:
+    name: AGENTS.md quick validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - name: Check that referenced scripts exist
+        run: |
+          set -euo pipefail
+          ERRORS=0
+          while IFS= read -r line; do
+            if [[ "$line" =~ \`(scripts/[^[:space:]\`]+)\` ]]; then
+              script="${BASH_REMATCH[1]}"
+              if [[ ! -f "$script" && ! -f "${script}.sh" ]]; then
+                echo "::error::AGENTS.md references missing script: $script"
+                ERRORS=$((ERRORS + 1))
+              fi
+            fi
+          done < AGENTS.md
+          if [[ $ERRORS -gt 0 ]]; then
+            exit 1
+          fi
+          echo "All AGENTS.md script references valid."
+
+      - name: Self-test agent memory source policy
+        run: node scripts/ci/verify-agent-memory-source-policy.test.mjs
+
+      - name: Verify agent memory source policy
+        run: node scripts/ci/verify-agent-memory-source-policy.mjs
+
+  # ── Path filter: skip expensive legs when their surfaces are untouched ────
+  fast-feedback-path-filter:
+    name: Fast Feedback path filter
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      rust_changed: ${{ steps.changed.outputs.rust_changed }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          # The PR checkout ref is a synthetic merge commit. Depth 2 includes its
+          # base and head parents without fetching the entire repository history,
+          # while leaving enough room for large artifact-purge diffs to checkout.
+          fetch-depth: 2
+
+      - name: Detect Rust-relevant changes
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          base="${BASE_SHA:-}"
+          head="${HEAD_SHA:-HEAD}"
+          if git rev-parse --verify --quiet HEAD^2 >/dev/null; then
+            base="$(git rev-parse HEAD^1)"
+            head="$(git rev-parse HEAD^2)"
+          elif [[ -z "$base" || "$base" == "null" ]]; then
+            git fetch --no-tags origin main
+            base="$(git merge-base FETCH_HEAD HEAD)"
+            head="HEAD"
+          fi
+          git diff --name-only "$base" "$head" > /tmp/fast-feedback-changed-paths.txt
+          cat /tmp/fast-feedback-changed-paths.txt
+          if grep -Eq '^(crates/(openburnbar-iroh|openburnbar-domain-core|project-code-static-parser)/|\.github/workflows/fast-feedback\.yml$|\.cargo/config(\.toml)?$|\.?rustfmt\.toml$|clippy\.toml$|rust-toolchain(\.toml)?$|Cargo\.(toml|lock)$)' /tmp/fast-feedback-changed-paths.txt; then
+            echo "rust_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Rust: fmt + clippy + cargo-deny on iroh crate (WS5) ─────────────────
+  rust-deny-fast:
+    name: Rust (fmt + clippy + cargo-deny)
+    needs: fast-feedback-path-filter
+    if: always() && (needs.fast-feedback-path-filter.result != 'success' || needs.fast-feedback-path-filter.outputs.rust_changed != 'false')
+    runs-on: ubuntu-latest
+    # 15 rather than 8: this job feeds the REQUIRED Fast Feedback Gate, and a
+    # full clone of this repo's 8.6 GiB history consumed the whole budget and
+    # cancelled it inside actions/checkout on a merge_group ref with zero Rust
+    # work done (run 31041261148: 7m59s in checkout), which fails the gate and
+    # ejects the queue candidate on infrastructure rather than on code.
+    timeout-minutes: 15
+    steps:
+      # fmt/clippy/cargo-deny read only the three crates below plus the
+      # workspace manifests; history and the other ~13k files are dead weight.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          filter: blob:none
+          # There is no workspace root manifest: each crate under crates/ owns
+          # its Cargo.toml, Cargo.lock, deny.toml, and rust-toolchain.toml.
+          # openburnbar-domain-core additionally compiles repo-root KAT
+          # fixtures into its tests via include_str!(../../../../tests/
+          # fixtures/domain-core/...), so clippy --all-targets needs them
+          # present (run 31042545006 failed without them).
+          sparse-checkout: |
+            crates
+            tests/fixtures/domain-core
+
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # v1, pinned via toolchain below
+        with:
+          # Match crates/openburnbar-iroh/rust-toolchain.toml so fmt/clippy/test
+          # run under the same rustc the crate is pinned to (and its components
+          # resolve). The crate's rust-toolchain.toml otherwise overrides `stable`
+          # mid-job and the requested components would be missing.
+          toolchain: "1.96.0" # pin: crates/openburnbar-iroh (libsignal lineage)
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            crates/openburnbar-iroh -> target
+            crates/openburnbar-domain-core -> target
+            crates/project-code-static-parser -> target
+
+      - name: cargo fmt check (openburnbar-iroh)
+        run: cd crates/openburnbar-iroh && cargo fmt --check
+
+      - name: cargo fmt check (project-code-static-parser)
+        run: cargo fmt --manifest-path crates/project-code-static-parser/Cargo.toml --check
+
+      - name: cargo fmt check (openburnbar-domain-core)
+        run: cargo fmt --manifest-path crates/openburnbar-domain-core/Cargo.toml --all --check
+
+      - name: cargo clippy deny warnings (openburnbar-iroh)
+        run: |
+          cd crates/openburnbar-iroh && cargo clippy --all-targets -- \
+            -D warnings \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used
+
+      - name: cargo clippy deny warnings (project-code-static-parser)
+        run: |
+          cargo clippy --manifest-path crates/project-code-static-parser/Cargo.toml --all-targets -- \
+            -D warnings \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used
+
+      - name: cargo clippy deny warnings (openburnbar-domain-core)
+        run: |
+          cargo clippy --manifest-path crates/openburnbar-domain-core/Cargo.toml --workspace --all-targets -- \
+            -D warnings \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used
+
+      - name: cargo test — iroh loopback handshake (openburnbar-iroh)
+        # Merge-blocking validation of the SHIPPING iroh transport: a hermetic
+        # two-endpoint loopback ALPN handshake + length-prefixed frame round-trip.
+        # Fails on ALPN drift, length-prefix changes, or handshake regressions.
+        run: cd crates/openburnbar-iroh && cargo test --test loopback_handshake
+
+      - name: cargo test — project code static parser
+        run: cargo test --manifest-path crates/project-code-static-parser/Cargo.toml
+
+      - name: Install cargo-deny
+        run: |
+          for attempt in 1 2 3; do
+            if cargo install cargo-deny --locked; then
+              exit 0
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+      - name: cargo deny check (openburnbar-iroh)
+        run: cd crates/openburnbar-iroh && cargo deny check
+
+      - name: cargo deny check (openburnbar-domain-core)
+        run: cd crates/openburnbar-domain-core && cargo deny check
+
+  # ── Security vitest + iroh bindgen gate ───────────────────────────────────
+  functions-security-fast:
+    name: Functions (security vitest)
+    needs: classify
+    runs-on: ubuntu-latest
+    # 2026-09-03/04 npm registry degradation: this job was killed at its
+    # hard cap with clean partial output (see PR #2507 CI history), so a
+    # slow registry was reported as a job failure. 30m rides out the
+    # degradation; the gate itself is unchanged.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      - name: npm ci (functions)
+        working-directory: functions
+        run: npm ci
+
+      - name: Build entitlements contracts
+        run: bash scripts/build-entitlements.sh
+
+      - name: Build Signal envelope contracts
+        run: bash scripts/build-signal-envelope-contracts.sh
+
+      - name: Security vitest bundle
+        working-directory: functions
+        run: npm run test:security
+
+      - name: Verify iroh remoteNodeId in UniFFI bindings
+        run: bash scripts/ci/verify-iroh-remote-node-id-binding.sh
+
+  # ── Signal honesty-copy gate (tech-debt audit H7) ─────────────────────────
+  # Default-deny over-claim phrase scan ("zero-knowledge", "Signal-quality
+  # privacy", etc.) across product/copy surfaces. The script was authored but
+  # wired into ZERO workflows while rule0's comments claimed it was enforced —
+  # an FTC-grade exposure class. node + checkout only; no install needed.
+  signal-honesty-copy:
+    name: Signal honesty copy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      - name: Verify no un-reviewed over-claim copy
+        run: bash scripts/ci/verify-signal-honesty-copy.sh
+
+      # The in-process mirror of the gate above (TeamMemoryCopyGateTests) walks
+      # `TeamMemoryCopy.allCopy`, a hand-maintained list. This proves the list is
+      # complete, so a new team-memory string cannot escape the fast mirror
+      # (memory program D16 / P22, PR 4 review L9). Self-test first: a gate whose
+      # matcher is broken passes everything.
+      - name: Verify the team-memory copy inventory is complete
+        run: |
+          bash scripts/ci/verify-team-memory-copy-inventory.sh --self-test
+          bash scripts/ci/verify-team-memory-copy-inventory.sh
+
+      # The team-roster refusal reasons are a wire contract maintained by hand on
+      # two sides in two languages (functions/src/teamRosterReasons.ts and
+      # TeamRosterReasonCode in TeamRosterDirectory.swift). This is the only thing
+      # that checks they still agree — a server code with no Swift case ships as
+      # generic copy, silently. Self-test first: a gate whose matcher is broken
+      # passes everything.
+      - name: Verify the team-roster reason-code mirror
+        run: |
+          bash scripts/ci/verify-team-roster-reason-codes.sh --self-test
+          bash scripts/ci/verify-team-roster-reason-codes.sh
+
+  # ── Services: E2EE relay + paid hosted-MCP (tech-debt audit H4) ────────────
+  # The hermes-realtime-relay and hosted-mcp packages (22 test files) ran in
+  # zero CI lanes — a regression in the paid CLI's hosted-MCP path or the E2EE
+  # relay shipped green. Mirrors the console job: npm ci + tsc + npm test for
+  # both packages, plus the shared Signal envelope contract build their
+  # prebuild step depends on.
+  services-fast:
+    name: "Services (relay + hosted-MCP: types + tests)"
+    runs-on: ubuntu-latest
+    # Checkout can consume 6-7 minutes during GitHub fetch degradation (observed
+    # Aug 2026); leave headroom for the install + test steps afterward.
+    # 2026-09-03/04 npm registry degradation: this job was killed at its
+    # hard cap with clean partial output (see PR #2507 CI history), so a
+    # slow registry was reported as a job failure. 30m rides out the
+    # degradation; the gate itself is unchanged.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            services/hermes-realtime-relay/package-lock.json
+            services/hosted-mcp/package-lock.json
+            packages/signal-envelope-contracts/package-lock.json
+            packages/entitlements/package-lock.json
+
+      # Shared dependency: both services' prebuild compiles these contracts.
+      - name: Build Signal envelope contracts
+        run: bash scripts/build-signal-envelope-contracts.sh
+
+      - name: Build entitlements contracts
+        run: bash scripts/build-entitlements.sh
+
+      # ── hermes-realtime-relay ──
+      - name: Install relay dependencies
+        run: npm ci --prefix services/hermes-realtime-relay
+
+      - name: TypeScript type check (relay)
+        run: cd services/hermes-realtime-relay && npx tsc --noEmit
+
+      - name: Unit tests (relay)
+        run: npm test --prefix services/hermes-realtime-relay
+
+      # ── hosted-mcp ──
+      - name: Install hosted-MCP dependencies
+        run: npm ci --prefix services/hosted-mcp
+
+      - name: TypeScript type check (hosted-MCP)
+        run: cd services/hosted-mcp && npx tsc --noEmit
+
+      - name: Unit tests (hosted-MCP)
+        run: npm test --prefix services/hosted-mcp
+
+  # ── No new suppressions / baselines (permanence meta-gate, plan Phase 6) ────
+  # Fail-closed: blocks any new lint/type suppression (eslint-disable, @ts-*,
+  # # noqa, @Suppress, swiftlint:disable, #[allow]) or checked-in baseline
+  # (budgets/*.json, *baseline*.{xml,yml,yaml}) that lacks an inline `reason:`
+  # token or a documented allowlist entry in docs/LINT_RATIONALE.md. Pure git +
+  # python3 — no install needed; supersedes the former blunt suppression check.
+  no-suppressions:
+    name: No new suppressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      # Positive controls: prove the gate still catches bypass attempts (never
+      # passes vacuously) before trusting its verdict on the real tree.
+      - name: Self-test the meta-gate
+        run: bash scripts/ci/check-no-suppressions.test.sh
+
+      - name: Check no unjustified suppressions or baselines
+        run: bash scripts/ci/check-no-suppressions.sh
+
+      # run-09 privacy/logging/metadata structural invariants: ephemeral PII
+      # collections keep their TTL + writer, push payloads omit stable
+      # correlators, and the log scrubber + raw-logger ban stay in place.
+      - name: Self-test the privacy-invariants gate
+        run: node scripts/ci/check-privacy-invariants.test.mjs
+
+      - name: Check privacy invariants (run-09)
+        run: node scripts/ci/check-privacy-invariants.mjs
+
+      - name: Self-test explicit Android PendingIntent gate
+        run: node --test scripts/ci/verify-android-explicit-pending-intents.test.mjs
+
+      - name: Verify explicit Android PendingIntents
+        run: node scripts/ci/verify-android-explicit-pending-intents.mjs
+
+      - name: Verify credential-transfer secret boundary
+        run: bash scripts/ci/verify-credential-transfer-secret-boundary.sh
+
+      - name: Self-test PR secret boundaries
+        run: node scripts/ci/verify-pr-secret-boundaries.test.mjs
+
+      - name: Verify PR secret boundaries
+        run: node scripts/ci/verify-pr-secret-boundaries.mjs
+
+      - name: Self-test factory security-review boundary
+        run: node scripts/ci/verify-factory-security-review-boundary.test.mjs
+
+      - name: Verify factory security-review boundary
+        run: node scripts/ci/verify-factory-security-review-boundary.mjs
+
+      - name: Self-test ops-plane workflow boundary
+        run: node scripts/ci/verify-ops-plane-workflow-boundary.test.mjs
+
+      - name: Verify ops-plane workflow boundary
+        run: node scripts/ci/verify-ops-plane-workflow-boundary.mjs
+
+      - name: Self-test branch-protection drift gate
+        run: node --test scripts/ops/check-branch-protection-drift.test.mjs
+
+      - name: Self-test ops alert-plane drift gate
+        run: node --test scripts/ops/check-ops-alert-plane-drift.test.mjs
+
+      - name: Self-test PR harness aggregate gates
+        run: node scripts/ci/verify-pr-harness-aggregate-gates.test.mjs
+
+      - name: Verify PR harness aggregate gates
+        run: node scripts/ci/verify-pr-harness-aggregate-gates.mjs
+
+      - name: Self-test launch evidence capture permissions
+        run: node scripts/test-capture-commercial-launch-evidence.mjs
+
+      - name: Self-test exact-SHA staging Stripe lifecycle
+        run: node --test scripts/e2e/staging-stripe-lifecycle.test.mjs
+
+      - name: Self-test production deploy auth boundary
+        run: bash scripts/ci/verify-production-deploy-auth.test.sh
+
+      - name: Verify production deploy auth boundary
+        run: bash scripts/ci/verify-production-deploy-auth.sh
+
+  # ── Mac/iOS Swift twin-basename gate (stop new forked twins) ───────────────
+  twin-basenames:
+    name: Swift twin basenames
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          filter: blob:none
+          sparse-checkout: |
+            AgentLens
+            OpenBurnBarMobile
+            docs/LINT_RATIONALE.md
+            scripts/ci/check-twin-basenames.sh
+            scripts/ci/check-twin-basenames.test.sh
+
+      - name: Self-test Swift twin-basename gate
+        run: bash scripts/ci/check-twin-basenames.test.sh
+
+      - name: Check Swift twin basenames
+        run: bash scripts/ci/check-twin-basenames.sh
+
+  # ── Budget fork drift gate (BudgetGate stays de-forked in OpenBurnBarCore) ──
+  budget-fork-drift:
+    name: Budget fork drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          filter: blob:none
+          sparse-checkout: |
+            AgentLens/Services/DataStore
+            OpenBurnBarMobile/Models
+            OpenBurnBarCore/Sources/OpenBurnBarKernel/Budget
+            scripts/ci/check-budget-fork-drift.sh
+            scripts/ci/budget-fork-baselines
+
+      - name: Check budget fork drift
+        run: bash scripts/ci/check-budget-fork-drift.sh
+
+  # ── Production env hygiene (no checked-in secrets) ─────────────────────────
+  env-no-secrets:
+    name: Production env has no secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          filter: blob:none
+          sparse-checkout: |
+            functions/.env.burnbar.production
+            scripts/ci/check-env-no-secrets.sh
+            scripts/ci/check-env-no-secrets.test.sh
+
+      - name: Self-test production env secret guard
+        run: bash scripts/ci/check-env-no-secrets.test.sh
+
+      - name: Check production env files
+        run: bash scripts/ci/check-env-no-secrets.sh
+
+  # ── Windows-port architecture honesty: storage architecture (WPD-0005) ──────
+  # The Windows Engine lane compiles a storage-pruned Engine subset (drops
+  # GRDB-SQLCipher + OpenBurnBarData via OPENBURNBAR_DAEMON_LINUX_BOUNDARY_BUILD).
+  # Per WPD-0005 that prune is PERMANENT ARCHITECTURE — the Engine computes, the
+  # C# seam (windows/storage/) persists — not a waived gap. This gate fails if
+  # any workflow sets the flag without being named in WPD-0005's machine-read
+  # block, if the WPD is missing/malformed, or if the C# storage seam's test
+  # project disappears. (Replaced the storage-prune WAIVER gate on 2026-07-06.)
+  windows-storage-architecture:
+    name: Windows storage architecture (WPD-0005)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          persist-credentials: false
+          filter: blob:none
+          sparse-checkout: |
+            .github/workflows
+            docs/windows-port/decisions/0005-windows-storage-architecture.md
+            windows/storage/OpenBurnBar.Storage.Tests
+            scripts/ci/verify-windows-storage-architecture.sh
+            scripts/ci/verify-windows-storage-architecture.test.sh
+
+      - name: Self-test the storage architecture gate
+        run: bash scripts/ci/verify-windows-storage-architecture.test.sh
+
+      - name: Verify Windows storage architecture (WPD-0005 honesty)
+        run: bash scripts/ci/verify-windows-storage-architecture.sh
+
+  # ── Windows parity ledger (Phase 0 anti-false-green gate) ───────────────────
+  # The machine-readable macOS↔Windows ledger rejects non-approved states, Real
+  # rows without tests/evidence, fake production paths, and unmapped primary routes.
+  windows-parity-ledger:
+    name: Windows parity ledger (Phase 0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyYAML for ledger scanner
+        run: python3 -m pip install --user 'pyyaml>=6,<7'
+
+      - name: Self-test the Windows parity ledger gate
+        run: bash scripts/ci/verify-windows-parity-ledger.test.sh
+
+      - name: Verify Windows parity ledger honesty
+        run: bash scripts/ci/verify-windows-parity-ledger.sh
+
+  # ── Functions critical correctness (money + compliance; merge-blocking) ─────
+  # The App Store JWS verifier, billing/tier rollups, tier COGS, cloud-pro
+  # allowance, and account-deletion harnesses guard revenue and compliance. They
+  # ran only in the post-merge/nightly aggregate; this blocks merges on them.
+  # Each is self-contained (no emulator/secrets) and exits non-zero on a regression.
+  functions-correctness:
+    name: Functions (money + compliance harnesses)
+    needs: classify
+    if: needs.classify.outputs.functions == 'true'
+    runs-on: ubuntu-latest
+    # Healthy runs finish in ~2 minutes, but GitHub fetch degradation pushed
+    # checkout alone to 6-7 minutes in Aug 2026 (and cancelled merge_group
+    # attempts mid-fetch), which killed this lane at the old 6-minute timeout
+    # repeatedly before any code ran.
+    timeout-minutes: 15
+    steps:
+      # This job only reads the worktree, so history is unnecessary weight.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      - name: Install functions dependencies
+        run: npm ci --prefix functions
+
+      - name: Build Signal envelope contracts
+        run: bash scripts/build-signal-envelope-contracts.sh
+
+      - name: Build entitlements contracts
+        run: bash scripts/build-entitlements.sh
+
+      - name: Build functions
+        run: npm run build --prefix functions
+
+      - name: App Store JWS verifier regression
+        working-directory: functions
+        run: node scripts/test-appstore.mjs
+
+      - name: Billing / tier rollups
+        working-directory: functions
+        run: node scripts/test-rollups.mjs
+
+      - name: Tier COGS
+        working-directory: functions
+        run: node scripts/test-tier-cogs.mjs
+
+      - name: Cloud Pro allowance
+        working-directory: functions
+        run: node scripts/test-cloud-pro-allowance.mjs
+
+      - name: Account deletion
+        working-directory: functions
+        run: node scripts/test-account-deletion.mjs
+
+  # ── Debt-budget ratchets (shrink-only; merge-blocking) ──────────────────────
+  # These ratchets only move DOWN. A PR that adds a new try? / empty catch /
+  # unsafe cast / @unchecked Sendable / Rust panic, or a new oversized Swift file,
+  # fails HERE at merge time — not a day later in the post-merge harness. Pure
+  # bash + python3 + node; no Swift/Rust toolchain needed.
+  debt-budgets:
+    name: Debt budgets (shrink-only ratchets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      - name: Diligence data-room index
+        run: node scripts/ci/verify-data-room.mjs --check
+
+      - name: No committed compiler/build artifacts
+        run: ./scripts/ci/check-no-committed-build-artifacts.sh
+
+      - name: No stale failed launch evidence
+        run: ./scripts/ci/check-no-stale-launch-evidence.sh
+
+      - name: Root inventory ratchet (shrink-only)
+        run: ./scripts/ci/check-root-inventory.sh
+
+      - name: try? debt budget
+        run: ./scripts/debt/check-try-optional-budget.sh
+
+      - name: empty catch debt budget
+        run: ./scripts/debt/check-empty-catch-budget.sh
+
+      - name: unsafe cast debt budget
+        run: ./scripts/debt/check-unsafe-cast-budget.sh
+
+      - name: GRDB row cast debt budget
+        run: ./scripts/debt/check-grdb-row-cast-budget.sh
+
+      - name: unchecked Sendable debt budget
+        run: ./scripts/debt/check-unchecked-sendable-budget.sh
+
+      - name: Rust panic debt budget (unwrap/expect)
+        run: ./scripts/debt/check-rust-panic-budget.sh
+
+      - name: Force-unwrap debt budget (shrink-only ratchet)
+        run: ./scripts/debt/check-force-unwrap-budget.sh
+
+      - name: Swift file-size debt budget (shrink-only)
+        run: ./scripts/debt/check-swift-file-size-budget.sh
+
+      # Port-side analogue: freeze the Kotlin/Rust/TS god files (Tauri lib.rs,
+      # SwarmBackground.kt, tauriBridge.ts) so the newer platforms cannot regrow
+      # the bloat the Swift ratchet burned down (diligence 2026-07-12).
+      - name: Port file-size debt budget (shrink-only)
+        run: ./scripts/debt/check-port-file-size-budget.sh
+
+      # Structural remediation ratchets (audit 2026-06-30 findings #4/#5).
+      # Core UI purity: no new SwiftUI/AppKit imports in OpenBurnBarCore's main
+      # module; pure sibling targets assert-zero. Mission split-brain: the
+      # GUI-side mission-authority cluster may only shrink as authority moves
+      # to the daemon MissionControl.
+      - name: Core UI-purity budget (shrink-only ratchet)
+        run: ./scripts/debt/check-core-ui-purity-budget.sh
+
+      - name: Mission split-brain budget (shrink-only ratchet)
+        run: ./scripts/debt/check-mission-splitbrain-budget.sh
+
+      # Core-decomposition regrowth gates (docs/CORE_DECOMPOSITION_PROGRAM.md).
+      # Membership: no NEW .swift file may land in the dissolving OpenBurnBarCore
+      # main target, its totals may only shrink, and no extracted sibling may
+      # exceed its 1.25x ceiling. Umbrella imports: no NEW file may import the
+      # OpenBurnBarCore umbrella in a tracked consumer root (privileged roots
+      # ratchet to zero after their repoint packets). This job runs a full
+      # actions/checkout, so OpenBurnBarCore/Sources, budgets/, and every consumer
+      # root the scripts read are present.
+      - name: Core target-membership budget (deny-gate + shrink-only ratchet)
+        run: ./scripts/debt/check-core-target-membership-budget.sh
+
+      - name: Core umbrella-imports budget (shrink-only ratchet)
+        run: ./scripts/debt/check-core-umbrella-imports-budget.sh
+
+      # Windows per-tree size ratchet (rooted at windows/, partitioned by
+      # app/pal/native/tests). Blocking Windows check on every PR — a red
+      # Windows budget fails HERE at merge time. Pure bash + python3.
+      - name: Windows tree budget (per-tree shrink-only ratchet)
+        run: ./scripts/debt/check-windows-tree-budget.sh
+
+      # Refresh-tick perf ratchet: no new unbounded fetchAllUsage() call
+      # sites (O(total-history) tick work) and no raw token_usage writers
+      # outside the UsageTableWriteMarker-aware stores.
+      - name: Usage refresh-tick budget (shrink-only ratchet)
+        run: ./scripts/debt/check-usage-refresh-tick-budget.sh
+
+      - name: BurnBarRPC IPC canon is current
+        run: node tools/ipc/generate-burnbarrpc-canon.mjs --check
+
+      - name: Migration rollback catalog covers both migrators
+        run: |
+          node --test scripts/ci/verify-migration-rollback-catalog.test.mjs
+          node scripts/ci/verify-migration-rollback-catalog.mjs
+
+  # ── Fast summary gate ──────────────────────────────────────────────────────
+  fast-feedback-gate:
+    name: Fast Feedback Gate
+    needs:
+      - classify
+      - vendor-checksums
+      - fast-feedback-path-filter
+      - functions-fast
+      - extension-fast
+      - safari-extension-fast
+      - website-fast
+      - plugin-fast
+      - typescript-surfaces-lint
+      - agpl-compliance
+      - libsignal-bridge
+      - shell-syntax
+      - python-lint
+      - schema-drift
+      - sqlcipher-codec-policy
+      - chunker-parity
+      - prime-agent-proxy-auth
+      - control-center-foundations
+      - console-web
+      - version-consistency
+      - agents-md-fast
+      - rust-deny-fast
+      - functions-security-fast
+      - signal-honesty-copy
+      - services-fast
+      - no-suppressions
+      - twin-basenames
+      - windows-storage-architecture
+      - windows-parity-ledger
+      - debt-budgets
+      - functions-correctness
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all fast jobs passed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUST_CHANGED: ${{ needs.fast-feedback-path-filter.outputs.rust_changed }}
+          FUNCTIONS_REQUIRED: ${{ needs.classify.outputs.functions }}
+          MACOS_REQUIRED: ${{ needs.classify.outputs.macos }}
+          WEB_REQUIRED: ${{ needs.classify.outputs.web }}
+          CONSOLE_REQUIRED: ${{ needs.classify.outputs.console }}
+        run: |
+          set -euo pipefail
+          failed=$(printf '%s\n' "$NEEDS_JSON" | python3 -c "
+          import json, os, sys
+          data = json.load(sys.stdin)
+          detector_result = data.get('fast-feedback-path-filter', {}).get('result')
+          rust_changed = os.environ.get('RUST_CHANGED', '')
+          selected = {
+              'functions-fast': os.environ.get('FUNCTIONS_REQUIRED') == 'true',
+              'functions-security-fast': True,
+              'functions-correctness': os.environ.get('FUNCTIONS_REQUIRED') == 'true',
+              'extension-fast': os.environ.get('WEB_REQUIRED') == 'true',
+              'safari-extension-fast': os.environ.get('MACOS_REQUIRED') == 'true',
+              'website-fast': os.environ.get('WEB_REQUIRED') == 'true',
+              'plugin-fast': os.environ.get('WEB_REQUIRED') == 'true',
+              'console-web': os.environ.get('CONSOLE_REQUIRED') == 'true',
+          }
+          failed = []
+          for name, value in data.items():
+              result = value.get('result')
+              if result == 'success':
+                  continue
+              if (name == 'rust-deny-fast' and result == 'skipped'
+                      and detector_result == 'success' and rust_changed == 'false'):
+                  continue
+              if name in selected and result == 'skipped' and not selected[name]:
+                  continue
+              failed.append(name + ' (result=' + str(result or 'missing') + ')')
+          print('\\n'.join(failed))
+          ")
+          if [[ -n "$failed" ]]; then
+            echo "::error::The following fast feedback jobs did not succeed:"
+            echo "$failed"
+            exit 1
+          fi
+          echo "### Fast Feedback: All checks passed in under 5 minutes" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,325 @@
+name: CI
+
+on:
+  push:
+
+jobs:
+  test:
+    name: Compiler and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Enforce agent-analyzability import graph (layer DAG, no cycles)
+        run: npm run arch:check
+
+      - name: Enforce agent-analyzability caps (max-dependencies, max-lines)
+        run: npm run lint
+
+      - name: Run core test suite (unit and acceptance)
+        run: npm test
+
+      - name: Verify public install URL (jaiph use default path)
+        run: curl -fsSL -o /dev/null --retry 3 --retry-delay 1 https://jaiph.org/install
+
+      - name: Verify git tag for package version exists (canonical repo)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          git ls-remote --exit-code https://github.com/jaiphlang/jaiph.git "refs/tags/v${VERSION}"
+
+  e2e:
+    name: E2E (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run runtime acceptance E2E
+        run: |
+          npm ci
+          npm run test:e2e
+
+  docs-local:
+    name: Getting started (local)
+    runs-on: ubuntu-latest
+    env:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      CURSOR_TOKEN: ${{ secrets.CURSOR_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+          working-directory: docs
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      # The "Try it out" Playwright test runs docs/install in local-source
+      # mode, which builds the standalone binary via `bun build --compile`.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Cursor agent CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://cursor.com/install -o /tmp/install-cursor-agent.sh
+          bash /tmp/install-cursor-agent.sh
+          if command -v cursor-agent >/dev/null 2>&1; then
+            echo "cursor-agent installed at $(command -v cursor-agent)"
+          elif command -v agent >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v agent)" /usr/local/bin/cursor-agent
+            echo "Linked agent -> /usr/local/bin/cursor-agent"
+          elif command -v cursor >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v cursor)" /usr/local/bin/cursor-agent
+            echo "Linked cursor -> /usr/local/bin/cursor-agent"
+          else
+            echo "cursor-agent installation failed: no cursor-agent/agent/cursor binary found" >&2
+            exit 1
+          fi
+          command -v cursor-agent
+
+      - name: Install Claude Code CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          command -v claude
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Serve Jekyll in background
+        working-directory: docs
+        run: |
+          bundle exec jekyll serve --host 127.0.0.1 --port 4000 &
+          JEKYLL_PID=$!
+          echo "JEKYLL_PID=$JEKYLL_PID" >> "$GITHUB_ENV"
+
+      - name: Wait for Jekyll to respond
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:4000/; then
+              echo "Jekyll is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Jekyll failed to start within 30s"
+          exit 1
+
+      - name: Smoke-check local site
+        run: |
+          curl -fsS -o /dev/null -w "HTTP %{http_code} for /\n" http://127.0.0.1:4000/
+          curl -fsS -o /dev/null -w "HTTP %{http_code} for /getting-started\n" http://127.0.0.1:4000/getting-started
+          curl -fsS -o /dev/null -w "HTTP %{http_code} for /setup\n" http://127.0.0.1:4000/setup
+          curl -fsS -o /dev/null -w "HTTP %{http_code} for /libraries\n" http://127.0.0.1:4000/libraries
+          curl -fsS -o /dev/null -w "HTTP %{http_code} for /artifacts\n" http://127.0.0.1:4000/artifacts
+
+      - name: Verify landing-page samples
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/node_modules/.bin:${PATH}"
+          npx playwright test
+
+  e2e-wsl:
+    name: E2E install and CLI workflow (windows-latest + wsl)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect WSL distro
+        id: detect_wsl
+        shell: pwsh
+        run: |
+          $ciDistro = "jaiph-ci-ubuntu"
+          $distros = @(wsl -l -q | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+          if ($distros.Count -eq 0) {
+            Write-Warning "No WSL distro is available on this runner. Importing Ubuntu rootfs for CI."
+            $archivePath = Join-Path $env:RUNNER_TEMP "ubuntu-base-amd64.tar.gz"
+            $installPath = Join-Path $env:RUNNER_TEMP "wsl-ubuntu"
+            $ubuntuBaseReleaseIndexUrl = "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/"
+
+            if (Test-Path $installPath) {
+              Remove-Item -Path $installPath -Recurse -Force
+            }
+            New-Item -ItemType Directory -Path $installPath -Force | Out-Null
+            $releaseIndex = Invoke-WebRequest -Uri $ubuntuBaseReleaseIndexUrl
+            $matches = [regex]::Matches($releaseIndex.Content, 'ubuntu-base-24\.04\.(\d+)-base-amd64\.tar\.gz')
+            $candidates = @($matches | ForEach-Object { $_.Value } | Sort-Object -Unique)
+            if ($candidates.Count -eq 0) {
+              Write-Error "Unable to resolve an Ubuntu Base 24.04 amd64 archive from $ubuntuBaseReleaseIndexUrl"
+              exit 1
+            }
+            $archiveName = $candidates |
+              Sort-Object {
+                [int]([regex]::Match($_, '24\.04\.(\d+)-').Groups[1].Value)
+              } -Descending |
+              Select-Object -First 1
+            $ubuntuBaseUrl = "$ubuntuBaseReleaseIndexUrl$archiveName"
+            Write-Host "Downloading Ubuntu base archive: $ubuntuBaseUrl"
+            try {
+              Invoke-WebRequest -Uri $ubuntuBaseUrl -OutFile $archivePath -MaximumRetryCount 3 -RetryIntervalSec 2
+            } catch {
+              Write-Error "Failed to download $ubuntuBaseUrl : $($_.Exception.Message)"
+              exit 1
+            }
+            wsl --import "$ciDistro" "$installPath" "$archivePath" --version 2
+            $distros = @("$ciDistro")
+          }
+          $ubuntu = $distros | Where-Object { $_ -match "^Ubuntu" } | Select-Object -First 1
+          $selected = if ($ubuntu) { $ubuntu } else { $distros[0] }
+          if (-not $selected) {
+            Write-Error "Failed to provision a WSL distro for CI."
+            exit 1
+          }
+          "distro=$selected" >> $env:GITHUB_OUTPUT
+          Write-Host "Using WSL distro: $selected"
+
+      - name: Install Node and run E2E tests in WSL
+        shell: pwsh
+        run: |
+          $workspace = "${{ github.workspace }}"
+          $distro = "${{ steps.detect_wsl.outputs.distro }}"
+          $env:JAIPH_WORKSPACE = $workspace
+          $bashScript = @'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # wsl.exe does not forward the parent runner's env into this Linux
+          # session, so CI (which docs/install treats as "trusted toolchain,
+          # checksum-only OK when minisign is absent") must be re-set here —
+          # this WSL shell IS the CI runner, just one hop removed.
+          export CI=true
+          SUDO=
+          if [ "$(id -u)" -ne 0 ]; then
+            SUDO=sudo
+          fi
+          $SUDO apt-get update
+          # git: required by feature-coverage tests (124_install_command,
+          # 129_artifacts_lib, the git-aware section of 10_basic_workflows).
+          # docs/install only needs git when not installing from a local source,
+          # so installing it here does not change the "no-git host" code path
+          # those tests already cover via JAIPH_FROM_LOCAL.
+          $SUDO apt-get install -y curl ca-certificates git
+          if ! command -v node >/dev/null 2>&1; then
+            if [ -n "$SUDO" ]; then
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            else
+              curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            fi
+            $SUDO apt-get install -y nodejs
+          fi
+          cd "$(wslpath "$JAIPH_WORKSPACE")"
+          npm ci
+          npm run test:e2e
+          '@
+          # PowerShell on Windows can keep CRLF in here-strings; strip CR so bash does not see "pipefail\r".
+          $bashScript = $bashScript -replace "`r", ""
+          wsl -d "$distro" -- bash -lc "$bashScript"
+
+  installer-powershell:
+    name: PowerShell installer (windows-x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript + embed assets
+        run: npm run build
+
+      # Same build as release.yml's windows-x64 leg, so the acceptance runs the
+      # real self-contained binary the release ships.
+      - name: Cross-compile windows-x64 standalone binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun build --compile --target=bun-windows-x64 ./src/cli.ts --outfile jaiph-windows-x64.exe
+          ls -la jaiph-windows-x64.exe
+
+      - name: Run PowerShell installer acceptance (docs/install.ps1)
+        shell: pwsh
+        run: |
+          $env:JAIPH_TEST_WINDOWS_EXE = Join-Path $env:GITHUB_WORKSPACE "jaiph-windows-x64.exe"
+          ./e2e/tests/installer_powershell.ps1
+
+  windows-native-smoke:
+    name: Native Windows smoke (windows-latest, no WSL)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript + embed assets
+        run: npm run build
+
+      # Same build as release.yml's windows-x64 leg / the installer-powershell
+      # job, so the smoke test runs the real self-contained binary we ship.
+      - name: Cross-compile windows-x64 standalone binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun build --compile --target=bun-windows-x64 ./src/cli.ts --outfile jaiph-windows-x64.exe
+          ls -la jaiph-windows-x64.exe
+
+      # Native run only — no `wsl`. Git for Windows' sh.exe (preinstalled on the
+      # runner) is the POSIX shell for inline lines; the harness shadows `wsl` so
+      # any accidental invocation fails the job.
+      - name: Run native Windows smoke (e2e/tests/windows_native_smoke.ps1)
+        shell: pwsh
+        run: |
+          $env:JAIPH_TEST_WINDOWS_EXE = Join-Path $env:GITHUB_WORKSPACE "jaiph-windows-x64.exe"
+          ./e2e/tests/windows_native_smoke.ps1

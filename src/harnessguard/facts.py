@@ -265,6 +265,12 @@ def untrusted_context_hits_in(value: Any) -> list[str]:
     return untrusted_context_hits(text)
 
 
+def _looks_like_mcp(name: str) -> bool:
+    """MCP packages either contain "mcp" or live under the MCP org scope."""
+    lowered = name.lower()
+    return "mcp" in lowered or "modelcontextprotocol" in lowered
+
+
 def mcp_launch_packages(text: str) -> list[str]:
     """MCP server packages launched by a step (npx/uvx/bunx @scope/name@ver)."""
     flat = text.replace("\n", " ")
@@ -273,15 +279,15 @@ def mcp_launch_packages(text: str) -> list[str]:
         for match in MCP_LAUNCH_RE.finditer(fragment):
             for raw in MCP_TOKEN_RE.findall(match.group(0)):
                 token = raw.strip("'\"`,;:()[]{}<>")
-                lowered = token.lower()
-                if "://" in token or token.endswith((".json", ".yaml", ".yml")):
+                # ``mcp__server__tool`` is a Claude Code permission name, not a package.
+                if "://" in token or "__" in token or token.endswith((".json", ".yaml", ".yml")):
                     continue
                 if not any(char.islower() for char in token):
                     continue
                 if token.startswith("@"):
-                    if "mcp" in lowered:
+                    if _looks_like_mcp(token):
                         packages.add(token)
-                elif "/" not in token and "mcp" in lowered:
+                elif "/" not in token and _looks_like_mcp(token):
                     packages.add(token)
     return sorted(packages)
 

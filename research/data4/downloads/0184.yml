@@ -1,0 +1,159 @@
+name: Build and publish image
+
+# Publishes only on an explicit dispatch or the weekly cron. There is deliberately no
+# `push` trigger: a merge to master should not republish `latest` on its own, because
+# what this image contains is decided by the PostHog commit it is built from, not by
+# changes to this repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      posthog_ref:
+        description: 'PostHog commit SHA or branch to build from'
+        required: false
+        default: 'master'
+  schedule:
+    # Weekly. Self-hosted PostHog tracks master, so there is no release to
+    # follow - see the design spec.
+    - cron: '0 3 * * 1'
+  # Changes to the image were previously only ever built on a manual dispatch
+  # or the weekly cron, i.e. after merge. That is how a Dockerfile missing the
+  # mcp-remote the entrypoint execs reached the shipped image: nothing built
+  # the real image on a PR, and the test image's stub covered for it. This
+  # trigger builds and smoke-tests without pushing.
+  pull_request:
+    paths:
+      - 'docker/**'
+      - '.github/workflows/build-image.yml'
+
+# One publisher at a time: two runs finishing out of order would leave `latest`
+# pointing at the older build. Not cancel-in-progress - a half-pushed run
+# should finish rather than be interrupted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/ownego/selfhog-mcp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        # The monorepo checkout plus two images does not fit alongside the
+        # runner's preinstalled toolchains.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Check out PostHog
+        env:
+          REF: ${{ github.event.inputs.posthog_ref || 'master' }}
+        run: |
+          mkdir posthog-src
+          cd posthog-src
+          git init -q
+          git remote add origin https://github.com/PostHog/posthog.git
+          git fetch --depth 1 --filter=blob:none origin "$REF"
+          git checkout -q FETCH_HEAD
+          echo "POSTHOG_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          df -h /
+
+      - name: Build upstream base image
+        working-directory: posthog-src
+        run: |
+          docker build -f services/mcp/Dockerfile \
+            --build-arg COMMIT_HASH="$POSTHOG_SHA" \
+            -t selfhog-mcp-base:local .
+
+      - name: Build our layer
+        run: |
+          docker build -f docker/Dockerfile \
+            --build-arg BASE_IMAGE=selfhog-mcp-base:local \
+            -t "$IMAGE:sha-$POSTHOG_SHA" \
+            -t "$IMAGE:latest" .
+
+      - name: Smoke test http mode
+        run: |
+          docker rm -f smoke >/dev/null 2>&1 || true
+          docker run -d --name smoke -p 18787:3001 \
+            -e POSTHOG_API_BASE_URL=https://posthog.example.com \
+            "$IMAGE:latest"
+          for i in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:18787/readyz >/dev/null 2>&1; then
+              echo "ready after ${i} attempts"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server never became ready"
+          docker logs smoke
+          exit 1
+
+      - name: Smoke test stdio mode
+        # Against the REAL image, not the stubbed test base: this is the only
+        # place mcp-remote is exercised where it actually has to be installed.
+        # The bridge is long-lived, so the run is time-boxed and its exit code
+        # ignored; the assertions are about the streams.
+        run: |
+          set -u
+          out=$(timeout 90 docker run --rm -i \
+            -e MCP_MODE=stdio \
+            -e POSTHOG_API_BASE_URL=https://posthog.example.com \
+            -e POSTHOG_AUTH_HEADER="Bearer phx_smoke" \
+            "$IMAGE:latest" 2>/dev/null </dev/null || true)
+          err=$(timeout 90 docker run --rm -i \
+            -e MCP_MODE=stdio \
+            -e POSTHOG_API_BASE_URL=https://posthog.example.com \
+            -e POSTHOG_AUTH_HEADER="Bearer phx_smoke" \
+            "$IMAGE:latest" 2>&1 >/dev/null </dev/null || true)
+
+          echo "--- stderr ---"
+          echo "$err"
+
+          case "$err" in
+            *"mcp-remote: not found"*|*"exec: mcp-remote"*)
+              echo "FAIL: mcp-remote is not installed in the image"
+              exit 1 ;;
+          esac
+          case "$err" in
+            *"bridging stdio to"*) : ;;
+            *) echo "FAIL: entrypoint never reached the bridge"; exit 1 ;;
+          esac
+          case "$out" in
+            *"[MCP]"*|*"[selfhog-mcp]"*)
+              echo "FAIL: log output leaked onto the JSON-RPC channel"
+              echo "$out"
+              exit 1 ;;
+          esac
+          echo "stdio bridge started with a clean stdout"
+
+      - name: Record image size and memory
+        # The spec lists per-container memory as an unmeasured estimate.
+        # Publish the real number with every build.
+        run: |
+          docker image inspect "$IMAGE:latest" --format 'image size: {{.Size}} bytes'
+          docker stats --no-stream --format 'memory: {{.MemUsage}}' smoke
+
+      # A pull_request run stops here: it proves the image builds and both
+      # modes work, and publishes nothing.
+      - name: Log in to ghcr
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "$IMAGE:sha-$POSTHOG_SHA"
+          docker push "$IMAGE:latest"

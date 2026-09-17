@@ -1,0 +1,477 @@
+name: Qwen Code
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to process"
+        required: true
+        type: string
+
+# Per-issue concurrency: allows parallel work on different issues
+# but prevents duplicate runs for the same issue
+concurrency:
+  group: qwen-code-${{ github.event.issue.number || github.event.pull_request.number || github.event.inputs.issue_number || 'default' }}
+  cancel-in-progress: false
+
+jobs:
+  qwen:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@qwen')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@qwen')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@qwen')) ||
+      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'qwen-code') ||
+      (github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get issue number and detect trigger type
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+            echo "trigger=issue" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+            if [ -n "${{ github.event.issue.pull_request.url }}" ]; then
+              echo "trigger=pr_comment" >> "$GITHUB_OUTPUT"
+              PR_BRANCH=$(gh pr view "${{ github.event.issue.number }}" --json headRefName --jq '.headRefName' 2>/dev/null || echo "")
+              echo "pr_branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
+            else
+              echo "trigger=issue" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ github.event.inputs.issue_number }}" >> "$GITHUB_OUTPUT"
+            echo "trigger=issue" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "pull_request_review_comment" ] || [ "${{ github.event_name }}" = "pull_request_review" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "trigger=pr_comment" >> "$GITHUB_OUTPUT"
+            PR_BRANCH=$(gh pr view "${{ github.event.pull_request.number }}" --json headRefName --jq '.headRefName' 2>/dev/null || echo "")
+            echo "pr_branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=" >> "$GITHUB_OUTPUT"
+            echo "trigger=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check main branch CI health
+        if: (github.event_name == 'issues' && github.event.action == 'labeled') || github.event_name == 'workflow_dispatch'
+        id: main_health
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          LAST_MAIN_CI=$(gh run list --workflow=ci-cd.yml --branch=main --limit 1 --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "unknown")
+          if [ "$LAST_MAIN_CI" = "failure" ]; then
+            echo "WARNING: Main branch CI is currently broken. Proceeding with caution."
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate story dependencies (DAG)
+        if: >-
+          ((github.event_name == 'issues' &&
+          github.event.action == 'labeled' &&
+          github.event.label.name == 'qwen-code') ||
+          github.event_name == 'workflow_dispatch') &&
+          steps.issue.outputs.number != ''
+        id: validate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          DAG_FILE=".github/story-dag.json"
+
+          if [ ! -f "$DAG_FILE" ]; then
+            echo "No DAG file found. Proceeding (might be a non-DAG issue)."
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STORY_EPIC=$(jq -r --argjson num "$ISSUE_NUM" '.stories[($num | tostring)].epic // empty' "$DAG_FILE")
+
+          if [ -z "$STORY_EPIC" ]; then
+            echo "Issue #$ISSUE_NUM is not in the story DAG. Proceeding as ad-hoc."
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STORY_ID=$(jq -r --argjson num "$ISSUE_NUM" '.stories[($num | tostring)].id' "$DAG_FILE")
+          EPIC_NAME=$(jq -r --arg ep "$STORY_EPIC" '.epics[$ep].name' "$DAG_FILE")
+
+          EPIC_STORIES=$(jq -r --arg ep "$STORY_EPIC" '.epics[$ep].stories | @json' "$DAG_FILE")
+          STORY_INDEX=$(echo "$EPIC_STORIES" | jq --argjson num "$ISSUE_NUM" 'to_entries[] | select(.value == $num) | .key')
+
+          if [ "$STORY_INDEX" -gt 0 ]; then
+            PREV_INDEX=$((STORY_INDEX - 1))
+            PREV_ISSUE=$(echo "$EPIC_STORIES" | jq ".[$PREV_INDEX]")
+            PREV_STATE=$(gh issue view "$PREV_ISSUE" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+
+            if [ "$PREV_STATE" = "OPEN" ]; then
+              echo "BLOCKED: Previous story in epic (#$PREV_ISSUE) is still open."
+              echo "valid=false" >> "$GITHUB_OUTPUT"
+              gh issue edit "$ISSUE_NUM" --remove-label "qwen-code"
+              gh issue comment "$ISSUE_NUM" --body "Blocked: Previous story in Epic $STORY_EPIC (#$PREV_ISSUE) is still open. This story will be triggered automatically when it completes."
+              exit 0
+            fi
+          fi
+
+          for DEP_EPIC in $(jq -r --arg ep "$STORY_EPIC" '.epics[$ep].depends_on[]' "$DAG_FILE"); do
+            for DEP_ISSUE in $(jq -r --arg ep "$DEP_EPIC" '.epics[$ep].stories[]' "$DAG_FILE"); do
+              DEP_STATE=$(gh issue view "$DEP_ISSUE" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+              if [ "$DEP_STATE" = "OPEN" ]; then
+                DEP_NAME=$(jq -r --arg ep "$DEP_EPIC" '.epics[$ep].name' "$DAG_FILE")
+                echo "BLOCKED: Dependency Epic $DEP_EPIC ($DEP_NAME) has open story #$DEP_ISSUE."
+                echo "valid=false" >> "$GITHUB_OUTPUT"
+                gh issue edit "$ISSUE_NUM" --remove-label "qwen-code"
+                gh issue comment "$ISSUE_NUM" --body "Blocked: Dependency Epic $DEP_EPIC ($DEP_NAME) is not yet complete (story #$DEP_ISSUE still open). This story will be triggered when all dependencies are met."
+                exit 0
+              fi
+            done
+          done
+
+          echo "DAG validation passed. Story $STORY_ID (Epic $STORY_EPIC: $EPIC_NAME) is ready."
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+
+      - name: Abort if validation failed
+        if: steps.validate.outputs.valid == 'false'
+        run: |
+          echo "Story chain validation failed. Aborting."
+          exit 0
+
+      - name: Verify Qwen LLM endpoint
+        if: steps.validate.outputs.valid != 'false'
+        id: llm_check
+        run: |
+          set +e
+          HEALTH=$(curl -sf --max-time 15 "${{ secrets.QWEN_API_BASE }}/models" 2>/dev/null)
+
+          if [ $? -eq 0 ] && echo "$HEALTH" | jq -e '.data | length > 0' > /dev/null 2>&1; then
+            MODEL=$(echo "$HEALTH" | jq -r '.data[0].id // "unknown"')
+            echo "LLM endpoint healthy. Model: $MODEL"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "WARNING: Qwen LLM endpoint not reachable"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Abort if LLM unavailable
+        if: steps.llm_check.outputs.available == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          if [ -n "$ISSUE_NUM" ]; then
+            gh issue comment "$ISSUE_NUM" --body "Qwen LLM endpoint is not reachable. The DGX Spark server may be offline. Removing label — the watchdog will retry or escalate to Claude." || true
+            gh issue edit "$ISSUE_NUM" --remove-label "qwen-code" || true
+          fi
+          echo "LLM endpoint unavailable. Aborting."
+          exit 1
+
+      - name: Run Qwen Agent
+        if: steps.validate.outputs.valid != 'false' && steps.llm_check.outputs.available == 'true' && steps.issue.outputs.trigger != 'pr_comment'
+        id: qwen
+        env:
+          LLM_BASE_URL: ${{ secrets.QWEN_API_BASE }}
+          LLM_API_KEY: ${{ secrets.QWEN_API_KEY }}
+          LLM_MODEL: "qwen3-coder-next:q4_K_M"
+          MAX_ITERATIONS: "40"
+          REPO_ROOT: ${{ github.workspace }}
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN || secrets.GITHUB_TOKEN }}
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          IS_PR="${{ steps.issue.outputs.is_pr }}"
+
+          # Configure git
+          git config user.name "Qwen Code"
+          git config user.email "qwen@sarathfrancis.work"
+
+          # ── Build the system prompt ──
+          cat > /tmp/system_prompt.txt << 'SYSTEM_EOF'
+          You are an autonomous developer building the Ignite innovation management platform.
+          You have access to tools: bash, read_file, write_file, edit_file, list_files, search_files.
+          Follow every step below precisely.
+
+          ## CONTEXT: Project Architecture
+          This is a T3 Stack application (Next.js 14+ App Router, tRPC, Prisma, Auth.js v5, Tailwind CSS, shadcn/ui).
+          Key architectural rules:
+          - TypeScript strict mode — no `any`, no `as any`, no `@ts-ignore`
+          - tRPC routers are thin dispatch — validate input, check permissions, call service, return result
+          - Services contain ALL business logic — no business logic in routers or components
+          - Status changes ONLY through state machine transition functions — never direct prisma.update({ status })
+          - Events via EventBus — services emit events, listeners handle cross-cutting concerns
+          - RBAC via middleware — every tRPC procedure checks permissions
+          - AI features are optional — platform must function fully without them
+          - The logger uses pino. API is: `logger.info({data}, "message")` — object FIRST, message string SECOND
+          - For string-only logs: `logger.info("message")` is fine
+          - Named exports preferred (except page-level defaults)
+          - One concern per file — max 300 lines
+
+          ## TOOLS USAGE
+          - Use `bash` for: git commands, running tests, npm/npx, gh CLI (GitHub operations)
+          - Use `read_file` to read existing code before modifying
+          - Use `write_file` to create new files
+          - Use `edit_file` to modify existing files (exact string match required)
+          - Use `list_files` to explore the codebase structure
+          - Use `search_files` to find code patterns
+
+          ## EXECUTION DISCIPLINE
+          - You have a LIMITED number of iterations. Do NOT waste them all on research.
+          - Spend at most 8-10 iterations reading/exploring the codebase.
+          - Then START IMPLEMENTING. Write code files, don't just read them.
+          - If you don't have enough context, make reasonable assumptions and implement.
+          - ALWAYS create the feature branch FIRST (Step 1), then explore, then implement.
+          - ALWAYS create the PR LAST (Step 5), even if implementation is partial.
+
+          ## CRITICAL RULES
+          - ALWAYS run `npx prettier --write .` and `npx eslint . --fix` BEFORE committing
+          - NEVER recreate project scaffolding if it already exists
+          - NEVER modify CLAUDE.md, settings.json, or lock files unless explicitly told to
+          - NEVER hardcode secrets or API URLs — use environment variables
+          - NEVER commit .env files
+          - ALWAYS read existing code before making changes
+          - ALWAYS run available validation before committing
+          - Write tests for new features when a test framework is configured
+          - One logical change per commit
+          - The PR body MUST contain `Closes #<issue-number>` for the story chain to work
+          SYSTEM_EOF
+
+          # ── Build the user prompt based on trigger type ──
+          if [ "$IS_PR" = "true" ]; then
+            # Triggered from PR review — fix review feedback
+            PR_NUM="$ISSUE_NUM"
+            REVIEW_BODY=$(gh pr view "$PR_NUM" --json reviews --jq '.reviews | last | .body // ""' 2>/dev/null || echo "")
+            PR_DIFF=$(gh pr diff "$PR_NUM" 2>/dev/null | head -500 || echo "")
+            PR_BRANCH=$(gh pr view "$PR_NUM" --json headRefName --jq '.headRefName' 2>/dev/null || echo "")
+
+            cat > /tmp/user_prompt.txt << PROMPT_EOF
+          ## IF TRIGGERED FROM A PR REVIEW (fixing review feedback)
+
+          PR #${PR_NUM} has review feedback that needs to be addressed.
+
+          ### Review feedback:
+          ${REVIEW_BODY}
+
+          ### Current PR diff (first 500 lines):
+          ${PR_DIFF}
+
+          ### Steps:
+          1. Checkout the PR branch: \`git checkout ${PR_BRANCH}\`
+          2. Read the review comments to understand what needs to be fixed
+          3. Fix the issues raised in the review
+          4. Run available validation checks: npm run typecheck, npm run lint, npm run test
+          5. Commit and push the fixes to the same branch:
+             \`git add -A && git commit -m "fix: address review feedback" && git push origin ${PR_BRANCH}\`
+          6. Post a comment on the PR summarizing what was fixed:
+             \`gh pr comment ${PR_NUM} --body "Fixed the review issues: ..."\`
+          PROMPT_EOF
+          else
+            # Triggered from issue — implement the feature
+            ISSUE_JSON=$(gh issue view "$ISSUE_NUM" --json title,body)
+            TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
+            BODY=$(echo "$ISSUE_JSON" | jq -r '.body')
+
+            cat > /tmp/user_prompt.txt << PROMPT_EOF
+          ## STEP 0: Acknowledge & Update Kanban
+          1. Post an acknowledgment comment on the issue:
+             Use bash: gh issue comment ${ISSUE_NUM} --body "I'm picking up this issue now. I'll create a feature branch, implement, run tests, and open a PR when ready.
+
+             **Agent:** Qwen3-Coder-Next (DGX Spark)
+             **Status:** In Progress
+             **Branch:** \\\`qwen/issue-${ISSUE_NUM}-<slug>\\\`"
+
+          2. Move the issue to "In progress" on the Kanban board:
+             Use bash: chmod +x .github/scripts/update-kanban.sh && GH_TOKEN="${PROJECT_TOKEN}" .github/scripts/update-kanban.sh --issue ${ISSUE_NUM} --status "In progress"
+             If this fails, continue — it's non-blocking.
+
+          ## STEP 1: Create a Feature Branch
+          - Create a new branch from main: \`qwen/issue-${ISSUE_NUM}-<short-slug>\`
+          - The slug should be 2-4 words derived from the issue title (lowercase, hyphenated)
+          - Use bash: git checkout -b qwen/issue-${ISSUE_NUM}-<slug>
+
+          ## STEP 2: Understand What Exists
+          - Use list_files to see the current project structure: src/**/*.ts, prisma/*.prisma
+          - Use read_file on package.json and prisma/schema.prisma
+          - Do NOT recreate files that already exist — build ON TOP of what's there
+
+          ## STEP 3: Implement the Change
+          Issue #${ISSUE_NUM}: ${TITLE}
+
+          ${BODY}
+
+          - Read the issue description carefully for acceptance criteria
+          - Implement the requested feature following existing patterns
+          - Write tests where applicable (Vitest for unit, Playwright for E2E)
+          - Follow naming conventions: camelCase for functions/variables, PascalCase for components/types
+
+          ## STEP 4: Format & Validate
+          - Auto-format ALL code before committing:
+            npx prettier --write .
+            npx eslint . --fix
+          - Run validation checks via bash: npm run typecheck, npm run lint, npm run test
+          - Fix ALL errors before proceeding
+          - If a check command doesn't exist yet (early stories), skip it
+          - Commit your changes:
+            git add -A && git commit -m "feat(<scope>): <description>"
+
+          ## STEP 5: Rebase on Latest Main & Create a Pull Request
+          Before pushing, ALWAYS rebase on the latest main:
+            git fetch origin main && git rebase origin/main
+
+          For package-lock.json conflicts:
+            git checkout --theirs package-lock.json && npm install && git add package-lock.json && git rebase --continue
+
+          For prisma/schema.prisma conflicts:
+            Accept BOTH sides (additive merge), then: npx prisma validate && npx prisma format && git add prisma/schema.prisma && git rebase --continue
+
+          Then push and create the PR:
+            git push --force-with-lease origin <branch>
+            gh pr create --title "${TITLE}" --body "## Summary
+            <what was implemented>
+
+            Closes #${ISSUE_NUM}
+
+            ## Files Changed
+            <list of files and their purpose>
+
+            ## Testing
+            <how this was tested>
+
+            ---
+            Implemented by **Qwen3-Coder-Next** (self-hosted on DGX Spark)"
+
+          After creating the PR, enable auto-merge:
+            gh pr merge <PR_NUMBER> --squash --auto
+
+          ## STEP 6: Update Kanban to In Review
+            chmod +x .github/scripts/update-kanban.sh && GH_TOKEN="${PROJECT_TOKEN}" .github/scripts/update-kanban.sh --issue ${ISSUE_NUM} --status "In review"
+          PROMPT_EOF
+          fi
+
+          # ── Run the agent ──
+          python3 .github/scripts/qwen-agent.py /tmp/system_prompt.txt /tmp/user_prompt.txt
+
+      # ── Qwen for PR COMMENTS (targeted fix/rebase only) ──
+      - name: Run Qwen Agent (PR feedback)
+        if: steps.issue.outputs.trigger == 'pr_comment' && steps.llm_check.outputs.available == 'true'
+        env:
+          LLM_BASE_URL: ${{ secrets.QWEN_API_BASE }}
+          LLM_API_KEY: ${{ secrets.QWEN_API_KEY }}
+          LLM_MODEL: "qwen3-coder-next:q4_K_M"
+          MAX_ITERATIONS: "15"
+          REPO_ROOT: ${{ github.workspace }}
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ steps.issue.outputs.number }}"
+          PR_BRANCH="${{ steps.issue.outputs.pr_branch }}"
+
+          git config user.name "Qwen Code"
+          git config user.email "qwen@sarathfrancis.work"
+
+          # Get latest comment
+          COMMENT=$(gh pr view "$PR_NUM" --json comments --jq '.comments | last | .body' 2>/dev/null || echo "")
+
+          cat > /tmp/system_prompt.txt << 'EOF'
+          You are fixing feedback on an EXISTING pull request. Do NOT re-implement the feature.
+          Do ONLY what the comment asks — nothing more. Be fast and targeted.
+          You have tools: bash, read_file, write_file, edit_file, list_files, search_files.
+          EOF
+
+          cat > /tmp/user_prompt.txt << PROMPT_EOF
+          Fix PR #${PR_NUM} on branch ${PR_BRANCH}.
+
+          The latest comment says:
+          ${COMMENT}
+
+          Steps:
+          1. Checkout the branch: git checkout ${PR_BRANCH}
+          2. Do EXACTLY what's asked:
+             - Rebase: git fetch origin main && git rebase origin/main
+               - package-lock.json conflicts: git checkout --theirs package-lock.json && npm install && git add package-lock.json && git rebase --continue
+               - prisma conflicts: keep ALL models from both sides
+             - Code fixes: make only the specific changes requested
+          3. Push: git push --force-with-lease origin ${PR_BRANCH}
+          4. Comment: gh pr comment ${PR_NUM} --body "Done: <what you did>"
+
+          Do NOT create a new branch. Do NOT re-implement the feature.
+          PROMPT_EOF
+
+          python3 .github/scripts/qwen-agent.py /tmp/system_prompt.txt /tmp/user_prompt.txt
+
+      - name: Validate agent output
+        if: steps.qwen.outcome == 'success' && steps.issue.outputs.trigger != 'pr_comment'
+        id: validate_output
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+
+          # Check if a PR was created for this issue
+          OPEN_PR=$(gh pr list --state open --search "issue-${ISSUE_NUM}" --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+
+          # Check if a branch exists
+          BRANCH_EXISTS=$(git branch -r --list "origin/qwen/issue-${ISSUE_NUM}-*" 2>/dev/null | head -1 || echo "")
+
+          if [ -n "$OPEN_PR" ]; then
+            echo "Agent created PR #$OPEN_PR. Output validated."
+            echo "has_output=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$BRANCH_EXISTS" ]; then
+            echo "Agent created branch but no PR. Partial output."
+            echo "has_output=partial" >> "$GITHUB_OUTPUT"
+          else
+            echo "WARNING: Agent completed successfully but created no branch or PR."
+            echo "has_output=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Remove label on silent failure
+        if: steps.validate_output.outputs.has_output == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          gh issue edit "$ISSUE_NUM" --remove-label "qwen-code" 2>/dev/null || true
+          gh issue comment "$ISSUE_NUM" --body "Qwen Code completed but produced no branch or PR. Removing label so the watchdog can retry.
+
+          **Agent:** Qwen3-Coder-Next
+          **Status:** Silent failure (no output)
+          **Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" || true
+
+      - name: Handle failure
+        if: failure() && steps.issue.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          # Remove label so watchdog can retry
+          gh issue edit "$ISSUE_NUM" --remove-label "qwen-code" 2>/dev/null || true
+          gh issue comment "$ISSUE_NUM" --body "Qwen Code failed to implement this issue. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+
+          **Agent:** Qwen3-Coder-Next
+          **Status:** Failed
+
+          The orchestration watchdog will retry or escalate to Claude if needed." || true

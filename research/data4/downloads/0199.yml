@@ -1,0 +1,636 @@
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.1.0 or v0.1.0. Defaults to Cargo.toml version."
+        required: false
+        type: string
+      publish_crate:
+        description: "Publish to crates.io after GitHub Release is created"
+        required: false
+        default: false
+        type: boolean
+      publish_npm_wrapper:
+        description: "Publish the npm wrapper after binary assets are uploaded"
+        required: false
+        default: false
+        type: boolean
+      publish_pypi_wrapper:
+        description: "Publish the PyPI wrapper after binary assets are uploaded"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binary-artifacts:
+    name: Binary artifact (${{ matrix.target }})
+    if: >
+      github.event_name != 'pull_request' || (
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        startsWith(github.event.pull_request.head.ref, 'release/v')
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-binary-${{ matrix.target }}
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            scripts/release/verify-version.sh "${GITHUB_REF_NAME}"
+          else
+            bash scripts/release/resolve-release-version.sh \
+              "${{ github.event_name }}" \
+              "${{ inputs.version }}" \
+              "${{ github.event.pull_request.head.ref }}"
+          fi
+
+      - name: Release target check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: just VERSION="${{ steps.version.outputs.version }}" release-target-check
+
+      - name: Package binary artifact
+        shell: bash
+        run: |
+          for executable in kml kml-mcp kml-mcp-remote; do
+            python scripts/release/binary_artifacts.py package \
+              --version "${{ steps.version.outputs.version }}" \
+              --target "${{ matrix.target }}" \
+              --executable "$executable"
+          done
+
+      - name: Smoke binary artifact
+        shell: bash
+        run: |
+          for executable in kml kml-mcp kml-mcp-remote; do
+            python scripts/release/binary_artifacts.py smoke \
+              --version "${{ steps.version.outputs.version }}" \
+              --target "${{ matrix.target }}" \
+              --executable "$executable"
+          done
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            target/binary/*-${{ steps.version.outputs.version }}-${{ matrix.target }}.*
+
+  release:
+    name: Release
+    needs: binary-artifacts
+    if: >
+      github.event_name != 'pull_request' || (
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        startsWith(github.event.pull_request.head.ref, 'release/v')
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-ubuntu-stable-publish
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            scripts/release/verify-version.sh "${GITHUB_REF_NAME}"
+          else
+            bash scripts/release/resolve-release-version.sh \
+              "${{ github.event_name }}" \
+              "${{ inputs.version }}" \
+              "${{ github.event.pull_request.head.ref }}"
+          fi
+
+      - name: Release target check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: just VERSION="${{ steps.version.outputs.version }}" release-target-check
+
+      - name: Ensure signed release tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          tag="${{ steps.version.outputs.version }}"
+
+          if [[ -z "${RELEASE_GPG_KEY}" ]]; then
+            echo "RELEASE_GPG_KEY is required to create release tags automatically." >&2
+            exit 1
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}" || true
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists; skipping creation."
+            exit 0
+          fi
+
+          scripts/release/assert-tag-safe.sh "${tag}" origin
+
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          mkdir -p "${GNUPGHOME}"
+          chmod 700 "${GNUPGHOME}"
+          umask 077
+          printf '%s' "${RELEASE_GPG_KEY}" | gpg --batch --import -
+
+          key_id="$(gpg --list-secret-keys --keyid-format=LONG --with-colons | awk -F: '/^sec/ { print $5; exit }')"
+          if [[ -z "${key_id}" ]]; then
+            echo "No secret key available after importing RELEASE_GPG_KEY." >&2
+            exit 1
+          fi
+
+          git config user.name "Katana Release"
+          git config user.email "hfuruno0114@gmail.com"
+          git -c user.signingkey="${key_id}" tag -s "${tag}" -m "Release ${tag}"
+          git push origin "refs/tags/${tag}"
+
+      - name: Verify release tag is GitHub Verified
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.version.outputs.version }}"
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          scripts/release/verify-tag-verified.sh "${tag}" "${GITHUB_REPOSITORY}"
+
+      - name: Format check
+        run: just fmt-check
+
+      - name: Schema consistency check
+        run: just schema-check
+
+      - name: Test
+        run: cargo test --all-features --locked
+
+      - name: Examples
+        run: just examples
+
+      - name: MCP build
+        run: just mcp-build
+
+      - name: MCP stdio smoke
+        run: just mcp-stdio-smoke
+
+      - name: MCP remote build
+        run: just mcp-remote-build
+
+      - name: MCP remote smoke
+        run: just mcp-remote-smoke
+
+      - name: MCPB smoke
+        run: just VERSION="${{ steps.version.outputs.version }}" mcpb-smoke
+
+      - name: MCP Registry metadata
+        run: just VERSION="${{ steps.version.outputs.version }}" server-json-validate
+
+      - name: Action smoke
+        run: just action-smoke
+
+      - name: npm package check
+        run: just npm-package-check
+
+      - name: npm publish target check
+        if: >
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.merged == true &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            startsWith(github.event.pull_request.head.ref, 'release/v')
+          ) || (
+            github.event_name == 'workflow_dispatch' &&
+            inputs.publish_npm_wrapper == true
+          )
+        run: just npm-publish-target-check
+
+      - name: PyPI package check
+        run: just pypi-package-check
+
+      - name: Dogfood
+        run: just dogfood
+
+      - name: Public confidence
+        run: just public-confidence
+
+      - name: Document answer fix
+        run: just document-answer-fix
+
+      - name: Clone upstream markdownlint
+        run: git clone --depth 1 https://github.com/DavidAnson/markdownlint.git "${RUNNER_TEMP}/markdownlint"
+
+      - name: Upstream drift check
+        env:
+          KML_UPSTREAM_MARKDOWNLINT_DOC_DIR: ${{ runner.temp }}/markdownlint/doc
+        run: just upstream-drift
+
+      - name: Clippy
+        run: just lint
+
+      - name: Publish dry-run
+        run: cargo publish --dry-run --locked --allow-dirty
+
+      - name: Install smoke test
+        run: |
+          cargo install --path . --locked --force --root "${RUNNER_TEMP}/kml-install-check" --bin kml
+          "${RUNNER_TEMP}/kml-install-check/bin/kml" init-config --config "${RUNNER_TEMP}/kml-install-check/.markdownlint.json"
+
+      - name: Package crate
+        id: package
+        run: scripts/release/package-crate.sh "${{ steps.version.outputs.version_bare }}"
+
+      - name: Package MCPB
+        id: mcpb
+        run: |
+          just VERSION="${{ steps.version.outputs.version }}" mcp-server-json
+          mcpb_path="target/mcpb/katana-markdown-linter-${{ steps.version.outputs.version_bare }}.mcpb"
+          mcpb_checksum_path="${mcpb_path}.sha256"
+          echo "mcpb_path=${mcpb_path}" >> "$GITHUB_OUTPUT"
+          echo "mcpb_checksum_path=${mcpb_checksum_path}" >> "$GITHUB_OUTPUT"
+          echo "server_json_path=target/mcpb/server.json" >> "$GITHUB_OUTPUT"
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binary-*
+          path: target/binary
+          merge-multiple: true
+
+      - name: Install uv
+        run: python3 -m pip install --upgrade uv
+
+      - name: Wrapper MCP smoke
+        run: scripts/release/smoke-wrappers.sh "${{ steps.version.outputs.version }}" target/binary
+
+      - name: Generate Homebrew formula
+        run: |
+          python3 scripts/release/homebrew_formula.py generate \
+            --version "${{ steps.version.outputs.version }}" \
+            --formula-name kml \
+            --output target/homebrew/kml.rb
+          python3 scripts/release/homebrew_formula.py check \
+            --version "${{ steps.version.outputs.version }}" \
+            --formula-name kml \
+            --output target/homebrew/kml.rb
+          python3 scripts/release/homebrew_formula.py generate \
+            --version "${{ steps.version.outputs.version }}" \
+            --formula-name "kml@${{ steps.version.outputs.version_bare }}" \
+            --output "target/homebrew/kml@${{ steps.version.outputs.version_bare }}.rb"
+          python3 scripts/release/homebrew_formula.py check \
+            --version "${{ steps.version.outputs.version }}" \
+            --formula-name "kml@${{ steps.version.outputs.version_bare }}" \
+            --output "target/homebrew/kml@${{ steps.version.outputs.version_bare }}.rb"
+
+      - name: Build release notes
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            notes_version="${{ steps.version.outputs.cargo_version }}"
+          else
+            notes_version="${{ steps.version.outputs.version_bare }}"
+          fi
+
+          scripts/release/release-notes.sh "$notes_version" > RELEASE_NOTES.md
+
+      - name: Create or update GitHub Release
+        if: >
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.merged == true &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            startsWith(github.event.pull_request.head.ref, 'release/v')
+          ) ||
+          github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.version }}
+          PACKAGE_PATH: ${{ steps.package.outputs.package_path }}
+          CHECKSUM_PATH: ${{ steps.package.outputs.checksum_path }}
+          MCPB_PATH: ${{ steps.mcpb.outputs.mcpb_path }}
+          MCPB_CHECKSUM_PATH: ${{ steps.mcpb.outputs.mcpb_checksum_path }}
+          SERVER_JSON_PATH: ${{ steps.mcpb.outputs.server_json_path }}
+        run: |
+          shopt -s nullglob
+          tag_target="$(git rev-list -n 1 "$TAG")"
+          schema_asset="markdownlint.schema.${TAG}.json"
+          cp "schema/markdownlint.schema.json" "$schema_asset"
+          binary_assets=(
+            target/binary/kml-${TAG}-*.tar.gz
+            target/binary/kml-${TAG}-*.tar.gz.sha256
+            target/binary/kml-${TAG}-*.zip
+            target/binary/kml-${TAG}-*.zip.sha256
+            target/binary/kml-mcp-${TAG}-*.tar.gz
+            target/binary/kml-mcp-${TAG}-*.tar.gz.sha256
+            target/binary/kml-mcp-${TAG}-*.zip
+            target/binary/kml-mcp-${TAG}-*.zip.sha256
+            target/binary/kml-mcp-remote-${TAG}-*.tar.gz
+            target/binary/kml-mcp-remote-${TAG}-*.tar.gz.sha256
+            target/binary/kml-mcp-remote-${TAG}-*.zip
+            target/binary/kml-mcp-remote-${TAG}-*.zip.sha256
+          )
+          if [[ "${#binary_assets[@]}" -ne 24 ]]; then
+            echo "Expected 24 binary assets, found ${#binary_assets[@]}." >&2
+            printf '%s\n' "${binary_assets[@]}" >&2
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "$TAG" \
+              --notes-file RELEASE_NOTES.md \
+              --target "$tag_target"
+            gh release upload "$TAG" "$PACKAGE_PATH" "$CHECKSUM_PATH" "$MCPB_PATH" "$MCPB_CHECKSUM_PATH" "$SERVER_JSON_PATH" "$schema_asset" "${binary_assets[@]}" --clobber
+          else
+            gh release create "$TAG" "$PACKAGE_PATH" "$CHECKSUM_PATH" "$MCPB_PATH" "$MCPB_CHECKSUM_PATH" "$SERVER_JSON_PATH" "$schema_asset" "${binary_assets[@]}" \
+              --verify-tag \
+              --target "$tag_target" \
+              --title "$TAG" \
+              --notes-file RELEASE_NOTES.md
+          fi
+
+      - name: Update Homebrew tap
+        if: >
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.merged == true &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            startsWith(github.event.pull_request.head.ref, 'release/v')
+          ) ||
+          github.event_name == 'workflow_dispatch'
+        env:
+          HOMEBREW_KATANA_GIT_TOKEN: ${{ secrets.HOMEBREW_KATANA_GIT_TOKEN }}
+        run: |
+          python3 scripts/release/update_homebrew_tap.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --current-formula target/homebrew/kml.rb \
+            --versioned-formula "target/homebrew/kml@${{ steps.version.outputs.version_bare }}.rb"
+
+      - name: Publish MCP Registry metadata
+        if: >
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.merged == true &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            startsWith(github.event.pull_request.head.ref, 'release/v')
+          ) || (
+            github.event_name == 'workflow_dispatch' &&
+            (
+              inputs.publish_crate == true ||
+              (
+                inputs.publish_npm_wrapper != true &&
+                inputs.publish_pypi_wrapper != true
+              )
+            )
+          )
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar -xz -f - mcp-publisher
+          ./mcp-publisher login github-oidc
+          set +e
+          publish_output="$(./mcp-publisher publish "${{ steps.mcpb.outputs.server_json_path }}" 2>&1)"
+          publish_status="$?"
+          set -e
+          printf '%s\n' "$publish_output"
+          if [[ "$publish_status" -ne 0 ]]; then
+            if grep -q "cannot publish duplicate version" <<<"$publish_output"; then
+              echo "MCP Registry metadata is already published for this version; continuing."
+            else
+              exit "$publish_status"
+            fi
+          fi
+
+      - name: Publish crate
+        if: >
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.merged == true &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            startsWith(github.event.pull_request.head.ref, 'release/v')
+          ) || (
+            github.event_name == 'workflow_dispatch' &&
+            inputs.publish_crate == true
+          )
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN secret is required to publish to crates.io." >&2
+            exit 1
+          fi
+          scripts/release/assert-crate-not-published.sh "${{ steps.version.outputs.version_bare }}"
+          cargo publish --locked --allow-dirty --token "$CARGO_REGISTRY_TOKEN"
+
+  release-cleanup:
+    name: Release branch cleanup
+    needs:
+      - release
+      - publish-npm-wrapper
+      - publish-pypi-wrapper
+    if: >
+      needs.release.result == 'success' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.merged == true &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'release/v')
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.ref }}
+          fetch-depth: 0
+      - name: Run release cleanup
+        env:
+          CLEANUP_RELEASE_TAG: ${{ needs.release.outputs.release_version }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release/release-cleanup.sh
+
+  publish-npm-wrapper:
+    name: Publish npm wrapper
+    needs: release
+    if: >
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        startsWith(github.event.pull_request.head.ref, 'release/v')
+      ) || (
+        github.event_name == 'workflow_dispatch' &&
+        inputs.publish_npm_wrapper == true
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.ref }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Verify npm trusted publishing context
+        shell: bash
+        run: |
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            echo "npm trusted publishing is unavailable. Configure npm trusted publisher for HiroyukiFuruno/katana-markdown-linter with workflow release.yml and keep id-token: write." >&2
+            exit 1
+          fi
+
+      - name: Verify npm package
+        run: just npm-package-check
+
+      - name: Verify npm publish target
+        run: just npm-publish-target-check
+
+      - name: Enforce trusted publishing for npm publish
+        shell: bash
+        run: |
+          if [ -f "$NPM_CONFIG_USERCONFIG" ]; then
+            sed -i.bak '/registry\.npmjs\.org.*:_authToken/d' "$NPM_CONFIG_USERCONFIG"
+          fi
+          if [ -f "$NPM_CONFIG_USERCONFIG.bak" ]; then
+            rm -f "$NPM_CONFIG_USERCONFIG.bak"
+          fi
+
+      - name: Publish npm wrapper
+        run: npm publish --tag latest --access public --provenance
+        working-directory: wrappers/npm
+
+  publish-pypi-wrapper:
+    name: Publish PyPI wrapper
+    needs: release
+    if: >
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        startsWith(github.event.pull_request.head.ref, 'release/v')
+      ) || (
+        github.event_name == 'workflow_dispatch' &&
+        inputs.publish_pypi_wrapper == true
+      )
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Build PyPI wrapper
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build wrappers/python
+
+      - name: Verify PyPI package
+        run: just pypi-package-check
+
+      - name: Publish PyPI wrapper
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wrappers/python/dist/

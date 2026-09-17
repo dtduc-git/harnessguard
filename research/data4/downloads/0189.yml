@@ -1,0 +1,129 @@
+name: CD # Continuous Deployment
+
+on:
+  push:
+    tags:
+      - "[v]?[0-9]+.[0-9]+.[0-9]+"
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build for ${{ matrix.job.os }}
+    needs: ci
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      matrix:
+        rust: [stable]
+        job:
+          - os: macos-latest
+            os-name: macos
+            target: aarch64-apple-darwin
+            architecture: arm64
+            binary-postfix: ""
+          - os: ubuntu-latest
+            os-name: linux
+            target: x86_64-unknown-linux-gnu
+            architecture: x86_64
+            binary-postfix: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          target: ${{ matrix.job.target }}
+          profile: minimal
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Cargo build
+        run: cargo build --release --target ${{ matrix.job.target }} --bins
+
+      - name: Packaging final binaries
+        shell: bash
+        run: |
+          cd target/${{ matrix.job.target }}/release
+
+          for BINARY_NAME in nom-mcp nom-mcp-remote; do
+            ####### reduce binary size by removing debug symbols #######
+            strip ${BINARY_NAME}${{ matrix.job.binary-postfix }}
+
+            ########## create tar.gz ##########
+            RELEASE_NAME=${BINARY_NAME}-${GITHUB_REF/refs\/tags\//}-${{ matrix.job.os-name }}-${{ matrix.job.architecture }}
+            tar czvf $RELEASE_NAME.tar.gz ${BINARY_NAME}${{ matrix.job.binary-postfix }}
+
+            ########## create sha256 ##########
+            shasum -a 256 $RELEASE_NAME.tar.gz > $RELEASE_NAME.sha256
+          done
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.job.os-name }}-${{ matrix.job.architecture }}
+          path: |
+            target/${{ matrix.job.target }}/release/nom-mcp-*.tar.gz
+            target/${{ matrix.job.target }}/release/nom-mcp-*.sha256
+          retention-days: 1
+
+  nix-check:
+    name: Nix build for ${{ matrix.job.os }}
+    needs: ci
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      matrix:
+        job:
+          - os: macos-latest
+          - os: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: cachix/cachix-action@v16
+        with:
+          name: jeffutter
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - run: nix build .#nom-mcp --accept-flake-config --option log-lines 200
+      - run: nix build .#nom-mcp-remote --accept-flake-config --option log-lines 200
+      - run: nix flake check --accept-flake-config
+
+  release:
+    name: Publish release
+    needs: [build, nix-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Releasing assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify-homelab:
+    name: Notify homelab
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch dependency-release event
+        env:
+          GH_TOKEN: ${{ secrets.HOMELAB_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/jeffutter/homelab/dispatches \
+            -f event_type=dependency-release \
+            -F client_payload[app]=nom-mcp \
+            -F client_payload[tag]="${{ github.ref_name }}"

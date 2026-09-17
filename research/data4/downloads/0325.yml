@@ -1,0 +1,82 @@
+# Application Observability for AWS — mirrors the working setup from
+# aws-observability/application-signals-demo (.github/workflows/awsapm.yml):
+# uses anthropics/claude-code-base-action with dedicated mcp_config/allowed_tools
+# inputs (not claude-code-action@v1 with claude_args), plus a retry on timeout.
+#
+# Test-specific deviations from that reference:
+# - prepare/post use the fix/issues-toctou-comment-filtering branch (under test)
+# - model is global.anthropic.claude-sonnet-5
+
+name: Application observability for AWS (Claude Code Action)
+
+on:
+  issue_comment:
+    types: [created, edited]
+  issues:
+    types: [opened, assigned, edited]
+
+jobs:
+  awsapm-investigation:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@awsapm')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@awsapm') || contains(github.event.issue.title, '@awsapm')))
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write        # To create branches for PRs
+      pull-requests: write   # To post comments on PRs
+      issues: write          # To post comments on issues
+      id-token: write        # Required for AWS OIDC authentication
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+
+      # Step 1: Prepare AWS MCP configuration and investigation prompt
+      - name: Prepare Investigation Context
+        id: prepare
+        uses: aws-actions/application-observability-for-aws@main
+        with:
+          bot_name: "@awsapm"
+          cli_tool: "claude_code"
+
+      # Step 2: Execute investigation with Claude Code (with retry on timeout)
+      # See https://github.com/anthropics/claude-code-action/issues/693
+      - name: Run Claude Investigation - Attempt 1
+        id: claude
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 #v0.0.63
+        with:
+          use_bedrock: "true"
+          model: "global.anthropic.claude-sonnet-5"
+          prompt_file: ${{ steps.prepare.outputs.prompt_file }}
+          mcp_config: ${{ steps.prepare.outputs.mcp_config_file }}
+          allowed_tools: ${{ steps.prepare.outputs.allowed_tools }}
+
+      # Retry if the first attempt fails or times out
+      - name: Run Claude Investigation - Attempt 2
+        id: claude-retry
+        if: steps.claude.outcome == 'failure'
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 #v0.0.63
+        with:
+          use_bedrock: "true"
+          model: "global.anthropic.claude-sonnet-5"
+          prompt_file: ${{ steps.prepare.outputs.prompt_file }}
+          mcp_config: ${{ steps.prepare.outputs.mcp_config_file }}
+          allowed_tools: ${{ steps.prepare.outputs.allowed_tools }}
+
+      # Step 3: Post results back to GitHub issue/PR
+      - name: Post Investigation Results
+        if: always()
+        uses: aws-actions/application-observability-for-aws@main
+        with:
+          cli_tool: "claude_code"
+          comment_id: ${{ steps.prepare.outputs.awsapm_comment_id }}
+          output_file: ${{ steps.claude.outputs.execution_file || steps.claude-retry.outputs.execution_file }}
+          output_status: ${{ steps.claude.outputs.conclusion || steps.claude-retry.outputs.conclusion }}

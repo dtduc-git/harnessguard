@@ -1,0 +1,77 @@
+name: Generate and Deploy Showcase
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev/showcase-improvements  
+      - 'dev/**'  # 支持所有dev开头的分支
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write  # 改为write以允许提交
+  pages: write
+  id-token: write
+
+jobs:
+  generate-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Create data directory
+        run: |
+          mkdir -p data
+          
+      - name: Generate TOOLS.json
+        run: |
+          python scripts/generate_tools_json.py
+          
+      - name: Generate MCP configs
+        run: |
+          python scripts/generate_mcp_configs.py
+          
+      - name: Update contributors
+        run: |
+          python scripts/update_contributors.py
+          
+      - name: Generate showcase page
+        run: |
+          python scripts/generate_simple_showcase.py
+          
+      - name: Commit generated files
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/dev/'))
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/tools.json data/contributors.json data/CONTRIBUTORS.md showcase/index.html servers/*/mcp-config.json || true
+          git commit -m "chore: update generated files [skip ci]" || echo "No changes to commit"
+          git push || echo "No changes to push"
+          
+      - name: Setup Pages
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: actions/configure-pages@v4
+        with:
+          enablement: true
+        
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './showcase'
+          
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,232 @@
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+name: Release
+
+jobs:
+  # This job builds the self-contained executable for each supported platform
+  build-artifacts:
+    name: Build Binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # Linux: Gemini CLI (NodeJS) uses "x64", but Toolbox (Go) uses "amd64".
+          - os: ubuntu-latest
+            platform_name: linux
+            arch_name: x64
+            toolbox_os: linux
+            toolbox_arch: amd64
+            toolbox_ext: ""
+          # macOS: Gemini CLI (NodeJS) and Toolbox (Go) both use "arm64" for Apple Silicon.
+          - os: macos-latest
+            platform_name: darwin
+            arch_name: arm64
+            toolbox_os: darwin
+            toolbox_arch: arm64
+            toolbox_ext: ""
+          # Windows: Gemini CLI (NodeJS) uses "x64", but Toolbox (Go) uses "amd64" with ".exe".
+          - os: windows-latest
+            platform_name: win32
+            arch_name: x64
+            toolbox_os: windows
+            toolbox_arch: amd64
+            toolbox_ext: ".exe"
+
+    steps:
+      # Checkout the repository code
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Install the `uv` Python package manager which handles fast installations
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      # Setup the correct Python version defined by uv
+      - name: Set up Python
+        run: uv python install
+
+      # Install all project dependencies defined in pyproject.toml / uv.lock
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Extract the targeted mcp-toolbox version from pyproject.toml
+      - name: Get Toolbox Version
+        shell: bash
+        run: |
+          TOOLBOX_VERSION=$(grep -o '^toolbox_version = "[^"]*"' pyproject.toml | cut -d '"' -f 2)
+          echo "Found toolbox version: ${TOOLBOX_VERSION}"
+          echo "TOOLBOX_VERSION=${TOOLBOX_VERSION}" >> $GITHUB_ENV
+
+      # Extract evalbench version from pyproject.toml
+      - name: Get Evalbench Version
+        shell: bash
+        run: |
+          EVALBENCH_VERSION=$(grep -o '^evalbench_version = "[^"]*"' pyproject.toml | cut -d '"' -f 2)
+          echo "Found evalbench version: ${EVALBENCH_VERSION}"
+          echo "EVALBENCH_VERSION=${EVALBENCH_VERSION}" >> $GITHUB_ENV
+
+      # Download the pre-compiled mcp-toolbox binary for the target platform
+      - name: Download mcp-toolbox binary
+        shell: bash
+        run: |
+          DOWNLOAD_URL="https://storage.googleapis.com/mcp-toolbox-for-databases/v${TOOLBOX_VERSION}/${{ matrix.toolbox_os }}/${{ matrix.toolbox_arch }}/toolbox${{ matrix.toolbox_ext }}"
+          echo "Downloading toolbox from: ${DOWNLOAD_URL}"
+          curl -L --fail -o "toolbox${{ matrix.toolbox_ext }}" "${DOWNLOAD_URL}"
+          chmod +x "toolbox${{ matrix.toolbox_ext }}"
+
+      # Download the evalbench binary for the target platform
+      - name: Download evalbench binary
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            ARCHIVE="${{ matrix.platform_name }}.${{ matrix.arch_name }}.evalbench.zip"
+          else
+            ARCHIVE="${{ matrix.platform_name }}.${{ matrix.arch_name }}.evalbench.tar.gz"
+          fi
+          DOWNLOAD_URL="https://github.com/GoogleCloudPlatform/evalbench/releases/download/v${EVALBENCH_VERSION}/${ARCHIVE}"
+          echo "Downloading evalbench from: ${DOWNLOAD_URL}"
+          curl -L --fail -o "${ARCHIVE}" "${DOWNLOAD_URL}"
+
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            unzip -o "${ARCHIVE}"
+          else
+            tar -xzf "${ARCHIVE}"
+          fi
+
+          chmod +x "evalbench${{ matrix.toolbox_ext }}"
+          rm "${ARCHIVE}"
+
+      # Package the Python application into a standalone executable using PyInstaller
+      - name: Build binary with PyInstaller
+        run: uv run pyinstaller pyinstaller.spec
+
+      # Validate the built binary starts successfully before packaging
+      - name: Validate binary
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            ./dist/google-cloud-db-context-engineering.exe --help
+          else
+            ./dist/google-cloud-db-context-engineering --help
+          fi
+
+      # Prepare the final distribution folder containing the binary, config, and docs
+      - name: Prepare distribution
+        shell: bash
+        run: |
+          mkdir -p staging
+
+          cp -r plugin/skills/ staging/skills/
+          mkdir -p staging/skills/autoctx-init/scripts/
+          mkdir -p staging/skills/autoctx-evaluate/scripts/
+
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            mv dist/google-cloud-db-context-engineering.exe staging/
+            mv toolbox.exe staging/skills/autoctx-init/scripts/
+            mv evalbench.exe staging/skills/autoctx-evaluate/scripts/
+            BINARY_NAME="\${extensionPath}/google-cloud-db-context-engineering.exe"
+            TOOLBOX_NAME="\${extensionPath}/skills/autoctx-init/scripts/toolbox.exe"
+          else
+            mv dist/google-cloud-db-context-engineering staging/
+            mv toolbox staging/skills/autoctx-init/scripts/
+            mv evalbench staging/skills/autoctx-evaluate/scripts/
+            BINARY_NAME="\${extensionPath}/google-cloud-db-context-engineering"
+            TOOLBOX_NAME="\${extensionPath}/skills/autoctx-init/scripts/toolbox"
+          fi
+
+          jq ".contextFileName = \"GEMINI.md\" | .mcpServers.mcp_db_context_engineering.command = \"$BINARY_NAME\" | .mcpServers.mcp_db_context_engineering.args = [] | .mcpServers.mcp_toolbox = {\"command\": \"$TOOLBOX_NAME\", \"args\": [\"--stdio\", \"--config\", \"autoctx/tools.yaml\"]}" plugin/gemini-extension.json > staging/gemini-extension.json
+          cp plugin/GEMINI.md staging/
+          cp LICENSE staging/
+
+      # Create a compressed tarball archive for Linux and macOS distributions
+      - name: Archive artifacts (Unix)
+        if: runner.os != 'Windows'
+        working-directory: staging
+        run: |
+          tar -czf ../${{ matrix.platform_name }}.${{ matrix.arch_name }}.google-cloud-db-context-engineering.tar.gz *
+
+      # Create a zip archive for Windows distributions
+      - name: Archive artifacts (Windows)
+        if: runner.os == 'Windows'
+        working-directory: staging
+        run: |
+          Compress-Archive -Path * -DestinationPath ../${{ matrix.platform_name }}.${{ matrix.arch_name }}.google-cloud-db-context-engineering.zip
+
+      # Upload the archives to GitHub Actions artifacts so the publish job can access them
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binary-${{ matrix.platform_name }}-${{ matrix.arch_name }}
+          path: |
+            ${{ matrix.platform_name }}.${{ matrix.arch_name }}.google-cloud-db-context-engineering.tar.gz
+            ${{ matrix.platform_name }}.${{ matrix.arch_name }}.google-cloud-db-context-engineering.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  # This job gathers the built executables and attaches them as release assets
+  publish-release:
+    needs: build-artifacts
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      # Download all platform archives generated by the build-artifacts job
+      - name: Download all build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: release-assets
+          pattern: binary-*
+          merge-multiple: true
+
+      # Attach the downloaded archives as assets to the created GitHub Release
+      - name: Upload Release Assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: release-assets/*
+
+  # After PyPI publishes the new wheel, move the `stable` tag to this release.
+  # The Claude Code plugin marketplace pins `ref: stable`, so advancing the tag
+  # advertises the new version — no PR, no manual step. Gated on the PyPI wait
+  # so `stable` never points at a version whose wheel isn't live yet.
+  advance-stable-tag:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Strip leading 'v' from the release tag (e.g. v0.5.1 -> 0.5.1) since PyPI versions are unprefixed.
+      # Poll PyPI for up to 6 hours (72 attempts x 5min) waiting for the wheel to be indexed.
+      - name: Wait for PyPI release
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          TAG="${TAG_NAME}"
+          VERSION="${TAG#v}"
+          PKG="google-cloud-db-context-engineering"
+          for i in {1..72}; do
+            if curl -sf "https://pypi.org/pypi/${PKG}/${VERSION}/json" > /dev/null; then
+              echo "PyPI ${PKG}==${VERSION} is live"
+              exit 0
+            fi
+            echo "Waiting for PyPI ${PKG}==${VERSION} (attempt $i/72)..."
+            sleep 300
+          done
+          echo "::error::Timed out waiting for PyPI ${PKG}==${VERSION}"
+          exit 1
+
+      # Point `stable` at this release commit (checkout leaves HEAD on the tagged
+      # commit for a release event). Force is required to move an existing tag.
+      - name: Advance `stable` tag to this release
+        run: git push -f origin HEAD:refs/tags/stable

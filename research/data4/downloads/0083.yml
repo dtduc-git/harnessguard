@@ -1,0 +1,202 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege, and it earns its keep here: two steps below install
+# code from outside this repo, so a read-only token means a takeover of
+# either upstream still cannot push back.
+permissions:
+  contents: read
+
+jobs:
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate JSON syntax
+        run: |
+          set -e
+          for f in $(find . -type f -name '*.json' -not -path './node_modules/*'); do
+            echo "Checking $f"
+            jq empty "$f"
+          done
+
+      - name: Check marketplace.json required fields
+        run: |
+          set -e
+          F=.claude-plugin/marketplace.json
+          jq -e '.name and .owner.name and (.plugins | type == "array" and length > 0)' "$F" > /dev/null
+          jq -e '.plugins | all(.name and .description and .source)' "$F" > /dev/null
+
+      - name: Check Claude Code plugin.json has required fields
+        run: |
+          set -e
+          F=.claude-plugin/plugin.json
+          test -f "$F" || { echo "missing $F"; exit 1; }
+          jq -e '.name and .description' "$F" > /dev/null
+
+      - name: Check Cursor plugin.json has required fields
+        run: |
+          set -e
+          F=.cursor-plugin/plugin.json
+          test -f "$F" || { echo "missing $F"; exit 1; }
+          jq -e '.name and .description' "$F" > /dev/null
+
+      - name: Check Cursor marketplace.json required fields
+        run: |
+          set -e
+          F=.cursor-plugin/marketplace.json
+          jq -e '.name and .owner.name and (.plugins | type == "array" and length > 0)' "$F" > /dev/null
+          jq -e '.plugins | all(.name and .description and .source)' "$F" > /dev/null
+
+      - name: Check Codex plugin.json required fields
+        run: |
+          set -e
+          F=.codex-plugin/plugin.json
+          test -f "$F" || { echo "missing $F"; exit 1; }
+          jq -e '.name and .version and .description and .skills and .mcpServers and .interface.displayName' "$F" > /dev/null
+          jq -e '(.skills | startswith("./")) and (.mcpServers | startswith("./")) and (.interface.logo | startswith("./"))' "$F" > /dev/null
+
+      - name: Check Codex marketplace.json required fields
+        run: |
+          set -e
+          F=.agents/plugins/marketplace.json
+          test -f "$F" || { echo "missing $F"; exit 1; }
+          jq -e '.name and (.plugins | type == "array" and length > 0)' "$F" > /dev/null
+          jq -e '.plugins | all(.name and .source and .policy.installation and .policy.authentication and .category)' "$F" > /dev/null
+
+      - name: Check Codex MCP config shape
+        run: |
+          set -e
+          MCP="$(jq -r '.mcpServers' .codex-plugin/plugin.json)"
+          test -f "$MCP" || { echo "missing Codex MCP config $MCP"; exit 1; }
+          jq -e '
+            if has("mcp_servers") then
+              (.mcp_servers | type == "object")
+            elif has("mcpServers") then
+              false
+            else
+              (type == "object")
+            end
+          ' "$MCP" > /dev/null
+
+      - name: Check Codex docs do not use stale install command
+        run: |
+          set -e
+          ! grep -R "codex plugin install" README.md AGENTS.md
+
+      - name: Check plugin versions stay in sync
+        run: |
+          set -e
+          VERSION="$(jq -r '.version' package.json)"
+          test "$(jq -r '.version' .claude-plugin/plugin.json)" = "$VERSION"
+          test "$(jq -r '.metadata.version' .claude-plugin/marketplace.json)" = "$VERSION"
+          test "$(jq -r '.version' .cursor-plugin/plugin.json)" = "$VERSION"
+          test "$(jq -r '.metadata.version' .cursor-plugin/marketplace.json)" = "$VERSION"
+          test "$(jq -r '.version' .codex-plugin/plugin.json)" = "$VERSION"
+          test "$(jq -r '.version' kiro/plugin.json)" = "$VERSION"
+
+      - name: Check each skill has SKILL.md with frontmatter
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          for f in skills/*/SKILL.md; do
+            head -1 "$f" | grep -q '^---$' || { echo "missing frontmatter in $f"; exit 1; }
+            grep -q '^name:' "$f" || { echo "missing 'name:' in $f"; exit 1; }
+            grep -q '^description:' "$f" || { echo "missing 'description:' in $f"; exit 1; }
+          done
+
+      # Skill prose is instructions the agent follows, so characters a
+      # reviewer cannot see are an attack surface: zero-width and bidi
+      # characters hide instructions inside an innocent-looking diff, and
+      # long base64 runs smuggle payloads past review (OWASP Agentic
+      # Skills Top 10, AST04 "Insecure Metadata"). The policy lives in
+      # scripts/check-skill-markdown.mjs with table-driven regression
+      # tests in test/skill-markdown.test.ts (run by the sanity workflow).
+      - name: Check skill markdown for characters invisible to reviewers
+        run: node scripts/check-skill-markdown.mjs
+
+      # Canonical cross-vendor validator for the agent-skills spec
+      # (https://agentskills.io/specification). Catches strict-YAML
+      # frontmatter errors and naming-rule violations that the shell
+      # checks above miss — e.g., unquoted colons in description fields,
+      # uppercase letters in the name, consecutive hyphens, etc.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install agent-skills spec validator
+        # Pinned to a commit: unpinned, this runs whatever HEAD is at the
+        # time CI fires. The repo publishes no tags, and Dependabot cannot
+        # see inside `run:`, so bump this by hand when the spec moves.
+        run: |
+          pip install "skills-ref @ git+https://github.com/agentskills/agentskills.git@69ef37e9424c0a7ea9dd2293b559e43ec8176379#subdirectory=skills-ref"
+
+      - name: Validate every skill against the agent-skills spec
+        run: |
+          set -e
+          for d in skills/*/; do
+            echo "Validating $d"
+            skills-ref validate "$d"
+          done
+
+      - name: Check Kiro power manifests and skills mirror the skills/ tree
+        run: |
+          set -e
+          # plugin.json manifest is the Agent Plugins entry point
+          test -f kiro/plugin.json || { echo "missing kiro/plugin.json"; exit 1; }
+          python3 - <<'PY'
+          import json
+          p = json.load(open('kiro/plugin.json'))
+          for k in ("$schema", "name", "description"):
+              assert p.get(k), f"missing {k} in kiro/plugin.json"
+          assert p["$schema"] == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", "wrong $schema"
+          print("kiro plugin.json OK")
+          PY
+          # mcp.json points at the hosted server (same as the other client configs)
+          test -f kiro/mcp.json || { echo "missing kiro/mcp.json"; exit 1; }
+          python3 - <<'PY'
+          import json
+          m = json.load(open('kiro/mcp.json'))
+          assert "GitGuardian" in m.get("mcpServers", {}), "GitGuardian server missing from kiro/mcp.json"
+          print("kiro mcp.json OK")
+          PY
+          # Every skill in skills/ must have a mirror under kiro/skills/ with identical
+          # SKILL.md + references/. The `# x-release-please-version` annotation is
+          # stripped from both sides before diffing, so the comment itself may differ
+          # but the version value must match — Release Please bumps both trees.
+          for s in skills/*/; do
+            name=$(basename "$s")
+            test -f "kiro/skills/$name/SKILL.md" || { echo "kiro/skills/$name/SKILL.md missing"; exit 1; }
+            diff <(sed 's/ # x-release-please-version//' "$s/SKILL.md") \
+                 <(sed 's/ # x-release-please-version//' "kiro/skills/$name/SKILL.md") \
+              || { echo "kiro/skills/$name/SKILL.md drifted from skills/$name/SKILL.md"; exit 1; }
+            if [ -d "$s/references" ]; then
+              for r in "$s"/references/*.md; do
+                b=$(basename "$r")
+                test -f "kiro/skills/$name/references/$b" || { echo "kiro/skills/$name/references/$b missing"; exit 1; }
+                diff "$r" "kiro/skills/$name/references/$b" \
+                  || { echo "kiro/skills/$name/references/$b drifted"; exit 1; }
+              done
+            fi
+          done
+          echo "kiro skills mirror OK"
+
+      - name: Run claude plugin validate
+        # Runs the same validator Anthropic's community-marketplace
+        # submission pipeline uses. Local file-system check only — no
+        # auth or network access required.
+        # See: https://code.claude.com/docs/en/plugins#submit-your-plugin-to-the-community-marketplace
+        #
+        # Pinned, not `@latest`: `@latest` lets an npm-side compromise land
+        # in CI with no diff to review. Bump by hand — Dependabot cannot
+        # see inside `run:`.
+        run: |
+          set -e
+          npm install -g @anthropic-ai/claude-code@2.1.245
+          claude plugin validate .

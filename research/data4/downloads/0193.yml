@@ -1,0 +1,142 @@
+name: Researcher
+
+on:
+  pull_request:
+    types: [opened]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  lit-review:
+    if: startsWith(github.head_ref, 'lit-review/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # fetches entire git history
+
+      - name: Literature Review
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          direct_prompt: |
+            You are a research assistant following CS197 methodology. 
+            Focus on comprehensive paper review using Arxiv. 
+            Once done:
+            - Update related_work/ with your various markdown notes that seem useful/interesting. 
+            - Update section_notes/02-lit-review.md with your review. 
+            - Update paper.jsonl and bit_flip.jsonl with your findings.
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+          allowed_tools: "mcp__search__web_search_exa"
+  ideas:
+    if: startsWith(github.head_ref, 'ideas/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # fetches entire git history
+
+      - name: Experiment Ideas
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          direct_prompt: |
+            You are a research assistant following CS197 methodology. 
+            Design rigorous experiments that an AI agent could run.
+            Check proposal.jsonl and run.jsonl to see what has been done in the past. 
+            Update section_notes/03-experiment-ideas.md with your ideas. Update proposal.jsonl with your proposals.
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+          allowed_tools: "mcp__search__web_search_exa"
+  run:
+    if: startsWith(github.head_ref, 'run/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # fetches entire git history
+
+      - name: Run Experiment
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          direct_prompt: |
+            You are a research assistant following CS197 methodology. 
+            Check run.jsonl and experiments/ to see what has been done in the past. 
+            Choose an experiment from proposal.jsonl and run it. 
+            Use experiments/example_bitflip_001/ as a template for the folder to create and run in.
+            For data, store it in the data/ folder.
+            In your experiments/<exp_id>/, update plan.md with your plan.
+            In your experiments/<exp_id>/, run your experiment in the run/ folder.
+            Once done:
+            - Append your results to section_notes/04-experiment-runs.md. 
+            - Remove the experiment from proposal.jsonl. 
+            - Update run.jsonl with your results. 
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+          allowed_tools: "mcp__search__web_search_exa"
+  analyze:
+    if: startsWith(github.head_ref, 'analyze/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # fetches entire git history
+
+      - name: Analyze Experiment
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          direct_prompt: |
+            You are a research assistant following CS197 methodology. 
+            Check analyze.jsonl and experiments/ to see what has been done in the past. 
+            Given experiments/<exp_id>/, analyze the results in experiments/<exp_id>/results and experiments/<exp_id>/result.md.
+            Once done:
+            - Append your analysis to section_notes/05-experiment-analyses.md.
+            - Update analyze.jsonl with your analysis.

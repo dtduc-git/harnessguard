@@ -1,0 +1,59 @@
+name: Lab 010 - Mcp Remote
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - '/Labs/010-mcp-remote/**'
+      - '/_utils/**'
+      - '/labs-environment/**'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - '/Labs/010-mcp-remote/**'
+      - '/_utils/**'
+      - '/labs-environment/**'
+  workflow_dispatch:
+
+jobs:
+  test-lab-010:
+    name: Test Lab 010
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Set up Kind
+        uses: helm/kind-action@v1.8.0
+        with:
+          cluster_name: kagent-lab
+      
+      - name: Verify Kubernetes cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+      
+      - name: Build labs environment
+        working-directory: /labs-environment
+        run: |
+          docker compose build
+      
+      - name: Load image to Kind
+        run: |
+          kind load docker-image kagent-lab-environment:latest --name kagent-lab
+      
+      - name: Run lab demo script
+        working-directory: /Labs/010-mcp-remote
+        run: |
+          chmod +x _demo.sh
+          bash _demo.sh
+      
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          docker compose logs || true
+          kubectl get all --all-namespaces || true

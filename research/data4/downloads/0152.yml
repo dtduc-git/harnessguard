@@ -1,0 +1,63 @@
+name: Deploy MCP + REST Worker
+
+# Deploys the Cloudflare Worker in mcp-remote/ — the hosted MCP connector AND the
+# read-only /v1 REST API (used by the n8n / Lovable / Obsidian integrations). It
+# runs on pushes to main that touch the worker, and can be triggered by hand from
+# the Actions tab (use the manual run for the very first deploy after merge).
+#
+# One-time setup — add two repo secrets (Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   a token with the "Edit Cloudflare Workers" permission
+#   CLOUDFLARE_ACCOUNT_ID  your Cloudflare account id
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mcp-remote/**'
+      - '.github/workflows/deploy-worker.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — secrets present
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] || [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "::error::Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID repo secrets first."
+            exit 1
+          fi
+
+      - name: Deploy with Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: mcp-remote
+          command: deploy
+
+      - name: Smoke-test the live /v1 REST API
+        run: |
+          URL="https://pm-skills-mcp.pm-claude-skills.workers.dev/v1/skills?limit=1"
+          echo "GET $URL"
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -s -o body.json -w '%{http_code}' "$URL" || echo 000)
+            echo "attempt $attempt → HTTP $code"
+            if [ "$code" = "200" ] && grep -q '"count"' body.json; then
+              echo "REST API is live:"; head -c 400 body.json; echo
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::/v1 REST API did not return a healthy response after deploy."
+          head -c 400 body.json || true
+          exit 1

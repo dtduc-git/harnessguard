@@ -1,0 +1,559 @@
+name: AI Code Review
+
+# Event-driven AI code review using Claude (replaces Copilot review + poller).
+#
+# Reviewer model auto-selection:
+#   Simple PRs  (≤5 files, ≤300 diff lines, no complex patterns) → claude-sonnet-4-6
+#   Complex PRs (large diff OR Realm/SwiftData/ObjC patterns found) → claude-opus-4-6
+#
+# Flow:
+#   agent push  → triage job → review job → posts review → dispatches claude-code.yml
+#   fix_ai_review → fixer pushes → push triggers ai-review.yml again (event-driven)
+#   After 3 review cycles (or APPROVE): assigns @JoeMatt for final review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: write   # To dispatch claude-code.yml
+
+# Cancel an in-progress review if a new push arrives for the same branch/PR.
+concurrency:
+  group: ai-review-${{ github.event.inputs.pr_number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1: Find PR + select reviewer model (pure bash, < 10 seconds)
+  # ─────────────────────────────────────────────────────────────────────────────
+  triage:
+    name: Find PR & select model
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number:    ${{ steps.triage.outputs.pr_number }}
+      pr_title:     ${{ steps.triage.outputs.pr_title }}
+      should_review: ${{ steps.triage.outputs.should_review }}
+      model:        ${{ steps.triage.outputs.model }}
+      followup_workflow: ${{ steps.triage.outputs.followup_workflow }}
+
+    steps:
+      - name: Find PR and select reviewer model
+        id: triage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+
+          # PR number always comes from workflow_dispatch input
+          PR_NUMBER="${{ github.event.inputs.pr_number }}"
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number provided. Skipping."
+            echo "should_review=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PR_TITLE=$(gh pr view "$PR_NUMBER" \
+            --json title --jq '.title' \
+            --repo "${{ github.repository }}" 2>/dev/null || echo "")
+
+          PR_LABELS=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json labels \
+            --jq '[(.labels // [])[].name] | join(",")' \
+            2>/dev/null || echo "")
+
+          HEAD_BRANCH=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json headRefName \
+            --jq '.headRefName // ""' \
+            2>/dev/null || echo "")
+
+          FOLLOWUP_WORKFLOW="claude-code.yml"
+          if echo "$PR_LABELS" | grep -Eq '(^|,)cursor-work(,|$)' || echo "$HEAD_BRANCH" | grep -q 'cursor$'; then
+            FOLLOWUP_WORKFLOW="cursor-agent.yml"
+          fi
+
+          # Skip if the owner (JoeMatt) has already approved — no need to re-review
+          OWNER_APPROVED=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json reviews \
+            --jq '[.reviews[] | select(.state == "APPROVED" and .author.login == "JoeMatt")] | length' \
+            2>/dev/null || echo "0")
+
+          if [ "${OWNER_APPROVED:-0}" -gt 0 ]; then
+            echo "Owner has already approved PR #${PR_NUMBER} — skipping AI review."
+            echo "should_review=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE"   >> "$GITHUB_OUTPUT"
+          echo "should_review=true"   >> "$GITHUB_OUTPUT"
+          echo "followup_workflow=$FOLLOWUP_WORKFLOW" >> "$GITHUB_OUTPUT"
+
+          # ── Model selection heuristics ─────────────────────────────────────
+          # Fetch diff once; derive file/line counts from it (avoids double API call)
+          DIFF_BODY=$(gh pr diff "$PR_NUMBER" \
+            --repo "${{ github.repository }}" 2>/dev/null || echo "")
+
+          FILES_CHANGED=$(echo "$DIFF_BODY" | grep -c '^diff --git' || echo "0")
+          LINES_CHANGED=$(echo "$DIFF_BODY" | grep -cP '^\+[^+]' || echo "0")
+          LINES_DEL=$(echo "$DIFF_BODY" | grep -cP '^-[^-]' || echo "0")
+          TOTAL_LINES=$(( ${LINES_CHANGED:-0} + ${LINES_DEL:-0} ))
+
+          # Check for complexity keywords in the diff
+          COMPLEX_PATTERNS=$(echo "$DIFF_BODY" | \
+            grep -cP 'Realm|ModelContext|@Model|@Relationship|@synchronized|\ actor\ |@MainActor|void\s*\*|PVFile|PVImageFile|PVSaveState|PVGame|SwiftData' \
+            2>/dev/null || echo "0")
+
+          echo "Files: ${FILES_CHANGED}, Lines: ${TOTAL_LINES}, Complex hits: ${COMPLEX_PATTERNS}"
+
+          # Select model
+          if [ "${FILES_CHANGED:-0}" -le 5 ] \
+            && [ "${TOTAL_LINES:-0}" -le 300 ] \
+            && [ "${COMPLEX_PATTERNS:-0}" -eq 0 ]; then
+            MODEL="claude-sonnet-4-6"
+          else
+            MODEL="claude-opus-4-6"
+          fi
+
+          echo "Selected reviewer model: $MODEL"
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: AI Code Review (Claude)
+  # ─────────────────────────────────────────────────────────────────────────────
+  review:
+    name: Review (model ${{ needs.triage.outputs.model }})
+    needs: triage
+    if: needs.triage.outputs.should_review == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Set ai-reviewing label and post status comment
+        id: status_comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUM="${{ needs.triage.outputs.pr_number }}"
+
+          gh pr edit "$PR_NUM" \
+            --add-label "ai-reviewing" \
+            --remove-label "needs-fixes" \
+            --repo "${{ github.repository }}" 2>/dev/null || true
+
+          # Post/update a live status comment so the PR shows reviewer activity
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          MODEL="${{ needs.triage.outputs.model }}"
+
+          cat > /tmp/review_status.md << STATUSEOF
+          <!-- claude-status -->
+          ## 🔍 AI Code Review — In Progress
+
+          **Reviewer:** ${MODEL}
+
+          ### Progress
+          - [x] 🚀 Review started
+          - [ ] 📖 Reading PR diff and context...
+          - [ ] 🔎 Analysing changed files...
+          - [ ] 📝 Posting review...
+
+          *Started: ${TIMESTAMP}*
+          STATUSEOF
+
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+            --jq '[.[] | select(.body | test("<!-- claude-status -->";""))] | last | .id // empty' \
+            2>/dev/null || echo "")
+
+          if [ -n "$EXISTING" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${EXISTING}" \
+              --method PATCH --field body=@/tmp/review_status.md 2>/dev/null || true
+            echo "comment_id=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+              --method POST --field body=@/tmp/review_status.md \
+              --jq '.id' 2>/dev/null || echo "")
+            echo "comment_id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run AI Reviewer
+        id: reviewer_run
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          # Allow github-actions[bot] to trigger this — ai-review-trigger.yml dispatches
+          # this workflow via workflow_dispatch, making the actor a bot, not a human.
+          allowed_bots: 'github-actions[bot]'
+          claude_args: >-
+            --model ${{ needs.triage.outputs.model }}
+            --allowedTools 'Read,Glob,Grep,Bash(gh pr:*),Bash(gh api:*),Bash(gh workflow:*),Bash(cat:*),Bash(sed:*)'
+          prompt: |
+            You are a senior iOS/tvOS Swift engineer performing an automated code review.
+            You are the REVIEWER — do NOT make code changes, commits, or pushes.
+
+            PR to review: #${{ needs.triage.outputs.pr_number }}
+            Repo: ${{ github.repository }}
+            Reviewer model: ${{ needs.triage.outputs.model }}
+            Status comment ID: ${{ steps.status_comment.outputs.comment_id }}
+
+            ## Live Status Updates
+            Update the status comment (ID above) at each phase. Pattern:
+            ```
+            STATUS_ID="${{ steps.status_comment.outputs.comment_id }}"
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+            cat > /tmp/review_status.md << STATUSEOF
+            <!-- claude-status -->
+            ## 🔍 AI Code Review — Phase Name
+
+            **Reviewer:** ${{ needs.triage.outputs.model }}
+
+            ### Progress
+            - [x] 🚀 Review started
+            - [x] 📖 Read PR diff and context
+            - [ ] 🔎 Analysing files...
+            - [ ] 📝 Posting review...
+
+            *Updated: ${TIMESTAMP}*
+            STATUSEOF
+            [ -n "$STATUS_ID" ] && gh api repos/${{ github.repository }}/issues/comments/${STATUS_ID} \
+              --method PATCH --field body=@/tmp/review_status.md 2>/dev/null || true
+            ```
+            Update after STEP 2 (context gathered), after STEP 3 (analysis done), and after STEP 4 (review posted).
+            Final update after STEP 5 should show the verdict with ✅ or 🔧.
+
+            ## STEP 0 — Loop protection (always do this first)
+
+            Count how many GitHub Actions bot reviews already exist:
+            ```
+            REVIEW_COUNT=$(gh api repos/${{ github.repository }}/pulls/${{ needs.triage.outputs.pr_number }}/reviews \
+              --jq '[.[] | select(.user.login == "github-actions[bot]" and .state != "DISMISSED")] | length' \
+              --repo ${{ github.repository }} 2>/dev/null || echo "0")
+            echo "AI review cycle: $REVIEW_COUNT"
+            ```
+
+            If REVIEW_COUNT >= 3:
+            - Post a brief summary review: `gh pr review ${{ needs.triage.outputs.pr_number }} --comment --body "⚠️ Max review cycles (3) reached. Escalating to human review. See previous reviews for outstanding issues." --repo ${{ github.repository }}`
+            - Then dispatch approval: `gh workflow run ${{ needs.triage.outputs.followup_workflow }} --repo ${{ github.repository }} -f pr_number="${{ needs.triage.outputs.pr_number }}" -f action="ai_approved"`
+            - **STOP here — do not post another full review.**
+
+            ## STEP 1 — Check for duplicate review
+
+            Check if a review was already posted for the current HEAD commit:
+            ```
+            HEAD_SHA=$(gh api repos/${{ github.repository }}/pulls/${{ needs.triage.outputs.pr_number }} \
+              --jq '.head.sha' 2>/dev/null || echo "")
+            ALREADY_REVIEWED=$(gh api repos/${{ github.repository }}/issues/${{ needs.triage.outputs.pr_number }}/comments \
+              --jq "[.[] | select(.body | contains(\"ai-review-sha:$HEAD_SHA\"))] | length" \
+              2>/dev/null || echo "0")
+            ```
+            If ALREADY_REVIEWED > 0: stop silently (this push was already reviewed).
+
+            ## STEP 2 — Gather PR context
+
+            ```
+            gh pr view ${{ needs.triage.outputs.pr_number }} --json title,body,baseRefName,headRefName,files --repo ${{ github.repository }}
+            gh pr diff ${{ needs.triage.outputs.pr_number }} --repo ${{ github.repository }}
+            cat .github/prompts/reviewer-context.md
+            cat CLAUDE.md
+            ```
+
+            For each changed file, use Read and Grep to understand the surrounding context:
+            - Read 30 lines around each changed section
+            - Grep for callers, related types, test files for changed functions
+            - Focus on cross-cutting impact — does this change affect callers in other modules?
+
+            ## STEP 3 — Review the changes
+
+            Evaluate only what is actually present in the diff. Check each category:
+
+            **A. Correctness & crashes**
+            - Logic errors, nil force-unwraps without clear invariant
+            - Swallowed errors (`try?` in critical paths without logging)
+            - Incorrect async/await (blocking main thread, wrong actor context)
+
+            **B. Realm thread safety**
+            - Realm `Object` or `Results<T>` crossing thread/actor boundaries
+            - `Results<T>` held across `async` suspension points
+            - Write transactions outside `try realm.write { }`
+
+            **C. SwiftData patterns**
+            - `@Model` missing `@Attribute(.unique)` on primary key fields
+            - `ModelContext` treated as Sendable (it is not)
+            - `@Relationship` missing `deleteRule`
+            - Lazy sequences not materialized before actor hop
+
+            **D. ObjC/C++ bridge thread safety**
+            - Flags shared between UI thread and emulator thread without `@synchronized(self)`
+            - Both the write side AND read side must use the same lock object
+
+            **E. Module dependency tiers**
+            - New `import` statements — verify no lower tier importing higher tier
+            - New `public` API that shouldn't be public
+
+            **F. Availability guards**
+            - SwiftData APIs must be gated with `@available(iOS 17, tvOS 17, ...)`
+            - Check any new iOS-version-specific API usage
+
+            **G. Upstream submodule source (always CRITICAL)**
+            - Any edit to `Cores/<name>/<upstream-dir>/` is never acceptable
+
+            **H. SwiftLint**
+            - Lines > 200 characters (only flag obvious cases, not borderline)
+            - `force_cast`/`force_try` in truly critical crash-prone paths
+
+            ## STEP 4 — Post the review
+
+            Determine your verdict first, then write the body to a temp file and post it.
+            IMPORTANT: Use `--body-file` — do NOT use `--body "$(cat <<...)"` (the heredoc
+            collapses to a single line when used inside a command substitution).
+
+            CYCLE=$((REVIEW_COUNT + 1))
+
+            **If verdict is APPROVE** (no CRITICAL or MAJOR issues):
+            ```
+            cat > /tmp/review_body.md << 'REVIEW_BODY'
+            ## AI Code Review — Cycle CYCLE_PLACEHOLDER/3
+            > Reviewer: MODEL_PLACEHOLDER
+
+            ### Summary
+            <one paragraph overall assessment>
+
+            ### Issues
+            **🔴 CRITICAL** — none
+            **🟠 MAJOR** — none
+            **🟡 MINOR** — <list or "none">
+            **⚪ NIT** — <list or "none">
+
+            ### Verdict: APPROVE ✅
+            REVIEW_BODY
+            sed -i "s/CYCLE_PLACEHOLDER/${CYCLE}/g" /tmp/review_body.md
+            sed -i "s/MODEL_PLACEHOLDER/${{ needs.triage.outputs.model }}/g" /tmp/review_body.md
+            gh pr review ${{ needs.triage.outputs.pr_number }} \
+              --repo ${{ github.repository }} \
+              --approve \
+              --body-file /tmp/review_body.md
+            ```
+
+            **If verdict is REQUEST_CHANGES** (any CRITICAL or MAJOR issue):
+            ```
+            cat > /tmp/review_body.md << 'REVIEW_BODY'
+            ## AI Code Review — Cycle CYCLE_PLACEHOLDER/3
+            > Reviewer: MODEL_PLACEHOLDER
+
+            ### Summary
+            <one paragraph overall assessment>
+
+            ### Issues
+
+            **🔴 CRITICAL** *(must fix)*
+            - `path/to/file.swift:line` — description and suggested fix
+
+            **🟠 MAJOR** *(should fix)*
+            - `path/to/file.swift:line` — description
+
+            **🟡 MINOR** *(optional)*
+            - `path/to/file.swift:line` — note
+
+            **⚪ NIT**
+            - trivial style notes
+
+            ### Verdict: REQUEST_CHANGES 🔧
+
+            ---
+            > 🤖 *An automated fixer workflow has been dispatched to address CRITICAL and MAJOR issues automatically.*
+            REVIEW_BODY
+            sed -i "s/CYCLE_PLACEHOLDER/${CYCLE}/g" /tmp/review_body.md
+            sed -i "s/MODEL_PLACEHOLDER/${{ needs.triage.outputs.model }}/g" /tmp/review_body.md
+            gh pr review ${{ needs.triage.outputs.pr_number }} \
+              --repo ${{ github.repository }} \
+              --request-changes \
+              --body-file /tmp/review_body.md
+            ```
+
+            Rules for verdict:
+            - **APPROVE**: No CRITICAL or MAJOR issues (MINORs and NITs are fine)
+            - **REQUEST_CHANGES**: Any CRITICAL or MAJOR issue found
+
+            ## STEP 5 — Post SHA marker and dispatch follow-up
+
+            After posting the review, post a hidden marker comment with the SHA (prevents re-reviewing same commit):
+            ```
+            HEAD_SHA=$(gh api repos/${{ github.repository }}/pulls/${{ needs.triage.outputs.pr_number }} --jq '.head.sha')
+            gh pr comment ${{ needs.triage.outputs.pr_number }} \
+              --repo ${{ github.repository }} \
+              --body "<!-- ai-review-sha:$HEAD_SHA -->"
+            ```
+
+            Then dispatch the appropriate follow-up workflow:
+
+            If **APPROVE**:
+            ```
+            gh workflow run ${{ needs.triage.outputs.followup_workflow }} \
+              --repo ${{ github.repository }} \
+              -f pr_number="${{ needs.triage.outputs.pr_number }}" \
+              -f action="ai_approved"
+            ```
+
+            If **REQUEST_CHANGES**:
+            ```
+            gh workflow run ${{ needs.triage.outputs.followup_workflow }} \
+              --repo ${{ github.repository }} \
+              -f pr_number="${{ needs.triage.outputs.pr_number }}" \
+              -f action="fix_ai_review"
+            ```
+
+            ## FINAL OUTPUT
+
+            After completing ALL steps above, output EXACTLY one of these lines to stdout.
+            This becomes the action's auto-posted PR comment — make it clean and informative.
+            Replace CYCLE with the actual cycle number computed above.
+
+            If verdict was APPROVE:
+            `✅ AI review complete — Verdict: APPROVE (cycle CYCLE/3)`
+
+            If verdict was REQUEST_CHANGES:
+            `🔧 AI review complete — REQUEST_CHANGES (cycle CYCLE/3). Auto-fixer dispatched.`
+
+            Output ONLY this single line. No summaries, no explanations, no extra markdown.
+
+      # If Claude failed (rate limit, auth error), try Kimi Code (kimi-for-coding, 256k ctx)
+      # as a fallback reviewer via its Anthropic-compatible API (api.kimi.com/coding).
+      - name: Kimi fallback review
+        if: steps.reviewer_run.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        run: |
+          PR_NUM="${{ needs.triage.outputs.pr_number }}"
+          REPO="${{ github.repository }}"
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          # --- Fetch PR metadata and diff ---
+          PR_JSON=$(gh api "repos/${REPO}/pulls/${PR_NUM}" 2>/dev/null || echo '{}')
+          PR_TITLE=$(echo "$PR_JSON" | jq -r '.title // "Unknown"')
+          PR_BODY=$(echo "$PR_JSON"  | jq -r '.body  // ""')
+          DIFF=$(gh pr diff "$PR_NUM" --repo "$REPO" 2>/dev/null | head -c 40000 || echo "")
+
+          if [ -z "$KIMI_API_KEY" ] || [ -z "$DIFF" ]; then
+            echo "Kimi key missing or diff empty — falling back to manual notice"
+            KIMI_FAILED=true
+          else
+            # --- Build prompt payload (Anthropic messages format) ---
+            cat > /tmp/kimi_payload.json << PAYLOAD_EOF
+          {
+            "model": "kimi-for-coding",
+            "max_tokens": 4096,
+            "system": "You are an experienced Swift/iOS code reviewer. Review the provided PR diff carefully and produce a concise structured review. Focus on correctness, memory safety, threading, API misuse, and Swift best practices. Be direct and specific — cite file paths and line numbers where possible.",
+            "messages": [
+              {
+                "role": "user",
+                "content": "PR #${PR_NUM}: ${PR_TITLE}\n\nDescription:\n${PR_BODY}\n\nDiff (truncated to 60k chars):\n\`\`\`diff\n${DIFF}\n\`\`\`\n\nProvide your review in this format:\n\n## AI Code Review (Kimi fallback — Claude rate-limited)\n\n### Summary\n<one paragraph>\n\n### Issues\n**🔴 CRITICAL** *(must fix)*\n- or 'none'\n\n**🟠 MAJOR** *(should fix)*\n- or 'none'\n\n**🟡 MINOR** *(optional)*\n- or 'none'\n\n**⚪ NIT**\n- or 'none'\n\n### Verdict: APPROVE ✅  or  REQUEST_CHANGES 🔧\n\n---\n> 🤖 *Fallback review by Kimi Code (kimi-for-coding, 256k ctx). Claude Code was rate-limited.*"
+              }
+            ]
+          }
+          PAYLOAD_EOF
+
+            # --- Call Kimi Code API (Anthropic-compatible) ---
+            KIMI_RESP=$(curl -sf -X POST "https://api.kimi.com/coding/v1/messages" \
+              -H "x-api-key: ${KIMI_API_KEY}" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              -d @/tmp/kimi_payload.json 2>/dev/null || echo "")
+
+            KIMI_REVIEW=$(echo "$KIMI_RESP" | jq -r '[.content[]?.text] | join("") | select(length > 0)' 2>/dev/null || echo "")
+
+            if [ -z "$KIMI_REVIEW" ]; then
+              echo "Kimi API call failed or returned empty content"
+              KIMI_FAILED=true
+            else
+              KIMI_FAILED=false
+              # Post the Kimi review as a PR comment (not a formal review — Kimi has no GH token)
+              echo "$KIMI_REVIEW" > /tmp/kimi_review.md
+              gh pr comment "$PR_NUM" --body-file /tmp/kimi_review.md \
+                --repo "$REPO" 2>/dev/null || true
+
+              # Remove ai-reviewing label; add ai-reviewed
+              gh pr edit "$PR_NUM" \
+                --remove-label "ai-reviewing" \
+                --add-label "ai-reviewed" \
+                --repo "$REPO" 2>/dev/null || true
+
+              # Update status comment
+              STATUS_ID="${{ steps.status_comment.outputs.comment_id }}"
+              if [ -n "$STATUS_ID" ]; then
+                cat > /tmp/kimi_status.md << STATUSEOF
+          <!-- claude-status -->
+          ## ✅ AI Review Complete (Kimi fallback)
+
+          **Primary reviewer:** ${{ needs.triage.outputs.model }} — rate-limited
+          **Fallback reviewer:** Kimi Code (kimi-for-coding, 256k ctx)
+
+          Review posted as PR comment above.
+
+          *Completed: ${TIMESTAMP}*
+          STATUSEOF
+                gh api "repos/${REPO}/issues/comments/${STATUS_ID}" \
+                  --method PATCH --field body=@/tmp/kimi_status.md 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # --- Both Claude and Kimi failed: post manual notice ---
+          if [ "${KIMI_FAILED:-true}" = "true" ]; then
+            cat > /tmp/review_failure.md << 'FAILEOF'
+          <!-- agent-failure-notice -->
+          ## ⚠️ AI Review Failed
+
+          Both Claude Code (rate-limited) and Kimi (fallback) could not complete the review.
+
+          **Options:**
+          1. **Wait** for the Claude Code token window to reset (~2 hours) and re-run
+          2. **Review manually** or use Cursor locally / with `@cursor`
+          3. **Re-trigger** by re-running the `AI PR Review` workflow
+
+          FAILEOF
+            echo "*Failed: ${TIMESTAMP}*" >> /tmp/review_failure.md
+
+            gh pr comment "$PR_NUM" --body-file /tmp/review_failure.md \
+              --repo "$REPO" 2>/dev/null || true
+
+            gh pr edit "$PR_NUM" \
+              --add-label "needs-manual-intervention" \
+              --remove-label "ai-reviewing" \
+              --repo "$REPO" 2>/dev/null || true
+
+            STATUS_ID="${{ steps.status_comment.outputs.comment_id }}"
+            if [ -n "$STATUS_ID" ]; then
+              cat > /tmp/review_status.md << STATUSEOF
+          <!-- claude-status -->
+          ## ❌ AI Review Failed
+
+          **Reviewer:** ${{ needs.triage.outputs.model }} (rate-limited)
+          **Fallback:** Kimi — also failed
+
+          Manual review needed, or re-trigger once tokens are available.
+
+          *Failed: ${TIMESTAMP}*
+          STATUSEOF
+              gh api "repos/${REPO}/issues/comments/${STATUS_ID}" \
+                --method PATCH --field body=@/tmp/review_status.md 2>/dev/null || true
+            fi
+          fi

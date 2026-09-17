@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # tonic-build / prost-build shell out to `protoc` at build time to
+      # regenerate the gRPC stubs, so every release runner needs the
+      # protobuf compiler before `cargo build` runs. macOS images carry
+      # Homebrew preinstalled; Linux images use apt.
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Build pcx binary
+        # pcx is shipped by post-cortex-daemon as of the 8-crate workspace
+        # refactor; `-p` selects the right member crate to build.
+        run: cargo build --release --bin pcx -p post-cortex-daemon --target ${{ matrix.target }} --features "post-cortex-daemon/embeddings,post-cortex-daemon/surrealdb-storage"
+
+      - name: Strip pcx binary
+        run: strip target/${{ matrix.target }}/release/pcx
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/pcx dist/pcx-${{ matrix.target }}
+
+      - name: Upload pcx binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcx-${{ matrix.target }}
+          path: dist/pcx-${{ matrix.target }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: ls -R artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/pcx-x86_64-apple-darwin/pcx-x86_64-apple-darwin
+            artifacts/pcx-aarch64-apple-darwin/pcx-aarch64-apple-darwin
+            artifacts/pcx-x86_64-unknown-linux-gnu/pcx-x86_64-unknown-linux-gnu
+          body: |
+            ## Post-Cortex ${{ github.ref_name }}
+
+            **pcx** - Unified MCP server with multi-transport support (stdio + SSE daemon)
+
+            ## Installation
+
+            ### Homebrew (macOS/Linux) - Recommended
+            ```bash
+            brew install julymetodiev/tap/post-cortex
+            ```
+
+            ### Direct Download
+            Download binary for your platform:
+            - macOS Intel: `pcx-x86_64-apple-darwin`
+            - macOS Apple Silicon: `pcx-aarch64-apple-darwin`
+            - Linux: `pcx-x86_64-unknown-linux-gnu`
+
+            ### Cargo
+            ```bash
+            cargo install --git https://github.com/julymetodiev/post-cortex --features "embeddings,surrealdb-storage"
+            ```
+
+            ## Usage
+
+            ### Stdio mode (for MCP clients)
+            ```bash
+            pcx                    # Auto-starts daemon if needed
+            ```
+
+            Add to Claude config:
+            ```json
+            {
+              "mcpServers": {
+                "post-cortex": {
+                  "command": "pcx"
+                }
+              }
+            }
+            ```
+
+            ### Daemon mode (SSE server)
+            ```bash
+            pcx start              # Foreground
+            pcx start --daemon     # Background
+            pcx status             # Check status
+            ```
+
+            Default: http://127.0.0.1:3737
+
+            ### Admin commands
+            ```bash
+            pcx workspace list     # List workspaces
+            pcx session list       # List sessions
+            ```
+
+            For full documentation, see the [README](https://github.com/julymetodiev/post-cortex)

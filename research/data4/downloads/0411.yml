@@ -1,0 +1,409 @@
+name: "[v1] Manual Benchmark Run"
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent:
+        description: Agent to run
+        required: true
+        default: claude
+        type: choice
+        options:
+          - claude
+          - codex
+          - gemini
+          - grok
+          - agy
+          - opencode
+          - goose
+          - qwen
+          - aider
+          - cursor
+          - copilot
+          - vibe
+          - kimi
+          - dns
+      provider:
+        description: Provider (openai, anthropic, google, openrouter, etc.)
+        required: true
+        default: anthropic
+        type: choice
+        options:
+          - openai
+          - groq
+          - cerebras
+          - anthropic
+          - google
+          - openrouter
+          - dashscope
+          - xai
+          - deepseek
+          - moonshot
+          - zai
+          - mistral
+      model:
+        description: Model to use (e.g., claude-sonnet-4-20250514)
+        required: true
+        default: claude-3-5-haiku-20241022
+      exercise:
+        description: "Exercise selection: number (first N), comma list, or name"
+        required: false
+        default: ""
+      custom_instruction:
+        description: "Additional instruction text appended to the prompt"
+        required: false
+        default: ""
+      verbose:
+        description: Verbose console output
+        required: false
+        default: false
+        type: boolean
+
+run-name: 'Benchmark for ${{ github.event.inputs.agent }} using ${{ github.event.inputs.model }}'
+
+jobs:
+  run-benchmark:
+    name: Run Benchmark
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    timeout-minutes: 120
+    env:
+      RESULT_DIR: ./data/results
+      OUTPUT_DIR: ./results
+      USE_DOCKER: 'false'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node (for corepack/yarn)
+        uses: actions/setup-node@v4
+        with:
+          # dsh (the dns agent CLI) requires Node >= 22.18 (Promise.withResolvers,
+          # node:module.stripTypeScriptTypes); 20 is no longer sufficient.
+          node-version: "24"
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install agent CLI (local mode)
+        if: ${{ env.USE_DOCKER == 'false' }}
+        run: |
+          set -euo pipefail
+          agent="${{ github.event.inputs.agent }}"
+          echo "Installing CLI for agent: $agent"
+          case "$agent" in
+            claude)
+              npm install -g @anthropic-ai/claude-code
+              mkdir -p "$HOME/.claude"
+              ;;
+            codex)
+              npm install -g @openai/codex
+              # Provide default AGENTS.md (optional)
+              echo "Solve this TypeScript exercise. Read the test file to understand requirements and implement the solution." > AGENTS.md
+              ;;
+            goose)
+              curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+              echo "HOME=$HOME" >> "$GITHUB_ENV"
+              echo "PATH=$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
+              ;;
+            aider)
+              curl -LsSf https://aider.chat/install.sh | sh
+              echo "PATH=$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
+              ;;
+            gemini)
+              npm install -g @google/gemini-cli
+              ;;
+            grok)
+              curl -fsSL https://x.ai/cli/install.sh | bash
+              # The x.ai installer puts the binary in ~/.grok/bin, not ~/.local/bin
+              echo "PATH=$HOME/.grok/bin:$PATH" >> "$GITHUB_ENV"
+              ;;
+            agy)
+              curl -fsSL https://antigravity.google/cli/install.sh | bash
+              # The Antigravity installer puts the binary in ~/.local/bin
+              echo "PATH=$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
+              ;;
+            qwen)
+              npm install -g @qwen-code/qwen-code
+              ;;
+            opencode)
+              npm install -g opencode-ai
+              ;;
+            cursor)
+              curl -fsS https://cursor.com/install | bash
+              echo "PATH=$HOME/.cursor/bin:$PATH" >> "$GITHUB_ENV"
+              ;;
+            copilot)
+              npm install -g @github/copilot
+              ;;
+            vibe)
+              pip install mistral-vibe
+              ;;
+            kimi)
+              curl -LsSf https://code.kimi.com/install.sh | bash
+              echo "PATH=$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
+              ;;
+            dns)
+              npm install -g @deepseek-ai/dsh
+              ;;
+            *)
+              echo "No installer defined for agent: $agent" >&2
+              ;;
+          esac
+
+      - name: Setup Codex config.toml
+        if: ${{ github.event.inputs.agent == 'codex' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.codex"
+          CONFIG_PATH="$HOME/.codex/config.toml"
+          echo "Writing Codex config to $CONFIG_PATH"
+          cat > "$CONFIG_PATH" << 'EOF'
+          # Auto-generated by CI (CLI provides model/provider)
+          [model_providers.openai]
+          name = "OpenAI"
+          base_url = "https://api.openai.com/v1"
+          env_key = "OPENAI_API_KEY"
+
+          [model_providers.anthropic]
+          name = "Anthropic"
+          base_url = "https://api.anthropic.com/v1"
+          env_key = "ANTHROPIC_API_KEY"
+          
+          [model_providers.cerebras]
+          name = "Cerebras"
+          base_url = "https://api.cerebras.ai/v1"
+          env_key = "CEREBRAS_API_KEY"
+          
+          [model_providers.groq]
+          name = "Groq"
+          base_url = "https://api.groq.com/openai/v1"
+          env_key = "GROQ_API_KEY"
+          
+          [model_providers.openrouter]
+          name = "OpenRouter"
+          base_url = "https://openrouter.ai/api/v1"
+          env_key = "OPENROUTER_API_KEY"
+          EOF
+
+      - name: Check local agent availability
+        if: ${{ env.USE_DOCKER == 'false' }}
+        run: |
+          set -euo pipefail
+          agent="${{ github.event.inputs.agent }}"
+          ok=0
+          case "$agent" in
+            claude)   cmd=claude ;;
+            goose)    cmd=goose ;;
+            aider)    cmd=aider ;;
+            codex)    cmd="codex --version" ;;
+            gemini)   cmd=gemini ;;
+            grok)     cmd=grok ;;
+            agy)      cmd=agy ;;
+            opencode) cmd=opencode ;;
+            qwen)     cmd=qwen ;;
+            cursor)   cmd=cursor-agent ;;
+            copilot)  cmd="copilot --version" ;;
+            vibe)     cmd=vibe ;;
+            kimi)     cmd="kimi --version" ;;
+            dns)      cmd=dsh ;;
+            *)        cmd="" ;;
+          esac
+
+          if [ -z "$cmd" ]; then
+            echo "Unknown agent: $agent" >&2
+            exit 1
+          fi
+
+          if echo "$cmd" | grep -q '^npx'; then
+            # npx-based command
+            if $cmd >/dev/null 2>&1; then ok=1; fi
+          else
+            if command -v "$cmd" >/dev/null 2>&1; then ok=1; fi
+          fi
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::warning::Agent CLI '$agent' not found for local mode. Install it in this workflow or set USE_DOCKER to true." >&2
+          else
+            echo "Agent CLI '$agent' found."
+          fi
+
+      - name: Setup Grok model config
+        if: ${{ github.event.inputs.agent == 'grok' && env.USE_DOCKER == 'false' }}
+        env:
+          MODEL: ${{ github.event.inputs.model }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.grok"
+
+          cat > "$HOME/.grok/config.toml" <<EOF
+          [model."${MODEL}"]
+          model = "${MODEL}"
+          base_url = "https://api.x.ai/v1"
+          name = "${MODEL}"
+          env_key = "GROK_CODE_XAI_API_KEY"
+
+          [models]
+          default = "${MODEL}"
+          EOF
+
+      - name: List Grok models
+        if: ${{ github.event.inputs.agent == 'grok' && env.USE_DOCKER == 'false' }}
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GROK_CODE_XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "Available Grok CLI models:"
+          grok models || {
+            echo "::warning::Unable to list Grok CLI models. Continuing with configured model."
+          }
+
+      - name: Run benchmark
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GROK_CODE_XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CUSTOM_INSTRUCTION: ${{ github.event.inputs.custom_instruction }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ env.RESULT_DIR }}"
+          mkdir -p "${{ env.OUTPUT_DIR }}"
+
+          CMD=(bun src/index.ts \
+            --agent "${{ github.event.inputs.agent }}" \
+            --model "${{ github.event.inputs.model }}" \
+            --provider "${{ github.event.inputs.provider }}" \
+            --output-dir "${{ env.OUTPUT_DIR }}")
+
+          # Toggle Docker execution when USE_DOCKER is true
+          if [ "${{ env.USE_DOCKER }}" = "true" ]; then
+            CMD+=(--docker)
+          fi
+
+          # Persist results for GitHub Actions runs to power summaries
+          CMD+=(--save-result --result-dir "${{ env.RESULT_DIR }}")
+
+          # Exercise selection (number, comma list, or name)
+          if [ -n "${{ github.event.inputs.exercise }}" ]; then
+            CMD+=(--exercise "${{ github.event.inputs.exercise }}")
+          fi
+
+          # Verbose output toggle
+          if [ "${{ github.event.inputs.verbose }}" = "true" ]; then
+            CMD+=(--verbose)
+          fi
+
+          # Custom instruction (append to prompt)
+          if [ -n "${CUSTOM_INSTRUCTION:-}" ]; then
+            CMD+=(--custom-instruction "${CUSTOM_INSTRUCTION}")
+          fi
+
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}" | tee benchmark-summary.txt
+
+      # Fixed artifact name; safe-name step not needed
+
+      - name: Write Job Summary
+        if: always()
+        run: |
+          {
+            echo "## Benchmark Results"
+            echo
+            echo "- Agent: ${{ github.event.inputs.agent }}"
+            echo "- Model: ${{ github.event.inputs.model }}"
+            echo "- Provider: ${{ github.event.inputs.provider }}"
+            if [ -n "${{ github.event.inputs.custom_instruction }}" ]; then
+              PREVIEW=$(printf %s "${{ github.event.inputs.custom_instruction }}" | tr '\n' ' ' | sed -E 's/\s+/ /g' | cut -c1-140)
+              echo "- Custom Instruction: ${PREVIEW}$( [ ${#PREVIEW} -eq 140 ] && echo '…' )"
+            else
+              echo "- Custom Instruction: (none)"
+            fi
+
+            # If latest.json exists, print a compact summary
+            if [ -f "${{ env.RESULT_DIR }}/latest.json" ]; then
+              if command -v jq >/dev/null 2>&1; then
+                TOTAL=$(jq -r '.summary.totalCount' "${{ env.RESULT_DIR }}/latest.json" 2>/dev/null || echo "")
+                SUCCESS=$(jq -r '.summary.successCount' "${{ env.RESULT_DIR }}/latest.json" 2>/dev/null || echo "")
+                RATE=$(jq -r '.summary.successRate' "${{ env.RESULT_DIR }}/latest.json" 2>/dev/null || echo "")
+                TDUR_MS=$(jq -r '.summary.totalDuration' "${{ env.RESULT_DIR }}/latest.json" 2>/dev/null || echo "")
+                ADUR_MS=$(jq -r '.summary.avgDuration' "${{ env.RESULT_DIR }}/latest.json" 2>/dev/null || echo "")
+                # Pretty seconds (1 decimal if needed)
+                if [ -n "$TDUR_MS" ] && [ "$TDUR_MS" != "null" ]; then
+                  TDUR_S=$(jq -nr --argjson ms "$TDUR_MS" '((($ms/1000)*10)|round)/10')
+                fi
+                if [ -n "$ADUR_MS" ] && [ "$ADUR_MS" != "null" ]; then
+                  ADUR_S=$(jq -nr --argjson ms "$ADUR_MS" '((($ms/1000)*10)|round)/10')
+                fi
+                echo
+                echo "### Summary"
+                echo "- Total: ${TOTAL:-n/a}"
+                echo "- Success: ${SUCCESS:-n/a}"
+                echo "- Success Rate: ${RATE:-n/a}%"
+                if [ -n "${TDUR_S:-}" ]; then
+                  echo "- Duration: ${TDUR_S}s"
+                fi
+                if [ -n "${ADUR_S:-}" ]; then
+                  echo "- Avg: ${ADUR_S}s"
+                fi
+
+                echo
+                echo "### Problem Results"
+                # List each problem with link + mark + time
+                jq -r '
+                  .results[] |
+                  "- [" + .exercise + "](https://exercism.org/tracks/typescript/exercises/" + .exercise + ") "
+                  + (if .overallSuccess then "✅" else "❌" end)
+                  + " "
+                  + (((.totalDuration/1000*10)|round)/10|tostring) + "s"
+                ' "${{ env.RESULT_DIR }}/latest.json" || true
+              fi
+            fi
+            echo
+            echo "### Docs"
+            echo "- Methodology: [specs/000-project-handbook/METHODOLOGY.md](https://github.com/laiso/ts-bench/blob/main/specs/000-project-handbook/METHODOLOGY.md)"
+            echo "- README: [README.md](https://github.com/laiso/ts-bench/)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f benchmark-summary.txt ]; then
+            node scripts/append-gh-summary.mjs
+          fi
+
+      - name: Upload artifacts (results + console)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            ${{ env.RESULT_DIR }}/
+            ${{ env.OUTPUT_DIR }}/${{ github.event.inputs.agent }}/logs/
+            benchmark-summary.txt
+          if-no-files-found: warn
+          retention-days: 14

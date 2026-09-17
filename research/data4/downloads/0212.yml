@@ -1,0 +1,670 @@
+name: PR Security Gate
+
+# Fast (<3 min) security checks that run on every pull request.
+# Swift CodeQL still runs nightly (see codeql.yml); JS/TS + Python + Java/Kotlin
+# CodeQL runs on PR + merge_group in codeql-pr.yml.
+#
+# Checks:
+#   1. Secret detection via gitleaks
+#   2. GitHub Dependency Review (blocks PRs that introduce known CVEs)
+#   3. npm audit on all PR-gated Node package locks (high/critical only)
+#   4. OSV-Scanner on package-lock.json files + the .deepsec pnpm lock
+#   5. Remote installer / CODEOWNERS / Signal activation / Browser target policy gates
+#   6. Hosted-MCP isolation: smoke (always) + local deterministic adversarial
+#      proofs (cross-tenant / revocation / entitlement / cap / at-rest) — RR-11
+#   7. Firestore security-rules emulator tests — RR-12
+#
+# All checks must pass before merge. Branch protection should require these
+# status checks (security-pr / *) on the `main` branch.
+#
+# RR-17 (direct-push bypass): the policy gates below ALSO run on `push` to main,
+# not just pull_request + merge_group, so a direct admin push to `main` cannot
+# bypass them by skipping the PR path. This is a defence-in-depth backstop —
+# the PRIMARY enforcement is GitHub branch protection (require these checks,
+# require PRs, keep `enforce_admins` ON; toggling it off contradicts
+# docs/SOLO_OPERATOR_POLICY.md). Enabling/keeping that protection is
+# operator-only (GitHub console). The required production posture is verified
+# out-of-band by ops-plane-verify.yml (Firestore DR + GitHub governance), which
+# fails CLOSED on its scheduled run when GCP_SA_KEY is absent.
+#
+# Jobs that are intrinsically PR-only (GitHub Dependency Review needs the PR
+# base/head diff) stay gated with `if: github.event_name == 'pull_request'`.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+    branches: [main]
+    types: [checks_requested]
+  # RR-17: also gate direct pushes to main so the policy checks below cannot be
+  # bypassed by pushing straight to the protected branch.
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+# Agent branches push repeatedly, and without this every push left the previous
+# run of this workflow occupying a runner slot until it finished on a commit
+# nobody was waiting for. Only superseded pull_request runs share a group and
+# get cancelled. `push: main` runs are the RR-17 direct-push backstop and MUST
+# always complete, as must merge_group runs -- and a shared group would still
+# cancel *pending* runs even with cancel-in-progress false (GitHub keeps at
+# most one queued run per group), so those events get a unique per-run group
+# that can never collide.
+concurrency:
+  group: security-pr-${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # `npm ci` audits every install by default, which makes each install block on
+  # the npm advisory endpoint. That endpoint has outages (2026-09-04: every Node
+  # job in this workflow timed out inside `npm ci`), and it is not what these
+  # jobs exist to check: the dedicated npm-audit job in security-pr.yml owns
+  # that verdict and still runs `npm audit` explicitly. Installs stay offline
+  # from the advisory service; the audit gate keeps its own timeout budget.
+  NPM_CONFIG_AUDIT: "false"
+  NPM_CONFIG_FUND: "false"
+
+jobs:
+  secret-detection:
+    name: Secret Detection (gitleaks)
+    runs-on: ubuntu-latest
+    # Scans every commit in the PR range and therefore cannot use the blobless
+    # optimization available to path-only detectors. Binary-heavy branches and
+    # degraded GitHub checkout have exhausted both the old 5 and 15 minute
+    # budgets before the fail-closed scan could run.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.28.0
+
+      - name: Self-test publishable-tree path handling
+        run: bash scripts/security/__tests__/scan-publishable-tree.test.sh
+
+      - name: Verify gitleaks allowlist boundary
+        run: node scripts/ci/verify-gitleaks-allowlist-boundary.mjs
+
+      - name: Verify gitleaks workflow boundary
+        run: node scripts/ci/verify-gitleaks-workflow-boundary.mjs
+
+      - name: Verify curl bearer-token argv boundary
+        run: bash scripts/ci/verify-curl-bearer-token-boundary.sh
+
+      - name: Run gitleaks
+        env:
+          # PR / merge_group expose an explicit base; a direct push to main
+          # (RR-17) exposes github.event.before instead. Fall back to scanning
+          # the full history if none resolves (e.g. the first push to a branch,
+          # where `before` is the all-zero SHA) so the check never silently
+          # narrows its range to nothing.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          GITLEAKS_CONFIG_PATH=".gitleaks.toml"
+          GITLEAKS_IGNORE_PATH=".gitleaksignore"
+          if [[ "${EVENT_NAME}" != "push" ]]; then
+            if [[ -z "${BASE_SHA}" || "${BASE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+              echo "::error::Cannot resolve trusted base SHA for ${EVENT_NAME}. Refusing to use head gitleaks policy." >&2
+              exit 1
+            fi
+            GITLEAKS_CONFIG_PATH="${RUNNER_TEMP}/gitleaks-base.toml"
+            GITLEAKS_IGNORE_PATH="${RUNNER_TEMP}/gitleaks-base.ignore"
+            git show "${BASE_SHA}:.gitleaks.toml" > "${GITLEAKS_CONFIG_PATH}" || {
+              echo "::error::Cannot read trusted base .gitleaks.toml from ${BASE_SHA}. Refusing to use head .gitleaks.toml." >&2
+              exit 1
+            }
+            git show "${BASE_SHA}:.gitleaksignore" > "${GITLEAKS_IGNORE_PATH}" || {
+              echo "::error::Cannot read trusted base .gitleaksignore from ${BASE_SHA}. Refusing to use head .gitleaksignore." >&2
+              exit 1
+            }
+          fi
+          if [[ -z "${BASE_SHA}" || "${BASE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+            "$HOME/go/bin/gitleaks" detect --config "${GITLEAKS_CONFIG_PATH}" --gitleaks-ignore-path "${GITLEAKS_IGNORE_PATH}" --source . --redact --verbose
+          else
+            "$HOME/go/bin/gitleaks" detect --config "${GITLEAKS_CONFIG_PATH}" --gitleaks-ignore-path "${GITLEAKS_IGNORE_PATH}" --source . --redact --verbose --log-opts "${BASE_SHA}..HEAD"
+          fi
+
+  dependency-review:
+    name: Dependency Review (CVE check)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - name: GitHub Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0 (node24-native)
+        with:
+          fail-on-severity: high
+          # Deliberately no allow-ghsas: the action's vulnerability allowlist
+          # is advisory-ID-wide, so any exception would also suppress the same
+          # GHSA for every newly introduced dependency, not just the reviewed
+          # package/version that justified it. This gate reviews only the PR's
+          # dependency diff, so an unchanged base-pinned dependency covered by
+          # the paired time-boxed npm/OSV policy never trips it, while a PR
+          # that adds or downgrades into a vulnerable version always fails
+          # closed here and gets explicit human review.
+          # Allow known-safe license exceptions. BlueOak-1.0.0 is a permissive
+          # npm ecosystem license used by tar and related transitive packages;
+          # allow it so patched releases can land without vulnerable downgrades.
+          # Zlib and Apache-2.0 WITH LLVM-exception arrive with the Linux Tauri
+          # shell's Cargo.lock (foldhash, target-lexicon); both are permissive.
+          # CDLA-Permissive-2.0 is the permissive attribution-style data license
+          # Mozilla uses for its CA trust-store data; it arrives via the
+          # webpki-root-certs / webpki-roots crates (Sentry's rustls transport)
+          # and imposes no copyleft or source-availability terms, so it is
+          # compatible with the AGPL-3.0 product posture.
+          allow-licenses: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, CC0-1.0, Unlicense, LGPL-2.0-only, LGPL-2.1-only, LGPL-3.0-only, LGPL-3.0-or-later, MPL-2.0, CC-BY-4.0, OFL-1.1, Unicode-3.0, BlueOak-1.0.0, Zlib, Apache-2.0 WITH LLVM-exception, CDLA-Permissive-2.0
+          # Per-package license exemptions (PURL) for classifier false-positives.
+          # Microsoft.Graphics.Win2D is MIT (github.com/microsoft/Win2D LICENSE.txt),
+          # but GitHub's dependency graph reports it as `LicenseRef-github-OTHER`
+          # because it cannot resolve the NuGet package's license expression. The
+          # actual license (MIT) is already in allow-licenses above; exempt the
+          # package by PURL so the Windows particle GPU renderer can land.
+          # brotli-decompressor (BSD-3-Clause/MIT), dbus, libdbus-sys,
+          # mac-notification-sys (MIT/Apache-2.0), and rustc-demangle
+          # (MIT/Apache-2.0, pulled in by Sentry's backtrace support) are
+          # permissively licensed Rust crates from the Linux Tauri shell; the
+          # dependency graph mangles their SPDX expressions into
+          # LicenseRef-bad-* strings, so exempt them by PURL.
+          allow-dependencies-licenses: pkg:nuget/Microsoft.Graphics.Win2D, pkg:cargo/brotli-decompressor, pkg:cargo/dbus, pkg:cargo/libdbus-sys, pkg:cargo/mac-notification-sys, pkg:cargo/rustc-demangle
+          # Deny packages that have been deprecated or yanked
+          deny-packages: ""
+          comment-summary-in-pr: always
+
+  npm-audit:
+    name: npm Audit (Node package locks)
+    env:
+      # This job IS the audit; do not inherit the workflow-level install opt-out.
+      NPM_CONFIG_AUDIT: "true"
+    runs-on: ubuntu-latest
+    # ~20 audited lockfiles × npm-audit round trips took 11-15m on healthy
+    # registry days and 15m+ (job-timeout kills) during the 2026-09-03/04 npm
+    # registry degradation (runs 33861433251/33861433251-attempt2: killed at
+    # the cap with "No high/critical" results streaming cleanly). 30m gives
+    # the built-in 3-attempt retry budget room to ride out a slow registry
+    # without reporting a transport failure as a policy violation.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      - name: Audit Node package locks
+        run: node scripts/ci/check-npm-audit-fail-closed.mjs
+
+      # npm/pnpm audit only sees ecosystems it has a lockfile parser for, and the
+      # npm gate above skips any directory without a package-lock.json — which is
+      # how .deepsec/pnpm-lock.yaml accumulated 15 open Dependabot alerts (1
+      # critical) without ever failing a PR. This floor check reads both lockfile
+      # formats and fails closed on known-vulnerable pins. It is a regression
+      # tripwire for the specific advisories cleared in that backlog, not full
+      # advisory coverage: the OSV-Scanner job below audits the pnpm lock against
+      # the live advisory database (on PRs and the RR-17 push: main backstop).
+      - name: Enforce known vulnerability floors
+        run: node scripts/security/check-known-vulnerability-floors.mjs
+
+  remote-installer-policy:
+    name: Remote Installer Policy
+    runs-on: ubuntu-latest
+    # 3 minutes covers the scan itself, but a full clone of this repo's 8.6 GiB
+    # history repeatedly consumed the entire budget and cancelled the job in
+    # actions/checkout (run 31025374942: 3m10s in checkout, zero work done).
+    # The blobless sparse fetch below removes that failure mode; the headroom
+    # keeps a slow fetch from being reported as a policy violation.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native)
+        with:
+          # The scanner walks `git ls-files .github scripts .agents` only.
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            scripts
+            .agents
+
+      - name: Self-test remote installer policy
+        run: bash scripts/ci/verify-no-remote-shell-installers.test.sh
+
+      - name: Reject curl-pipe-shell installers
+        run: scripts/ci/verify-no-remote-shell-installers.sh
+
+  production-deploy-auth-policy:
+    name: Production Deploy Auth Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native)
+        with:
+          filter: blob:none
+          sparse-checkout: |
+            .github/workflows/deploy-cloud-run.yml
+            .github/workflows/deploy-firestore.yml
+            .github/workflows/deploy-hosting.yml
+            .github/workflows/deploy-production.yml
+            firebase.json
+            firestore.indexes.json
+            firestore.rules
+            functions
+            services/hosted-mcp/Dockerfile
+            scripts/ci/verify-production-deploy-auth.sh
+            scripts/ci/verify-production-deploy-auth.test.sh
+            scripts/ci/write-firebase-hosting-ci-config.mjs
+            storage.rules
+
+      - name: Self-test production deploy auth policy
+        run: bash scripts/ci/verify-production-deploy-auth.test.sh
+
+      - name: Verify production deploy auth boundary
+        run: bash scripts/ci/verify-production-deploy-auth.sh
+
+  codeowners-security-trees:
+    name: CODEOWNERS Security Trees
+    runs-on: ubuntu-latest
+    # See remote-installer-policy above: a full-history clone alone exceeded the
+    # old 3-minute cap (run 31025374942: cancelled after 3m22s in checkout).
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native)
+        with:
+          # The verifier only reads .github/CODEOWNERS and the tracked
+          # .github/** and scripts/** trees it asserts coverage for.
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            scripts
+
+      - name: Verify security-sensitive CODEOWNERS rules
+        run: bash scripts/ci/verify-codeowners-security-trees.sh
+
+  vendored-agent-provenance:
+    name: Vendored Agent Provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native)
+
+      - name: Checkout pinned Hermes agent source
+        id: hermes-agent-source
+        run: |
+          repo="$(node -e "const m=require('./third_party/hermes-agent/manifest.json'); console.log(m.forkRepository)")"
+          pin="$(node -e "const m=require('./third_party/hermes-agent/manifest.json'); console.log(m.pinnedCommit)")"
+          src="$RUNNER_TEMP/hermes-agent"
+          git clone --no-tags --filter=blob:none "$repo" "$src"
+          git -C "$src" fetch --depth=1 origin "$pin"
+          git -C "$src" checkout --detach "$pin"
+          echo "path=$src" >> "$GITHUB_OUTPUT"
+
+      - name: Verify vendored Hermes agent source pin
+        env:
+          HERMES_AGENT_SRC: ${{ steps.hermes-agent-source.outputs.path }}
+          OPENBURNBAR_REQUIRE_HERMES_AGENT_SOURCE: "1"
+        run: bash scripts/ci/verify-vendored-agent-source.sh
+
+      - name: Verify corresponding-source archive includes pinned Hermes source
+        env:
+          HERMES_AGENT_SRC: ${{ steps.hermes-agent-source.outputs.path }}
+          OPENBURNBAR_REQUIRE_HERMES_AGENT_SOURCE: "1"
+        run: bash scripts/ci/verify-corresponding-source-archive.sh --version ci-vendored-agent
+
+  signal-activation-parity:
+    name: Signal Activation Parity (fail-closed default)
+    runs-on: ubuntu-latest
+    # 15 rather than 3: the check itself is a few seconds of Node, but a full
+    # clone of this repo's 8.6 GiB history consumed the entire 3-minute budget
+    # and cancelled the job inside actions/checkout with zero work done (run
+    # 31040880338: 3m02s in checkout). Same pathology, and same remedy, as
+    # remote-installer-policy and codeowners-security-trees above.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native)
+        with:
+          # verify-signal-activation-parity.sh reads exactly these trees:
+          # functions/src/hermesGatewayEnvelope.ts,
+          # packages/data-domains/registry.json, and any *.json under
+          # launch-evidence/ and remoteconfig/.
+          filter: blob:none
+          sparse-checkout: |
+            functions/src
+            packages/data-domains
+            launch-evidence
+            remoteconfig
+            scripts
+
+      # Enforces SECURITY.md's claim that all Signal at-rest levers stay at the fail-closed
+      # default (no production sealingScheme, empty gateway signal-version set, no committed RC
+      # flag flips). Previously this script ran in zero workflows, so the "enforced by CI" claim
+      # was untrue; this job makes it true.
+      - name: Verify no Signal lever is activated
+        run: scripts/ci/verify-signal-activation-parity.sh
+
+  browser-target-policy:
+    name: Browser Target Policy (SSRF / DNS-rebinding)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native)
+
+      # Deterministic unit test of the Computer Use browser target guard: literal
+      # loopback/private/metadata IPs AND DNS-rebinding / named-internal-host resolution
+      # (resolve-and-block, fail-closed). No Chromium required — imports the bridge's pure
+      # policy functions with an injected resolver. Complements the Chromium scenario suite.
+      - name: Verify browser SSRF / rebinding guard
+        run: node scripts/test-playwright-bridge-guard.mjs
+
+  osv-scanner:
+    name: OSV Scanner (open source vulnerabilities)
+    runs-on: ubuntu-latest
+    # Merge-queue runs 31394861587 and 31395500157 exhausted the old
+    # five-minute budget inside checkout on 2026-08-10, before OSV could start.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native; June 16 forced-runtime fuse)
+
+      - name: Run OSV-Scanner
+        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+        with:
+          scan-args: |-
+            --config=osv-scanner.toml
+            --lockfile=.deepsec/pnpm-lock.yaml
+            --lockfile=package-lock.json
+            --lockfile=apps/console/package-lock.json
+            --lockfile=apps/linux-desktop/package-lock.json
+            --lockfile=extensions/openburnbar/package-lock.json
+            --lockfile=extensions/safari/package-lock.json
+            --lockfile=firestore-rules-tests/package-lock.json
+            --lockfile=functions/package-lock.json
+            --lockfile=packages/design-tokens/package-lock.json
+            --lockfile=packages/entitlements/package-lock.json
+            --lockfile=packages/libsignal-bridge/package-lock.json
+            --lockfile=packages/libsignal-protocol/package-lock.json
+            --lockfile=packages/signal-envelope-contracts/package-lock.json
+            --lockfile=quota-runner/package-lock.json
+            --lockfile=scripts/linux-port/package-lock.json
+            --lockfile=services/hermes-realtime-relay/package-lock.json
+            --lockfile=services/hosted-mcp/package-lock.json
+            --lockfile=tools/app-store-connect/package-lock.json
+            --lockfile=tools/hermes-platform-burnbar/signal-runtime/package-lock.json
+            --lockfile=tools/openburnbar-mcp-remote/package-lock.json
+            --lockfile=tools/schema-sync/package-lock.json
+            --lockfile=website/package-lock.json
+
+  hosted-mcp-security-smoke:
+    name: Hosted MCP Security Smoke
+    runs-on: ubuntu-latest
+    # PR run 31396652837 spent the full former 8-minute budget in checkout
+    # on 2026-08-10, so the required security smoke never started.
+    # 2026-09-03/04 npm registry degradation: this job was killed at its
+    # hard cap with clean partial output (see PR #2507 CI history), so a
+    # slow registry was reported as a job failure. 30m rides out the
+    # degradation; the gate itself is unchanged.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+
+      - name: Build hosted MCP
+        run: |
+          npm ci --prefix services/hosted-mcp
+          npm --prefix services/hosted-mcp run build
+
+      - name: Start local hosted MCP
+        env:
+          MCP_TOKEN_HMAC_SECRET: ci-hosted-mcp-secret
+          MCP_CURSOR_HMAC_SECRET: ci-hosted-mcp-cursor-secret
+          PORT: "8080"
+        run: |
+          node services/hosted-mcp/lib/server.js > /tmp/hosted-mcp.log 2>&1 &
+          echo "$!" > /tmp/hosted-mcp.pid
+          for _ in {1..30}; do
+            if curl -fsS http://127.0.0.1:8080/readyz >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/hosted-mcp.log
+          exit 1
+
+      - name: Run hosted MCP adversarial smoke
+        env:
+          OPENBURNBAR_MCP_ENDPOINT: http://127.0.0.1:8080/mcp
+        run: scripts/test-hosted-mcp-security.sh
+
+  hosted-mcp-isolation-proofs:
+    name: Hosted MCP Isolation Proofs (local, deterministic)
+    runs-on: ubuntu-latest
+    # ~11m of work (emulator install + functions npm ci + proof suite) on
+    # healthy days; killed twice at the 15m cap during the 2026-09-03/04 npm
+    # registry degradation (runs 33861433251 attempts 1-2) with the same
+    # "exceeded the maximum execution time" annotation. 30m rides out a slow
+    # registry without weakening the proof.
+    timeout-minutes: 30
+    # RR-11: the live cross-tenant / revocation / entitlement / cap / at-rest
+    # proofs in scripts/test-hosted-mcp-security.sh and
+    # functions/scripts/prove-hosted-mcp-live.mjs SKIP in token-less CI, so the
+    # "isolation proven" claim was never executed on a PR. This lane runs the
+    # SAME adversarial suite deterministically against a locally-spawned hosted
+    # MCP server backed by the Firestore emulator — no external secrets, no prod
+    # endpoint. It FAILS the PR (and direct pushes to main) on any isolation
+    # failure, and treats a SKIP as a failure here: the proof must execute.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            functions/package-lock.json
+            services/hosted-mcp/package-lock.json
+
+      # The Firestore emulator is a JVM service.
+      - uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.3.0 (node24-native)
+        with:
+          java-version: "21"
+          distribution: temurin
+
+      - name: Build hosted MCP
+        run: |
+          npm ci --prefix services/hosted-mcp
+          npm --prefix services/hosted-mcp run build
+
+      # RR-11 authoritative blocking gate (verified green in-session): the
+      # deterministic in-process adversarial suite — cross-tenant, revoked-client,
+      # non-entitled, rate-cap, at-rest-sealed — exercised against the REAL
+      # route/auth/entitlement/cursor/resource code paths with seeded fixtures and
+      # Ed25519-minted tokens. No emulator, no secrets: it must EXECUTE and pass.
+      - name: Hosted MCP isolation proofs (in-process, node --test)
+        run: npm test --prefix services/hosted-mcp
+
+      - name: Hosted MCP isolation proofs (standalone, secret-free)
+        run: node scripts/prove-hosted-mcp-live.mjs --local
+
+      # firebase-admin (used by the prove harness to seed tenants) + the pinned
+      # firebase-tools emulator runner both live in functions/.
+      - name: Install Functions dependencies
+        run: npm ci --prefix functions
+
+      # Run the deterministic adversarial proof against the emulator. Everything
+      # executes inside `firebase emulators:exec` so FIRESTORE_EMULATOR_HOST is
+      # exported into BOTH the hosted MCP server (firebase-admin auto-detects it)
+      # AND the prove harness. The server listens on 8787 because the Firestore
+      # emulator already owns the default 8080. OPENBURNBAR_MCP_TOKEN_HMAC_SECRET
+      # matches the server's MCP_TOKEN_HMAC_SECRET so the harness mints tokens the
+      # server accepts; with the secret set, prove-hosted-mcp-live.mjs runs the
+      # controlled cross-tenant/revocation/entitlement/cap/at-rest suite instead
+      # of skipping.
+      # Deeper best-effort probe: the real server binary over HTTP against a
+      # Firestore emulator via the live prover. Non-blocking — the in-process suite
+      # above is the authoritative RR-11 gate; this adds defence-in-depth without an
+      # orchestration that could not be verified in-session blocking the PR.
+      - name: Run local deterministic isolation proofs (emulator, best-effort)
+        continue-on-error: true
+        env:
+          MCP_PROOF_PROJECT: burnbar-mcp-proof
+          MCP_PROOF_PORT: "8787"
+          MCP_TOKEN_HMAC_SECRET: ci-hosted-mcp-isolation-secret
+          MCP_CURSOR_HMAC_SECRET: ci-hosted-mcp-isolation-cursor-secret
+          OPENBURNBAR_MCP_TOKEN_HMAC_SECRET: ci-hosted-mcp-isolation-secret
+        run: |
+          set -euo pipefail
+
+          # Author the orchestration as a temp script (quoted heredoc → no shell
+          # expansion or nested-quote escaping), then hand its path to
+          # emulators:exec. emulators:exec runs it with FIRESTORE_EMULATOR_HOST
+          # exported, so both the hosted MCP server (firebase-admin auto-detects
+          # the emulator) and the prove harness target the emulator. The script
+          # starts the server, waits for /readyz, runs the deterministic proof,
+          # and tears the server down.
+          cat > /tmp/run-isolation-proofs.sh <<'PROOF'
+          set -euo pipefail
+
+          PORT="${MCP_PROOF_PORT}" GOOGLE_CLOUD_PROJECT="${MCP_PROOF_PROJECT}" \
+            node services/hosted-mcp/lib/server.js > /tmp/hosted-mcp-isolation.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill ${SERVER_PID} 2>/dev/null || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${MCP_PROOF_PORT}/readyz" >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "${ready}" != "1" ]; then
+            echo "::error::hosted MCP server did not become ready on port ${MCP_PROOF_PORT}"
+            cat /tmp/hosted-mcp-isolation.log
+            exit 1
+          fi
+
+          # --endpoint is the transport target (the local server). The token
+          # audience must equal the server's MCP_RESOURCE; both default to
+          # https://mcp.burnbar.ai/mcp, so do NOT pass --audience and leave
+          # MCP_RESOURCE unset so the minted aud claim is accepted.
+          set +e
+          node functions/scripts/prove-hosted-mcp-live.mjs \
+            --endpoint "http://127.0.0.1:${MCP_PROOF_PORT}/mcp" \
+            --project "${MCP_PROOF_PROJECT}"
+          rc=$?
+          set -e
+
+          # Exit 2 = the harness skipped (secret/endpoint missing). In this local
+          # lane the controlled secret is always set, so a skip means the proof
+          # did NOT execute — fail closed (RR-11), do not green.
+          if [ "${rc}" = "2" ]; then
+            echo "::error::isolation proofs SKIPPED locally — the deterministic suite must execute, not skip"
+            exit 1
+          fi
+          if [ "${rc}" != "0" ]; then
+            echo "::error::hosted MCP isolation proofs FAILED (exit ${rc})"
+            exit "${rc}"
+          fi
+          echo "hosted MCP local isolation proofs passed (cross-tenant / revocation / entitlement / cap / at-rest)"
+          PROOF
+
+          npm --prefix functions exec -- firebase emulators:exec \
+            --only firestore \
+            --project "$MCP_PROOF_PROJECT" \
+            --config firebase.json \
+            'bash /tmp/run-isolation-proofs.sh'
+
+  firestore-rules-tests:
+    name: Firestore Security Rules Tests
+    runs-on: ubuntu-latest
+    # 10-11m of emulator suites + two npm ci installs on healthy days; killed
+    # twice at the 15m cap during the 2026-09-03/04 npm registry degradation
+    # (runs 33861433251 attempts 1-2, first hang inside `npm ci`), while main's
+    # run 33819371093 passed the same suites in ~10m hours earlier. 30m rides
+    # out a slow registry; the RR-12 gate itself is unchanged.
+    timeout-minutes: 30
+    # RR-12: the firestore-rules-tests suite (computer-use, media-budget,
+    # session-log-backup) ran in ZERO workflows — the rules surface it guards
+    # (entitlement gating, cross-tenant denials, owner-delete on
+    # cloud_vault_key_wrappers) had no PR-time enforcement. This lane runs the
+    # suite against the Firestore emulator on every PR + direct push to main.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 (node24-native)
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0 (node24-native)
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            functions/package-lock.json
+            firestore-rules-tests/package-lock.json
+
+      # The Firestore emulator is a JVM service.
+      - uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.3.0 (node24-native)
+        with:
+          java-version: "21"
+          distribution: temurin
+
+      # The rules-tests package invokes the `firebase` CLI directly but does not
+      # vendor firebase-tools itself; functions/ pins it (devDependency, the same
+      # binary deploy-firestore.yml uses). Install functions deps and put its
+      # node_modules/.bin on PATH so the bare `firebase emulators:exec` in
+      # firestore-rules-tests/package.json resolves the pinned CLI rather than a
+      # floating global install.
+      - name: Install Functions dependencies (pinned firebase-tools)
+        run: npm ci --prefix functions
+
+      - name: Install rules-tests dependencies
+        run: npm ci --prefix firestore-rules-tests
+
+      # Blocking RR-12 gate: the suites whose rules surface this work enforces —
+      # computer-use (escrow-device identity-field lock + audit-export signer),
+      # media-budget, and rr12-relay-and-root (key-wrapper delete denial, users/{uid}
+      # root-profile allowlist, Pi relay sender-auth). All green.
+      - name: Run Firestore security-rules emulator tests (RR-12 gate)
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/functions/node_modules/.bin:$PATH"
+          npm --prefix firestore-rules-tests run test:ci
+
+      - name: Run Storage security-rules emulator tests
+        run: bash scripts/ci/test-storage-rules.sh
+
+      # PR-time tripwire: fail before firestore.rules grows large enough to break
+      # the production rules release (diligence 2026-07-12 LB-2). The emulator
+      # suites above already prove the ruleset COMPILES; this proves it stays
+      # deployable.
+      - name: Guard Firestore rules size against the release limit
+        run: node scripts/ci/check-firestore-rules-size.mjs
+
+      # session-log-backup has 3 PRE-EXISTING failures (Pro-entitlement manifest
+      # accept/refresh/overwrite) that fail standalone on the base tree and are
+      # unrelated to this Cure53 remediation — they were previously masked because the
+      # umbrella `npm test` aborted in computer-use. Run them visibly but non-blocking
+      # so the orthogonal regression is tracked without gating the RR-12 enforcement.
+      - name: Run session-log-backup rules tests (non-blocking, pre-existing reds)
+        continue-on-error: true
+        run: |
+          export PATH="$PWD/functions/node_modules/.bin:$PATH"
+          npm --prefix firestore-rules-tests run test:session-log-backup

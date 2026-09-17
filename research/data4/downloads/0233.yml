@@ -1,0 +1,1322 @@
+name: Researcher
+
+on:
+  pull_request:
+    types: [opened]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  concept:
+    if: startsWith(github.head_ref, 'concept/') || startsWith(github.head_ref, 'all/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1 # shallow clone to avoid LFS issues
+          lfs: false # Skip all LFS files
+
+      - name: Research Concept
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          allowed_tools: "Edit,Write,Task,mcp__search__web_search_exa"
+          settings: |
+            {
+              "chat": {
+                "tools": {
+                  "autoApprove": true,
+                  "permissions": [
+                    { "tool": "Edit", "decision": "allow" },
+                    { "tool": "Write", "decision": "allow" },
+                    { "tool": "Task", "decision": "allow" },
+                    { "tool": "mcp__search__web_search_exa", "decision": "allow" }
+                  ]
+                }
+              }
+            }
+          direct_prompt: |
+            You are an experienced researcher using scientific thinking and rigorous methodology.
+            
+            Think deeply and thoroughly about the research concept and direction.
+            Define the research problem, objectives, and key questions. Include:
+            - What specific gap in knowledge are you addressing?
+            - What are your initial ideas and hypotheses?
+            - What novel approach or methodology will you use?
+            - What impact will this research have on the field?
+            Once done:
+            - Update notes/sections/concept.md with your research concept and direction
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+  literature:
+    needs: concept
+    if: startsWith(github.head_ref, 'literature/') || (startsWith(github.head_ref, 'all/') && always())
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 1 # shallow clone
+          lfs: false # Skip all LFS files
+      
+      - name: Pull latest changes from previous jobs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin ${{ github.head_ref }} || echo "No changes to pull"
+
+      - name: Literature Review
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          allowed_tools: "Edit,Write,Task,mcp__search__web_search_exa"
+          settings: |
+            {
+              "chat": {
+                "tools": {
+                  "autoApprove": true,
+                  "permissions": [
+                    { "tool": "Edit", "decision": "allow" },
+                    { "tool": "Write", "decision": "allow" },
+                    { "tool": "Task", "decision": "allow" },
+                    { "tool": "mcp__search__web_search_exa", "decision": "allow" }
+                  ]
+                }
+              }
+            }
+          direct_prompt: |
+            You are an experienced researcher using scientific thinking and rigorous methodology.
+            
+            Think deeply and thoroughly about the research landscape.
+            Use careful analysis for comprehensive paper review using Arxiv and other research sites. 
+            Ensure your sources are from reputable journals, conferences, and institutions.
+            Identify gaps, methods, and theoretical frameworks in existing research,
+            Once done:
+            - Update notes/sections/literature.md with comprehensive literature review
+            - Update papers.jsonl with detailed paper summaries and citations (at least 20 papers)
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+  hypothesis:
+    needs: literature
+    if: startsWith(github.head_ref, 'hypothesis/') || (startsWith(github.head_ref, 'all/') && always())
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 1 # shallow clone
+          lfs: false # Skip LFS to avoid budget issues
+      
+      - name: Pull latest changes from previous jobs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin ${{ github.head_ref }} || echo "No changes to pull"
+
+      - name: Formulate Hypotheses
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          allowed_tools: "Edit,Write,Task,mcp__search__web_search_exa"
+          settings: |
+            {
+              "chat": {
+                "tools": {
+                  "autoApprove": true,
+                  "permissions": [
+                    { "tool": "Edit", "decision": "allow" },
+                    { "tool": "Write", "decision": "allow" },
+                    { "tool": "Task", "decision": "allow" },
+                    { "tool": "mcp__search__web_search_exa", "decision": "allow" }
+                  ]
+                }
+              }
+            }
+          direct_prompt: |
+            You are an experienced researcher using scientific thinking and rigorous methodology.
+            
+            Think deeply and thoroughly about research hypotheses and core assumptions.
+            Based on the research concept and literature review, formulate clear, testable hypotheses.
+            Include:
+            - What assumptions underlie your hypotheses?
+            - How do they relate to existing theory?
+            - What would falsify each hypothesis?
+            - What are your null and alternative hypotheses?
+            
+            Once done:
+            - Update notes/sections/hypothesis.md with detailed hypothesis formulation
+            - Update hypotheses.jsonl with structured hypothesis statements
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+  data:
+    needs: hypothesis
+    if: startsWith(github.head_ref, 'data/') || (startsWith(github.head_ref, 'all/') && always())
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write  # Changed to write for PR updates
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          lfs: false  # Disable LFS initially to avoid budget issues
+          fetch-depth: 1 # shallow clone
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Pull latest changes from previous jobs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin ${{ github.head_ref }} || echo "No changes to pull"
+
+      - name: Setup Git LFS (Smart Mode)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Check LFS budget before operations
+          echo "Checking Git LFS budget status..."
+          
+          # Install LFS without downloading files
+          git lfs install --skip-smudge
+          
+          # Only track files >100MB to conserve LFS budget
+          echo "Setting up conservative LFS tracking (>100MB only)..."
+          
+          track_large_files() {
+            find data -type f -size +100M 2>/dev/null | while read file; do
+              echo "Tracking large file: $file ($(du -h "$file" | cut -f1))"
+              git lfs track "$file"
+            done
+          }
+          
+          # Selective tracking for truly large files only
+          # Comment out smaller file types to save LFS budget
+          git lfs track "*.tar.gz"
+          git lfs track "*.zip"
+          git lfs track "*.h5"
+          git lfs track "*.safetensors"
+          git lfs track "*.bin"
+          # Skip these to save budget:
+          # git lfs track "*.pkl"
+          # git lfs track "*.npz"
+          # git lfs track "*.npy"
+          
+          track_large_files
+          git add .gitattributes || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install download tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl git-lfs unzip tar gzip bzip2 p7zip-full aria2
+          git lfs install
+
+      - name: Find Datasets
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          allowed_tools: "Bash,Edit,Write,Task,mcp__search__web_search_exa"
+          settings: |
+            {
+              "chat": {
+                "tools": {
+                  "autoApprove": true,
+                  "permissions": [
+                    { "tool": "Edit", "decision": "allow" },
+                    { "tool": "Write", "decision": "allow" },
+                    { "tool": "Task", "decision": "allow" },
+                    { "tool": "mcp__search__web_search_exa", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "pip*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "python*|python3*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "wget*|curl*|aria2c*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "mkdir*|ls*|find*|du*|head*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "tar*|unzip*|7z*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "git*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "kaggle*", "decision": "allow" }
+                  ]
+                }
+              }
+            }
+          direct_prompt: |
+            ⚠️ CRITICAL - MUST READ FIRST - GIT LFS CONFIGURATION ⚠️
+            ================================================================
+            
+            IMPORTANT LFS RULES TO PREVENT BUDGET ISSUES:
+            1. DO NOT track small CSV, JSON, or text files with Git LFS
+            2. ONLY use LFS for files larger than 50MB
+            3. When downloading datasets:
+               - Small files (<50MB): Add directly to Git
+               - Large files (>50MB): Will be automatically tracked with LFS
+            4. Before adding any file, check its size with: du -h filename
+            5. The workflow will automatically handle LFS for large files
+            
+            ================================================================
+            THIS REPOSITORY USES GIT LFS FOR ALL DATA FILES
+            
+            FORBIDDEN ACTIONS:
+            ❌ NEVER add data/ to .gitignore
+            ❌ NEVER skip datasets due to size
+            ❌ NEVER use regular git add for large files
+            
+            REQUIRED: Setup Git LFS BEFORE downloading:
+            ```bash
+            # Configure Git LFS first
+            git lfs install
+            git lfs track "data/**"
+            git lfs track "*.tar.gz" "*.zip" "*.7z" "*.h5" "*.pkl" "*.npy" "*.npz"
+            git add .gitattributes
+            git commit -m "chore: Configure Git LFS for data files"
+            ```
+            
+            AFTER DOWNLOADING, commit with LFS:
+            ```bash
+            # Remove any .gitignore entries that block data
+            if grep -q "data/" .gitignore 2>/dev/null; then
+              sed -i '/data\//d' .gitignore
+              git add .gitignore
+            fi
+            
+            # Stage and commit with LFS
+            git add data/
+            git commit -m "feat: Add datasets via Git LFS"
+            git lfs push origin HEAD
+            git push origin HEAD
+            ```
+            ================================================================
+            
+            You are an experienced researcher using scientific thinking and rigorous methodology.
+            
+            STEP 1 - CHECK EXISTING DATASETS FIRST:
+            ========================================
+            IMPORTANT: Before downloading ANY new datasets, thoroughly check what's already available!
+            
+            ```bash
+            # Check if data folder exists and what's already in it
+            if [ -d "data" ]; then
+              echo "=== Existing Data Folder Contents ==="
+              ls -la data/
+              echo ""
+              echo "=== Subdirectories ==="
+              find data -type d -maxdepth 2
+              echo ""
+              echo "=== All Data Files ==="
+              find data -type f -name "*" | head -50
+              echo ""
+              echo "=== Dataset Sizes ==="
+              du -sh data/* 2>/dev/null || echo "No data files yet"
+              echo ""
+              echo "=== Total Data Size ==="
+              du -sh data/
+              
+              # Check for dataset documentation
+              if [ -f "data/README.md" ]; then
+                echo ""
+                echo "=== Existing Dataset Documentation ==="
+                cat data/README.md
+              fi
+              
+              # Check for dataset metadata files
+              echo ""
+              echo "=== Dataset Metadata Files ==="
+              find data -name "*.json" -o -name "*.yaml" -o -name "*.yml" -o -name "README*" -o -name "*.txt" | head -20
+            else
+              echo "No data directory found - will create and populate with datasets"
+              mkdir -p data
+            fi
+            ```
+            
+            STEP 2 - ANALYZE EXISTING DATASETS:
+            ====================================
+            If datasets already exist, analyze them thoroughly:
+            
+            ```python
+            import os
+            import json
+            from pathlib import Path
+            
+            data_dir = Path('data')
+            existing_datasets = []
+            
+            # Scan for existing datasets
+            if data_dir.exists():
+                for item in data_dir.iterdir():
+                    if item.is_dir():
+                        dataset_info = {
+                            'name': item.name,
+                            'path': str(item),
+                            'files': [],
+                            'total_size': 0
+                        }
+                        
+                        # Get all files in dataset
+                        for file in item.rglob('*'):
+                            if file.is_file():
+                                size = file.stat().st_size
+                                dataset_info['files'].append({
+                                    'name': file.name,
+                                    'path': str(file.relative_to(data_dir)),
+                                    'size': size
+                                })
+                                dataset_info['total_size'] += size
+                        
+                        if dataset_info['files']:
+                            existing_datasets.append(dataset_info)
+                            print(f"Found dataset: {dataset_info['name']}")
+                            print(f"  Files: {len(dataset_info['files'])}")
+                            print(f"  Size: {dataset_info['total_size'] / (1024*1024):.2f} MB")
+            
+            # Save inventory
+            with open('data/existing_datasets.json', 'w') as f:
+                json.dump(existing_datasets, f, indent=2)
+            
+            print(f"\nTotal existing datasets: {len(existing_datasets)}")
+            ```
+            
+            STEP 3 - DETERMINE WHAT'S NEEDED:
+            ==================================
+            Based on the research goals and existing datasets:
+            
+            1. List all datasets already available
+            2. Identify gaps in the current dataset collection
+            3. Only download NEW datasets that are actually needed
+            4. Avoid duplicating existing data
+            
+            Think deeply and thoroughly about data requirements and quality.
+            Your job is to INTELLIGENTLY manage datasets - use existing ones when appropriate!
+            
+            CRITICAL: You must physically download actual data files into the data/ folder!
+            
+            IMPORTANT: You have FULL COMMAND EXECUTION permissions with autoApprove enabled!
+            You can run ANY command including pip, python, wget, curl, mkdir, etc.
+            
+            SETUP INSTRUCTIONS:
+            1. First install ALL necessary tools for downloading data:
+               ```bash
+               # Python packages for ML datasets
+               pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+               pip install datasets transformers scikit-learn pandas numpy matplotlib
+               pip install kaggle huggingface-hub requests beautifulsoup4 gdown
+               pip install tensorflow tensorflow-datasets
+               pip install openml lxml
+               
+               # Install additional download tools
+               pip install wget py7zr rarfile
+               ```
+            
+            2. Create the data folder structure:
+               ```bash
+               mkdir -p data
+               mkdir -p data/raw
+               mkdir -p data/processed
+               ```
+            
+            3. Use MULTIPLE methods to find and download datasets:
+               
+               a) Use torchvision for computer vision datasets:
+               ```python
+               import torchvision.datasets as datasets
+               # Download CIFAR-10, CIFAR-100, MNIST, Fashion-MNIST, ImageNet subsets, etc.
+               ```
+               
+               b) Use Hugging Face datasets:
+               ```python
+               from datasets import load_dataset, list_datasets
+               # Browse available datasets: print(list_datasets())
+               # Download: dataset = load_dataset('dataset_name')
+               ```
+               
+               c) Use TensorFlow Datasets:
+               ```python
+               import tensorflow_datasets as tfds
+               # List all: tfds.list_builders()
+               # Download: dataset = tfds.load('dataset_name', download=True)
+               ```
+               
+               d) Direct downloads with wget/curl/aria2:
+               ```bash
+               # Use wget for direct downloads
+               wget -P data/raw/ "https://example.com/dataset.zip"
+               
+               # Use curl for APIs
+               curl -L -o data/raw/dataset.tar.gz "https://example.com/dataset.tar.gz"
+               
+               # Use aria2 for faster parallel downloads
+               aria2c -x 16 -s 16 -d data/raw/ "https://example.com/large_dataset.zip"
+               ```
+               
+               e) Download from Kaggle:
+               ```bash
+               # Set up Kaggle API credentials if available
+               kaggle datasets download -d dataset-name -p data/raw/
+               ```
+               
+               f) Use gdown for Google Drive:
+               ```python
+               import gdown
+               gdown.download('https://drive.google.com/...', 'data/raw/dataset.zip')
+               ```
+            
+            4. Create a comprehensive download script `data/download_all_datasets.py`:
+               ```python
+               import os
+               import requests
+               import zipfile
+               import tarfile
+               import gdown
+               from pathlib import Path
+               
+               def download_with_progress(url, filepath):
+                   """Download file with progress bar"""
+                   response = requests.get(url, stream=True)
+                   total = int(response.headers.get('content-length', 0))
+                   with open(filepath, 'wb') as file:
+                       downloaded = 0
+                       for data in response.iter_content(chunk_size=1024):
+                           downloaded += len(data)
+                           file.write(data)
+                           print(f"Downloaded {downloaded}/{total} bytes", end='\r')
+               
+               # Download various datasets
+               datasets_to_download = [
+                   # Add dataset URLs here
+               ]
+               
+               for url in datasets_to_download:
+                   filename = url.split('/')[-1]
+                   download_with_progress(url, f'data/raw/{filename}')
+               ```
+            
+            5. Extract and organize downloaded files:
+               ```bash
+               # Extract zip files
+               unzip data/raw/*.zip -d data/processed/
+               
+               # Extract tar files
+               tar -xzf data/raw/*.tar.gz -C data/processed/
+               
+               # Extract 7z files
+               7z x data/raw/*.7z -o data/processed/
+               ```
+            
+            6. Verify ALL downloads:
+               ```bash
+               # List all downloaded files with sizes
+               ls -lah data/
+               ls -lah data/raw/
+               ls -lah data/processed/
+               
+               # Check total size of downloaded data
+               du -sh data/
+               du -sh data/raw/*
+               du -sh data/processed/*
+               
+               # Count files
+               find data/ -type f | wc -l
+               ```
+            
+            7. Create comprehensive documentation in data/README.md showing:
+               - Exact file paths and sizes
+               - Download timestamps
+               - Data statistics (number of samples, features, etc.)
+               - Loading instructions with code examples
+               - License information
+            
+            REQUIREMENTS:
+            - Download AT LEAST 5-10 different datasets
+            - Include various types: tabular, image, text, time-series
+            - Total downloaded data should be substantial (at least 1GB if possible)
+            - Try multiple download methods until successful
+            - If one source fails, try alternative sources
+            - Focus on publicly available research datasets
+            
+            Use Exa search to find dataset URLs, repositories, and download links.
+            Search for: "dataset download URL", "public research datasets", "benchmark datasets", "open data repositories"
+            
+            VERIFY SUCCESS:
+            - Run: `find data/ -type f -name "*" | head -20` to show downloaded files
+            - Run: `du -sh data/` to show total size
+            - Ensure data/README.md lists all downloaded datasets with their locations
+            
+            FINAL COMMIT (refer to LFS instructions at top):
+            After all downloads complete, commit everything with Git LFS:
+            ```bash
+            # CRITICAL: Ensure Git LFS is properly configured
+            git lfs install
+            git lfs track "data/**"
+            git add .gitattributes
+            git commit -m "chore: Configure Git LFS for data files"
+            
+            # Stage all data files with LFS
+            git add data/
+            git status  # Verify files are being tracked by LFS
+            
+            # Commit the datasets
+            git commit -m "feat: Add datasets for experiments via Git LFS
+            
+            Datasets included:
+            $(ls -1 data/ | head -10)
+            
+            Total size: $(du -sh data/ | cut -f1)"
+            
+            # Push LFS objects and commits
+            git lfs push origin HEAD --all
+            git push origin HEAD
+            ```
+            
+            IMPORTANT: The datasets MUST be committed with Git LFS for the 'run' job to access them!
+            Remember: NEVER add data/ to .gitignore - we use Git LFS for large files.
+            
+            Once done:
+            - Ensure datasets are committed with Git LFS and pushed
+            - Update data/README.md with complete dataset catalog INCLUDING:
+              * Exact file paths for each dataset
+              * File formats and sizes
+              * Number of samples/records
+              * Features/columns description
+              * How to load each dataset in Python
+            - Update notes/sections/data.md with comprehensive dataset documentation
+              
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+  proposal:
+    needs: data
+    if: startsWith(github.head_ref, 'proposal/') || (startsWith(github.head_ref, 'all/') && always())
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write  # Changed to write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          lfs: false  # Skip LFS initially
+          fetch-depth: 1 # shallow clone
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Pull latest changes from previous jobs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin ${{ github.head_ref }} || echo "No changes to pull"
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Selective LFS Pull
+        run: |
+          # Only pull essential LFS files if budget allows
+          echo "Checking LFS budget..."
+          git lfs install --skip-smudge
+          
+          # Try to pull only essential data files, handle failure gracefully
+          echo "Attempting selective LFS pull..."
+          git lfs pull --include="*.csv,*.json,*.jsonl" --exclude="*.wav,*.au,*.mp3,*.npz,*.pkl" || {
+            echo "WARNING: LFS pull failed (likely budget exceeded)"
+            echo "Creating mock data for experiments..."
+            mkdir -p data/mock
+            echo '{"mock": true, "message": "Using mock data due to LFS budget"}' > data/mock/dataset.json
+          }
+      - name: Design Experiment Proposal
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          allowed_tools: "Bash,Edit,Write,Task,mcp__search__web_search_exa"
+          settings: |
+            {
+              "chat": {
+                "tools": {
+                  "autoApprove": true,
+                  "permissions": [
+                    { "tool": "Edit", "decision": "allow" },
+                    { "tool": "Write", "decision": "allow" },
+                    { "tool": "Task", "decision": "allow" },
+                    { "tool": "mcp__search__web_search_exa", "decision": "allow" }
+                  ]
+                }
+              }
+            }
+          direct_prompt: |
+            You are an experienced researcher using rigorous scientific methodology.
+            
+            Think deeply and thoroughly about experiment design and proposals.
+            First, review proposals.jsonl to see what has been proposed in the past.
+            Based on your hypotheses and available datasets, propose detailed experiments with:
+            - Clear hypotheses and evaluation plans
+            - Specific variables to test
+            - Metrics to measure success
+            - Control conditions
+            - Expected outcomes
+            
+            Once done:
+            - Update notes/sections/proposal.md with a detailed experiment proposal
+            - Update proposals.jsonl with structured experiment plans
+            
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+  experiment:
+    needs: proposal
+    if: startsWith(github.head_ref, 'experiment/') || (startsWith(github.head_ref, 'all/') && always())
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          lfs: false  # Skip LFS initially
+          fetch-depth: 1 # shallow clone
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Pull latest changes from previous jobs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin ${{ github.head_ref }} || echo "No changes to pull"
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Selective LFS Pull
+        run: |
+          # Only pull essential LFS files if budget allows
+          echo "Checking LFS budget..."
+          git lfs install --skip-smudge
+          
+          # Try to pull only essential data files, handle failure gracefully
+          echo "Attempting selective LFS pull..."
+          git lfs pull --include="*.csv,*.json,*.jsonl" --exclude="*.wav,*.au,*.mp3,*.npz,*.pkl" || {
+            echo "WARNING: LFS pull failed (likely budget exceeded)"
+            echo "Creating mock data for experiments..."
+            mkdir -p data/mock
+            echo '{"mock": true, "message": "Using mock data due to LFS budget"}' > data/mock/dataset.json
+          }
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl git-lfs
+          # Install comprehensive ML and data science packages
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install datasets transformers scikit-learn pandas numpy matplotlib seaborn
+          pip install tensorflow tensorflow-datasets
+          pip install jax jaxlib optax flax
+          pip install xgboost lightgbm catboost
+          pip install scipy statsmodels networkx
+          pip install jupyterlab notebook ipython
+          pip install tqdm wandb tensorboard mlflow
+          pip install pytest pytest-cov black flake8
+          pip install modal # GPU setup
+          # Additional experiment tools
+          pip install optuna hyperopt ray[tune] # Hyperparameter optimization
+          pip install shap lime eli5 # Model interpretability
+          pip install plotly bokeh altair # Advanced visualization
+          pip install dask joblib # Parallel processing
+          pip install h5py zarr # Data storage formats
+          pip install pyarrow fastparquet # Efficient data formats
+          pip install streamlit gradio # Quick demos/interfaces
+          pip install gymnasium stable-baselines3 # RL environments
+          pip install prophet statsforecast # Time series
+          pip install opencv-python pillow albumentations # Computer vision
+          pip install nltk spacy gensim # NLP tools
+          pip install rdkit biopython # Chemistry/biology
+          # Ensure Git LFS is tracking data files
+          git lfs pull
+      
+      - name: Setup Modal
+        run: |
+          modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }} --profile=cosci
+      
+      - name: Run Experiment
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          allowed_tools: "Bash,Edit,Write,Task,mcp__search__web_search_exa"
+          settings: |
+            {
+              "chat": {
+                "tools": {
+                  "autoApprove": true,
+                  "permissions": [
+                    { "tool": "Edit", "decision": "allow" },
+                    { "tool": "Write", "decision": "allow" },
+                    { "tool": "Task", "decision": "allow" },
+                    { "tool": "mcp__search__web_search_exa", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "pip*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "python*|python3*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "ls*|mkdir*|find*|du*|cat*|head*|tail*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "git clone*|git pull*|git fetch*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "wget*|curl*|aria2c*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "cd*|pwd*|echo*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "cp*|mv*|rm*|touch*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "jupyter*|ipython*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "pytest*|black*|flake8*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "tar*|unzip*|gzip*|7z*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "nvidia-smi*|gpustat*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "htop*|top*|free*|df*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "tensorboard*|mlflow*|wandb*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "streamlit*|gradio*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "optuna*|ray*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "grep*|sed*|awk*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "modal*", "decision": "allow" }
+                  ]
+                }
+              }
+            }
+          direct_prompt: |
+            You are an experienced researcher using rigorous scientific methodology.
+            
+            Think deeply and thoroughly about experiment execution.
+            Execute the experiment proposal in notes/sections/proposal.md with careful attention to:
+            - Parameters and settings
+            - Observations and metrics to track
+            - Unexpected results or errors
+            - Reproducibility
+            
+            Use Modal for GPU-intensive tasks when needed.
+
+            <STEP 0>
+              If you are improving an existing experiment, use the existing experiment directory in `code/`.
+
+              If you are working on a new experiment, create a new experiment directory in `code/`
+              ```bash
+               exp_id="exp_{number}_{identifier}"
+               mkdir -p code/$exp_id/{data,utils,results,reference_code,checkpoints}
+               touch code/$exp_id/README.md
+               touch code/$exp_id/main.py # main entry point
+               touch code/$exp_id/reproduce.sh # reproduction script
+               ```
+            </STEP 0>
+            <STEP 1>
+              Analyze the research proposal to thoroughly understand what is being asked to implement. Analyze the research type and install necessary packages in `code/`, where you will be running your experiment.
+              
+              - Read the whole research proposal in sections/notes/proposal.md
+              - Examine proposals.jsonl and notes/sections/ to get broader context about the project
+              - Examine what is already in `code/`; chances are that previous experiments or attempts at this proposal have been run. What worked? What failed? 
+            </STEP 1>
+            <STEP 2>
+              Review datasets in `data/` via git lfs
+
+              If there are datasets pre-gathered, the data/ folder contains datasets stored with Git LFS from the 'data' job.
+              They will already be downloaded via git lfs pull! If they are not, then download the necessary datasets.
+              
+              These commands may be helpful
+              ```bash
+              # Verify datasets are properly downloaded (not just LFS pointers)
+              echo "=== Checking Git LFS Dataset Status ==="
+              git lfs ls-files  # Shows all LFS tracked files
+              git lfs status    # Shows download status
+              
+              # List available datasets
+              echo "=== Available Datasets in data/ ==="
+              ls -la data/
+              find data -type f -name "*.csv" -o -name "*.json" -o -name "*.parquet" -o -name "*.h5" -o -name "*.npy"
+              
+              # Check dataset sizes (ensure they're actual files, not pointers)
+              echo "=== Dataset Sizes ==="
+              du -sh data/*
+              file data/*/* | head -20  # Verify file types
+              
+              # Read dataset documentation created by data job
+              echo "=== Dataset Documentation ==="
+              if [ -f "data/README.md" ]; then
+                  cat data/README.md
+              else
+                  echo "WARNING: No data/README.md found - check data job output"
+              fi
+              
+              # Load data in Python
+              
+              ```python
+              import pandas as pd
+              import numpy as np
+              from pathlib import Path
+              import json
+              import h5py
+              
+              # IMPORTANT: Use absolute path to data directory
+              # The working directory is experiments/<exp_id>/code/
+              data_dir = Path('../../../data').resolve()
+              
+              print(f"Data directory: {data_dir}")
+              print(f"Data directory exists: {data_dir.exists()}")
+              
+              # List all available datasets
+              if data_dir.exists():
+                  print("\nAvailable datasets:")
+                  for dataset_path in data_dir.rglob('*'):
+                      if dataset_path.is_file():
+                          size_mb = dataset_path.stat().st_size / (1024*1024)
+                          print(f"  - {dataset_path.relative_to(data_dir)}: {size_mb:.2f} MB")
+              
+              # Load different data formats
+              def load_dataset(dataset_name):
+                  """Load dataset from data/ folder based on extension"""
+                  dataset_path = data_dir / dataset_name
+                  
+                  if dataset_path.suffix == '.csv':
+                      return pd.read_csv(dataset_path)
+                  elif dataset_path.suffix == '.json':
+                      with open(dataset_path, 'r') as f:
+                          return json.load(f)
+                  elif dataset_path.suffix == '.jsonl':
+                      with open(dataset_path, 'r') as f:
+                          return [json.loads(line) for line in f]
+                  elif dataset_path.suffix == '.parquet':
+                      return pd.read_parquet(dataset_path)
+                  elif dataset_path.suffix in ['.h5', '.hdf5']:
+                      return h5py.File(dataset_path, 'r')
+                  elif dataset_path.suffix in ['.npy', '.npz']:
+                      return np.load(dataset_path)
+                  elif dataset_path.suffix == '.pkl':
+                      return pd.read_pickle(dataset_path)
+                  else:
+                      raise ValueError(f"Unknown file format: {dataset_path.suffix}")
+              
+              # Example usage:
+              # df = load_dataset('processed/dataset_name.csv')
+              # data = load_dataset('raw/dataset.json')
+              ```
+              
+              Common LFS issue:
+              If datasets appear as small pointer files (~130 bytes):
+              ```bash
+              # Force download of LFS files
+              git lfs fetch --all
+              git lfs checkout
+              
+              # Verify files are downloaded
+              git lfs ls-files -s  # Shows size of actual files
+              
+              # If still issues, manually pull
+              git lfs pull --include="data/**"
+              ```
+            </STEP 2>
+            <STEP 3>
+              Review implementations that are either given, past experiment attempts in code/, or relevant public repos.
+              
+              You can clone and study public GitHub repositories for reference.
+
+              Feel free to use Exa search to find:
+              - State-of-the-art implementations
+              - Baseline models
+              - Evaluation metrics
+              - Best practices
+
+              Don't re-invent the wheel if you don't need to. 5 minutes spent reviewing existing implementations can save hours or days in the long run! 
+            </STEP 3>
+          
+
+            <STEP 4>
+              Implement the experiment in `code/`! 
+
+              Make sure each piece of your implementation properly adheres to the proposal. Treat the proposal like a list of success criteria to fulfill. 
+
+              If `code/` is not empty, make sure to review its files first to understand what has already been done. 
+
+              The end artifact of your work should be `reproduce.sh`, a reproduction script: Your submitted repository MUST include a script for reproducing the results at `code/reproduce.sh`. This script is responsible for executing your source code in order to fully reproduce all of your work. We will copy your submission to a fresh Ubuntu 24.04 LTS Docker container and run `bash reproduce.sh` from the code/ directory, for a maximum runtime of 7 days. Your submission may not be placed at the same path where you submitted it, so do not rely on hardcoded absolute paths to files in your codebase. The container will have access to a GPU, with the NVIDIA container toolkit already installed. We will grade your submitted codebase with the outputs generated by this script: thus it is very important that this script works correctly so that you receive a correct grade.
+
+              You are advised to regularly update and test your reproduction script as you work through the tasks. Docker has been installed in your environment, should you wish to use it.
+
+              Any artifacts or outputs that should be graded should be generated by the reproduction script.
+
+              Finally, please also include a README.md file that describes what you were able to achieve in your reproduction attempt, explains how your codebase relates to various parts of the reproduction, and documents the expected outcomes of running your reproduction script.
+
+              <REPRODUCTION SCRIPT TOY EXAMPLE>
+
+                **Imagine the following toy proposal**: 
+
+                ```
+                “We count the number of ‘r’s in the word ‘strawberry’ using a python script, and find that there are 3 instances of the letter ‘r’”
+                ```
+
+                > the experiment measures the number of ‘r’s in the word strawberry (this is an artifact, think of this as a table or figure or result), using a basic python script as an implementation (think of this as an algorithm described in a paper)
+
+                **Toy submission**:
+
+                code/main.py
+
+                ```python
+                import argparse, csv
+
+                def main():
+                    parser = argparse.ArgumentParser()
+                    parser.add_argument('--word', default="strawberry")
+                    parser.add_argument('--output', default="output.csv")
+                    args = parser.parse_args()
+
+                    r_count = args.word.lower().count('r')
+                    with open(args.output, 'w', newline='') as f:
+                        csv.writer(f).writerows([["word", "r count"], [args.word, r_count]])
+
+                    print(f"'{args.word}' has {r_count} 'r'(s). Saved to '{args.output}'.")
+
+                if __name__ == "__main__":
+                    main()
+                ```
+
+                code/reproduce.sh
+
+                ```bash
+                apt-get update && apt-get install -y python3
+
+                # Run the Python script with the specified arguments
+                python3 count.py --word strawberry --output output.csv
+
+                # Inform the user that the output has been saved
+                echo "r count for word 'strawberry' saved to output.csv"
+                ```
+
+              </REPRODUCTION SCRIPT TOY EXAMPLE>
+
+              
+            </STEP 4>
+
+            <STEP 5>
+              RIGOROUSLY TEST YOUR CODE
+            </STEP 5>
+
+            <STEP 6>
+              Run the experiment in `code/`!
+
+              Run the experiment locally if you only need a CPU.
+
+
+              IMPORTANT: IF YOU NEED A GPU, YOU MUST CREATE A MODAL APP TO RUN IT.
+              If you need a GPU, you must create a modal app to run it.
+
+              Whenever you need to run code that requires a GPU, you must create a modal app to run it.
+              Take a look at a minor example of how to do it:
+
+              ```python
+              # hello_world.py
+
+              import modal
+
+              image = modal.Image.debian_slim().pip_install("transformers", "torch")
+
+              app = modal.App("bert-inference")
+
+
+              @app.cls(
+                  image=image,  # customize accordingly as needed
+                  gpu="T4",  # T4, L40, A10G, A100,
+                  startup_timeout=120,  #
+                  timeout=600,  # set a run timeout to avoid hanging for too long
+              )
+              class BERTModel:
+                  @modal.enter()
+                  def load_model(self):
+                      from transformers import BertTokenizer, BertForMaskedLM
+
+                      # Load BERT model and tokenizer
+                      self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+                      self.model = BertForMaskedLM.from_pretrained("bert-base-uncased")
+                      self.model.eval()
+
+                  @modal.method()
+                  def predict(self, sentence: str):
+                      import torch
+
+                      inputs = self.tokenizer(sentence, return_tensors="pt")
+
+                      with torch.no_grad():
+                          outputs = self.model(**inputs)
+
+                      predictions = outputs.logits
+
+                      return {
+                          "sentence": sentence,
+                          "shape": str(predictions.shape),
+                          "sample_logits": predictions[0, 0, :10].tolist(),
+                      }
+              ```
+
+              Once you create the modal app, always ensure it runs succesfully by running the app with the command:
+              ```bash
+              modal run <script_name>.py
+              ```
+              If you have doubts on how to use Modal, use the command `modal --help` to find more information about how to use Modal. Or look at more examples in https://modal.com/docs/examples.
+
+            </STEP 6>
+
+            <STEP 7>
+              Repeat steps 4-6 until you are confident that your code is correct.
+            </STEP 7>
+
+            <STEP 8>
+              Upon completion:
+              - Ensure `code/<exp_id>/reproduce.sh` can reproduce essential results
+              - Update results in notes/sections/experiment.md
+              - Remove experiment from proposals.jsonl
+              - Append to experiments.jsonl with your results 
+              - Run `git commit -m "experiment: <message>"`
+              - Run `git push origin HEAD`
+            </STEP 8>
+            
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+  analysis:
+    needs: experiment
+    if: startsWith(github.head_ref, 'analysis/') || (startsWith(github.head_ref, 'all/') && always())
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write  # Changed to write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          lfs: false  # Skip LFS initially
+          fetch-depth: 1 # shallow clone
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Pull latest changes from previous jobs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin ${{ github.head_ref }} || echo "No changes to pull"
+      
+      - name: Selective LFS Pull for Analysis
+        run: |
+          # Only pull result files, not large datasets
+          echo "Checking LFS for analysis files..."
+          git lfs install --skip-smudge
+          git lfs pull --include="experiments/*/results/*.json,experiments/*/results/*.csv" || echo "No LFS results to pull"
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl
+          pip install matplotlib seaborn plotly pandas numpy scipy scikit-learn
+
+      - name: Analyze Results
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          allowed_tools: "Bash,Edit,Write,Task,mcp__search__web_search_exa"
+          settings: |
+            {
+              "chat": {
+                "tools": {
+                  "autoApprove": true,
+                  "permissions": [
+                    { "tool": "Edit", "decision": "allow" },
+                    { "tool": "Write", "decision": "allow" },
+                    { "tool": "Task", "decision": "allow" },
+                    { "tool": "mcp__search__web_search_exa", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "pip*", "decision": "allow" },
+                    { "tool": "Bash", "pattern": "python*|python3*", "decision": "allow" }
+                  ]
+                }
+              }
+            }
+          direct_prompt: |
+            You are an experienced researcher using scientific thinking and rigorous methodology.
+            
+            Think deeply and thoroughly about statistical analysis and result interpretation.
+            Analyze experiment results from experiments.jsonl and draw conclusions. Include:
+            - Statistical tests performed
+            - Patterns in the data
+            - Comparison to hypotheses
+            - Broader implications for theory and practice
+
+            Make sure to choose experiments that successfully completed with rigor. If an experiment was not run properly, do not include it in the analysis. 
+            
+            You have full execution permissions! Install any analysis packages you need:
+            ```bash
+            pip install matplotlib seaborn plotly pandas numpy scipy scikit-learn
+            ```
+            
+            Use Python with matplotlib, seaborn, or plotly to create visualizations.
+            
+            Once done:
+            - Update notes/sections/analysis.md with comprehensive analysis
+            - Update analyses.jsonl with statistical results and interpretations
+            - Create visualizations and save them for the paper 
+  paper:
+    needs: analysis
+    if: startsWith(github.head_ref, 'paper/') || (startsWith(github.head_ref, 'all/') && always())
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 1 # shallow clone
+          lfs: false # Skip LFS for paper draft
+      
+      - name: Pull latest changes from previous jobs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin ${{ github.head_ref }} || echo "No changes to pull"
+
+      - name: Write Paper Draft
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "60"
+          allowed_tools: "Edit,Write,Task,mcp__search__web_search_exa"
+          settings: |
+            {
+              "chat": {
+                "tools": {
+                  "autoApprove": true,
+                  "permissions": [
+                    { "tool": "Edit", "decision": "allow" },
+                    { "tool": "Write", "decision": "allow" },
+                    { "tool": "Task", "decision": "allow" },
+                    { "tool": "mcp__search__web_search_exa", "decision": "allow" }
+                  ]
+                }
+              }
+            }
+          direct_prompt: |
+            You are an experienced researcher using scientific thinking and following NeurIPS paper writing guidelines.
+            
+            Think deeply and thoroughly about the research narrative and contributions.
+            Draft papers and write up your research findings. Include:
+            - Main contribution of your work
+            - Paper structure (such as abstract, introduction, methods, results, discussion)
+            - Figures and tables supporting your findings
+            - Positioning within existing literature
+            
+            Review all section notes in notes/sections/:
+            - concept.md for research direction
+            - literature.md for related work
+            - hypothesis.md for theoretical framework
+            - data.md for dataset descriptions
+            - proposal.md for methodology
+            - experiment.md for execution details
+            - analysis.md for results interpretation
+            
+            Use papers.jsonl for citations and references.
+            Include visualizations from the analysis phase.
+            
+            ALL WRITING SHOULD BE FAITHFUL TO SOURCE CONTENT. Claims must be backed by evidence.
+            Ensure LaTeX compiles correctly and follows publication guidelines.
+            Paper should be no longer than 8 pages excluding references.
+            
+            Once done:
+            - Create or update paper.tex with the manuscript
+            - Update notes/sections/paper.md with writing notes and outline
+          mcp_config: |
+            {
+              "mcpServers": {
+                "search": {
+                  "command": "npx",
+                  "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=${{ secrets.EXA_API_KEY }}"]
+                }
+              }
+            }
+  auto-merge-pr:
+    if: |
+      always() && 
+      (needs.concept.result == 'success' || needs.concept.result == 'skipped') &&
+      (needs.literature.result == 'success' || needs.literature.result == 'skipped') &&
+      (needs.hypothesis.result == 'success' || needs.hypothesis.result == 'skipped') &&
+      (needs.data.result == 'success' || needs.data.result == 'skipped') &&
+      (needs.proposal.result == 'success' || needs.proposal.result == 'skipped') &&
+      (needs.experiment.result == 'success' || needs.experiment.result == 'skipped') &&
+      (needs.analysis.result == 'success' || needs.analysis.result == 'skipped') &&
+      (needs.paper.result == 'success' || needs.paper.result == 'skipped')
+    needs: [concept, literature, hypothesis, data, proposal, experiment, analysis, paper]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call External Webhook
+        uses: distributhor/workflow-webhook@v3
+        with:
+          webhook_url: ${{ secrets.WEBHOOK_URL }}
+          webhook_secret: ${{ secrets.WEBHOOK_SECRET }}
+          data: '{ "prNumber": "${{ github.event.pull_request.number }}", "repoName" : "${{ github.repository }}" }'

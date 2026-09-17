@@ -1,0 +1,36 @@
+name: MCP Remote Verify
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run read-only remote verifier
+        run: |
+          mkdir -p artifacts
+          python scripts/mcp_remote_verify.py \
+            --endpoint https://hodlxxi.com/agent/mcp \
+            --json-output artifacts/hodlxxi-mcp-verify.json \
+            --markdown-output artifacts/hodlxxi-mcp-verify.md
+
+      - name: Upload verifier artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hodlxxi-mcp-remote-verify
+          path: artifacts/

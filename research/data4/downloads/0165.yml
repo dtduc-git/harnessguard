@@ -1,0 +1,496 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Weekly FULL-matrix sweep. Pushes to main build only the skills the push
+  # changed (see `prepare`), so this is the bound on anything scoping could
+  # miss: a toolchain or module-cache drift, a base SHA the runner could not
+  # resolve, a registry edit that touched nothing under skills/. Sunday 06:00
+  # UTC is the quietest hour for the org's runner pool.
+  schedule:
+    - cron: "0 6 * * 0"
+  # The same sweep on demand (after a mis-scoped push, or to re-prove the fleet
+  # before a release wave). No inputs: dispatch = full matrix.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR runs supersede each other: a new push to the same PR cancels the run for
+# the commit it just replaced (nobody is waiting on that verdict). Every other
+# run is keyed by its own run id, so main pushes are NEVER cancelled or
+# coalesced: `prepare` diffs each push against its own github.event.before, so
+# a run dropped in favour of a newer one would leave its change-set built by
+# nobody - the newer run's `before` starts where the dropped push ended. Not
+# keyed by SHA either: two force-pushes landing on the same commit have
+# different `before`s and different matrices, and GitHub replaces a PENDING
+# run in a group even with cancel-in-progress off.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-{0}-{1}', github.event_name, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the DCO range check works on PRs
+
+      - name: Repo hygiene guards (placeholder, em-dash, personal paths)
+        run: bash tools/maintainer/ci_guards.sh
+
+      - name: New hand-fixes recorded in their ledger (PR diff)
+        if: github.event_name == 'pull_request'
+        # If this PR edits a generated (DO NOT EDIT) file in a connector without
+        # also recording it in skills/<slug>/handfixes.json, fail - so a new
+        # hand-fix is captured the moment it is introduced and survives the next
+        # reprint. Reprints (many generated files at once) are exempted; the
+        # per-skill ledger gate covers recorded fixes there.
+        #
+        # Also the issue #252 ratchet, scoped per ASSERT: an assert this PR ADDS
+        # or WEAKENS must not be one comments alone can satisfy. An assert that
+        # was already comment-satisfiable at the base revision is the repo's
+        # backlog, not this contributor's, and is reported by the advisory lint
+        # below instead - editing an entry's prose never trips this gate.
+        # See docs/reprint-survival.md.
+        run: python3 tools/maintainer/check_handfixes.py --changed --base "${{ github.event.pull_request.base.sha }}"
+
+      - name: Comment-satisfiable hand-fix asserts (advisory, repo-wide)
+        # ADVISORY: exits 0 on findings, by design. 26 of the 2280 `contains`
+        # asserts can be satisfied by a comment alone today, several of them
+        # deliberately (a `Hand-wired:` marker IS a comment). Making that a
+        # merge gate would red main for everyone and get the lint ignored - the
+        # false-RED failure mode. The hard ratchet is the --changed step above,
+        # so the number can only go down; this step is what makes the standing
+        # backlog visible on every run instead of only when somebody remembers
+        # to type the flag. Add --strict to make it fail once the list is empty.
+        run: python3 tools/maintainer/check_handfixes.py --lint-asserts
+
+      - name: Maintainer gate self-tests (each gate proved BOTH directions)
+        # One step, four proofs. A gate that cannot fail is worthless and a gate
+        # that always fires is worse, so each of these asserts its check is
+        # silent on the repo's real inputs AND fires on the defect it was
+        # written for:
+        #   registry.py       - every registered slug and source_dir loads clean
+        #                       (including skills/_meta, which the SLUG rule
+        #                       rejects on purpose), and eleven malformed
+        #                       identifiers are refused before they reach the
+        #                       build matrix's unquoted shell interpolations.
+        #                       The trailing-newline cases carry their own proof
+        #                       that they discriminate: the `$`-anchored twin of
+        #                       each pattern must ACCEPT what `\Z` refuses.
+        #   check_handfixes.py- issue #252's reproduction: the same assert is
+        #                       silent while the guarded code is present and
+        #                       fires once only a comment carries the needle;
+        #                       `code_only` is refused where it would WEAKEN an
+        #                       assert; and the --changed ratchet passes a
+        #                       prose-only ledger edit while failing a newly
+        #                       added or newly weakened assert (four cases, run
+        #                       against a throwaway git repository).
+        #   mcpb_bundle.py    - the published .mcpb defect (issue #287), a broken
+        #                       per-OS override, a 0644 binary and a ZIP_STORED
+        #                       member all fail; a built bundle and the
+        #                       connectwise-manage manifest shape both pass.
+        #   check_release_assets.py
+        #                     - the gate that decides whether a draft release may
+        #                       be published. An empty release (the immutable-
+        #                       release failure: every asset upload 422s and the
+        #                       release goes public with nothing in it), a single
+        #                       failed build target, and a missing .mcpb each
+        #                       fire, naming exactly the absent files; a complete
+        #                       release and a re-run that left an extra asset
+        #                       behind both pass; and a tag naming no releasable
+        #                       skill expects nothing, so it can never false-RED.
+        #                       The size field is checked as a TYPE, so a listing
+        #                       carrying "0", "1024", true or NaN fires instead of
+        #                       sailing through a truthiness test.
+        #   check_release_pipeline.py
+        #                     - the gate that decides whether a SHA may be tagged
+        #                       at all. A tag push runs release.yml FROM THE
+        #                       TAGGED COMMIT, so tagging a pre-draft-pipeline
+        #                       commit publishes an empty immutable release and
+        #                       spends that version number. Nine broken pipeline
+        #                       shapes are refused (publish-first, never sealed,
+        #                       two sealers, an uploader outside the seal's needs
+        #                       closure, no completeness gate, the gate after the
+        #                       seal, no bundle in the contract, comments that
+        #                       only QUOTE the commands, and a file that is not a
+        #                       workflow). Critically it also asserts THIS repo's
+        #                       own release.yml passes: that is what pins the
+        #                       probe to the pipeline, so a pipeline change that
+        #                       outgrows the probe goes red in the PR that made
+        #                       it rather than at release time.
+        #                       The --tag mode, which is what the hand-tagging
+        #                       path actually calls, is proved the same way: a
+        #                       clean tag is endorsed, while a RETIRED version
+        #                       number (xero-v0.1.3, whose git tag is free
+        #                       because the empty release was deleted), an
+        #                       already-cut tag, a SHA stamped at a different
+        #                       version, and five shapes that are not release
+        #                       tags are each refused - and an unreachable origin
+        #                       is NOT, because a DNS blip is not a bad tag. The
+        #                       burned-version ledger is proved to fail CLOSED:
+        #                       five malformed ledgers raise rather than reading
+        #                       as "nothing is burned", while a missing one
+        #                       correctly reads as empty.
+        #   release_matrix.py - the change-set classifier that decides which
+        #                       skills a push or PR builds. A bot regen commit
+        #                       (pending.json + .mcpb pin re-mints in skill
+        #                       READMEs) yields an EMPTY matrix; a human edit
+        #                       to the same README, a Go change, or a per-slug
+        #                       skills.json edit yields that skill's row; a
+        #                       matrix-row checker or a build-feeding workflow
+        #                       yields the FULL matrix; catalog.yml and the
+        #                       docs site yield nothing. Every case is asserted
+        #                       in both directions, offline.
+        run: |
+          set -euo pipefail
+          python3 tools/maintainer/registry.py --self-test
+          python3 tools/maintainer/check_handfixes.py --self-test
+          python3 tools/maintainer/mcpb_bundle.py --self-test
+          python3 tools/maintainer/check_release_assets.py --self-test
+          python3 tools/maintainer/check_release_pipeline.py --self-test
+          python3 tools/maintainer/release_matrix.py --self-test
+
+      - name: Skill contract (frontmatter + required files)
+        run: python3 tools/maintainer/check_skill_contract.py
+
+      - name: One project copyright line (Go headers + connector NOTICE/LICENSE)
+        # cli-printing-press stamps the header from whoever ran the generator, so
+        # a reprint reintroduces an individual's name into files the project owns
+        # (cli-printing-press#4326). Before 2026-08-23 that had produced TEN
+        # different copyright strings across 19,307 files, nine connectors
+        # disagreeing with themselves.
+        #
+        # This runs HERE and not only in verify_all.sh because verify_all.sh is a
+        # local convenience, not a merge gate: a reprint PR that never runs it
+        # would land the personal headers with CI green. The scan is whole-fleet
+        # and takes about a second, so it is cheap enough to run on every PR
+        # rather than only on the connectors a PR touched.
+        run: python3 tools/maintainer/check_copyright.py
+
+      - name: Markdown local links
+        run: python3 tools/maintainer/check_md_links.py
+
+      - name: Manifest env schema matches the binaries' reads
+        # Asserts every operator-facing env var a connector READS is declared in
+        # manifest.json (server.mcp_config.env + a user_config prompt), in
+        # server.json (the MCP Registry), and in mcp-install.md (the manual
+        # path). Claude Desktop has no shell and no config.toml, so an
+        # undeclared variable is a credential the operator is never asked for:
+        # the server boots, tools/list looks healthy, and the first real call
+        # fails. Issue #282 - 60 of 65 connectors under-declared, cove 0 of 4
+        # and quickbooks 1 of 8.
+        #
+        # Runs HERE and not in the per-skill matrix for two reasons: the
+        # classification rules must be read from the merge BASE so a PR cannot
+        # widen its own internal-prefix list to silence a credential, and this
+        # job already checks out with fetch-depth: 0, so BASE resolves without
+        # adding a full-history clone to each of the 65 matrix legs.
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: python3 tools/maintainer/check_env_schema.py --base "$BASE"
+
+      - name: server.json is publishable to the MCP Registry
+        # The registry validates server.json and answers 422 on a violation, and
+        # mcp-publish.yml publishes AFTER the release assets are uploaded - so a
+        # rejection leaves a release that looks complete while the connector never
+        # reaches the registry or the six catalogues that fan out from it.
+        # avanan hit this on 2026-08-26: a 107-character description against a
+        # 100-character limit. Validated against the registry's own JSON Schema,
+        # vendored beside the checker so CI needs no network and a silently-updated
+        # remote schema cannot turn main red without a commit.
+        run: python3 tools/maintainer/check_mcp_registry.py
+
+      - name: Install and remote-MCP docs match the shipped artifacts
+        # Reads doc prose against main.go, install.ps1 and install.sh - never
+        # against another doc. Catches the four defects that rode the whole fleet
+        # because no gate compared an instruction to the artifact that has to
+        # satisfy it: `mcp-remote` named as a stdio publisher (it bridges the
+        # other direction and exits ERR_INVALID_URL), `--transport http` on the
+        # binaries that never parse it, bare `localhost:7777` when mcp-go serves
+        # at /mcp, and the printing-press-library installer + PrintingPress\bin
+        # destination this repo does not use. Runs in this single job, so it adds
+        # no build-matrix rows. See issues #237, #240, #241.
+        run: python3 tools/maintainer/check_install_docs.py
+
+      - name: Install-doc gate discriminates (fires on broken, silent on fixed)
+        run: python3 tools/maintainer/check_install_docs.py --selftest
+
+      - name: No TODO / placeholder markers in skill prose
+        run: python3 tools/maintainer/check_no_todos.py
+
+      - name: Vocabulary contract (banned + required terms)
+        run: python3 tools/maintainer/check_vocabulary.py
+
+      - name: AEO contract (answer-first, unique titles, connector formula)
+        run: python3 tools/maintainer/check_aeo.py
+
+      - name: Video assets (skills that opt in via has_video)
+        run: python3 tools/maintainer/check_video_assets.py
+
+      - name: DCO sign-off (PR commits)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: bash tools/maintainer/check_dco.sh
+
+      - name: ShellCheck
+        # tools/maintainer/hooks/* is listed explicitly: a git hook cannot carry
+        # a .sh extension (git runs the file by its hook NAME), so the '*.sh'
+        # glob would leave the one script whose failure mode is silent - an
+        # uninstallable or crashing pre-push hook that lets an unendorsed
+        # release tag through - as the only unlinted shell in the repo.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          mapfile -t scripts < <(git ls-files '*.sh' 'tools/maintainer/hooks/*')
+          if [ ${#scripts[@]} -gt 0 ]; then
+            shellcheck "${scripts[@]}"
+          fi
+
+      - name: Secret scan (gitleaks)
+        env:
+          GL_VERSION: "8.18.4"
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/gitleaks_${GL_VERSION}_linux_x64.tar.gz"
+          curl -fsSL "$url" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks detect --no-git --source . --config .gitleaks.toml --redact --no-banner
+
+      - name: Plugin manifest validation (claude plugin validate --strict)
+        env:
+          CI: "true"
+        run: |
+          set -euo pipefail
+          npm install -g @anthropic-ai/claude-code
+          # Marketplace manifest + every per-skill plugin manifest. --strict
+          # fails on unknown fields (e.g. a stray `vendor`) and missing metadata.
+          claude plugin validate . --strict
+          for d in skills/*/; do
+            [ -f "${d}.claude-plugin/plugin.json" ] || continue
+            claude plugin validate "skills/$(basename "$d")" --strict
+          done
+
+  # Its own job, deliberately. This check is RED BY DESIGN for the window
+  # between a version-bump merge and the hand-cut tag that makes its pins real
+  # (and for the whole life of a release that was never cut). While it was a
+  # step inside `guards`, that red skipped every step after it - env schema,
+  # MCP registry, install docs, DCO, ShellCheck, gitleaks, plugin validate: a
+  # dozen unrelated gates silently not run on exactly the commits that most
+  # need them. Here it can only ever fail itself.
+  pins:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # every tag local, BASE resolvable, no network call
+
+      - name: Pinned release URLs resolve (tag cut, or an in-flight release)
+        # check_md_links.py skips http(s) entirely, so nothing verified that the
+        # version-pinned .mcpb identifiers and release links this repo publishes
+        # point at a tag that exists. On 2026-08-25 seventy of them did not: a
+        # version bump rewrites the pin, the tag is cut by hand afterwards, and
+        # skipping that step leaves main serving a 404 forever.
+        #
+        # BASE is what makes this checkable without failing every release
+        # commit: a pin that is NEW or MOVED in this change-set is an in-flight
+        # release (allowed, with a reminder), a pin byte-identical to BASE whose
+        # tag still does not exist is a release that was never cut (failure).
+        # On a push BASE must be github.event.before, NOT origin/main: the
+        # runner's origin/main already contains the push. The checkout above is
+        # fetch-depth: 0, so every tag is local and no network call is made.
+        # On the weekly sweep and on workflow_dispatch there is no base; the
+        # script says so and skips the tag-existence check rather than
+        # inventing one.
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        # Hard gate. The backlog this shipped in warn mode for - 62 pins across
+        # 31 connectors whose releases were never cut - was cleared by the
+        # 65-tag push on 2026-08-26. All 192 pinned release URLs across 128
+        # files now resolve, verified by HTTP HEAD against every one of them, so
+        # any new finding here is a new defect and should block.
+        run: python3 tools/maintainer/check_pinned_artifacts.py --base "$BASE" --no-network
+
+  # Skill build matrix is computed from the repo, so a new skill is built+vetted
+  # with no edit here (mirrors the release workflow). The matrix is SCOPED to
+  # the skills the change-set touched: on a PR that is the diff against the
+  # merge-base; on a push to main it is the two-point diff from
+  # github.event.before, the tip main had before the push, to HEAD - exactly
+  # what the push changed, including what a force-push took away. At fleet
+  # scale (65 skills) an unscoped matrix is 65 jobs and ~210-240 runner-minutes
+  # per run, and before 2026-09-07 every push to main paid it: the catalog
+  # bot's "regenerate derived files" commits (11 in one day, docs only) each
+  # burned a full matrix, and during a 21-tag release wave those runs pinned
+  # the org's runner pool (59 of 60 busy, 232 queued) so the RELEASE builds
+  # starved.
+  #
+  # release_matrix.py classifies the change-set (see its MACHINERY / DERIVED
+  # lists and --self-test): derived files the bot commits yield NO row, a
+  # human edit to a skill yields that skill's row, and a change to build
+  # machinery yields the FULL matrix. It fails open (full matrix) whenever the
+  # diff cannot be computed. The full matrix also runs on the weekly schedule
+  # and on workflow_dispatch, which is what bounds the scoping.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      any: ${{ steps.gen.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need history for the merge-base (PRs) and `before` (pushes)
+      - name: Compute skill matrix
+        id: gen
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          # PRs: the merge base. Pushes: github.event.before. Anything else
+          # (schedule, workflow_dispatch) has no base and builds everything.
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before) || '' }}
+        run: |
+          set -euo pipefail
+          zeros='0000000000000000000000000000000000000000'
+          base=""
+          if [ -z "$BASE_SHA" ]; then
+            echo "no diff base for a '$EVENT_NAME' event - building the FULL matrix"
+          elif [ "$BASE_SHA" = "$zeros" ]; then
+            # Branch creation (or a push whose `before` GitHub could not name).
+            echo "::warning::base is the all-zeros SHA - building the FULL matrix"
+          else
+            # A force-push or a rewritten history can name a `before` this
+            # clone never received; fetching it is best-effort, and a base the
+            # checkout cannot resolve means the FULL matrix (fail open), never
+            # an empty one. release_matrix.py fails open the same way if the
+            # merge-base or diff below errors.
+            git fetch -q origin "$BASE_SHA" 2>/dev/null || true
+            if git rev-parse --verify --quiet "${BASE_SHA}^{commit}" >/dev/null; then
+              base="$BASE_SHA"
+            else
+              echo "::warning::base $BASE_SHA is not reachable from this checkout - building the FULL matrix"
+            fi
+          fi
+          if [ -n "$base" ] && [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "diff base (merge-base): $base"
+            matrix="$(python3 tools/maintainer/release_matrix.py --skills-only --changed-only "$base")"
+          elif [ -n "$base" ]; then
+            # Two-point diff, deliberately not a merge-base: a force-push that
+            # rewinds main to an ancestor has merge-base == HEAD and would
+            # diff nothing; the files it removed still need their rows built.
+            echo "diff base (two-point, github.event.before): $base"
+            matrix="$(python3 tools/maintainer/release_matrix.py --skills-only --changed-since "$base")"
+          else
+            matrix="$(python3 tools/maintainer/release_matrix.py --skills-only)"
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "any=$(printf '%s' "$matrix" | python3 -c 'import json,sys; print(str(len(json.load(sys.stdin)["skill"])>0).lower())')" >> "$GITHUB_OUTPUT"
+          printf '%s' "$matrix" | python3 -c 'import json,sys; m=json.load(sys.stdin); print("matrix skills:", [s["name"] for s in m["skill"]] or "(none - build job will skip)")'
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.skill.dir }}/go.mod
+
+      - name: Build and vet
+        run: |
+          cd ${{ matrix.skill.dir }}
+          go build ./...
+          go vet ./...
+
+      # Cross-compile for every platform the release matrix ships, so a
+      # platform-specific compile break is caught HERE and not from a missing
+      # artifact after a tag push.
+      #
+      # auvik shipped exactly that: `syscall.Flock` in a novel command file with
+      # no build tag, which does not exist on Windows. It merged with CI green
+      # because CI built only for the runner's platform, and the six-target
+      # matrix runs on a TAG PUSH. The first real tag published 16 assets
+      # instead of 25 while every job stayed green - a partial asset set fails
+      # nothing. See the auvik Windows-build fix and issue #249 for the same
+      # shape one layer up.
+      #
+      # Compile only (`go build`), no vet or test: this is about "does it
+      # compile for the targets we ship", and it adds a few seconds per row.
+      - name: Cross-compile every released target
+        run: |
+          cd ${{ matrix.skill.dir }}
+          fail=0
+          for pair in windows/amd64 windows/arm64 darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            os="${pair%/*}"; arch="${pair#*/}"
+            if ! GOOS="$os" GOARCH="$arch" go build ./... 2>build.err; then
+              echo "::error::does not compile for $pair"
+              sed 's/^/    /' build.err
+              fail=1
+            fi
+          done
+          rm -f build.err
+          exit "$fail"
+
+      - name: CLI claims vs built binary (this skill)
+        # Runs here, in the per-skill matrix job, because verifying doc claims
+        # builds the real CLI and needs Go on PATH (already set up above). The
+        # --slug filter checks only this matrix row's skill.
+        #
+        # Hard gate. It shipped behind --warn "while the fleet calibrates", and
+        # --warn exits 0 on real findings, so a README telling an MSP to run a
+        # flag the binary rejects printed the defect and left the verdict
+        # green. The fleet has been clean since: a hard-mode run over all 65
+        # connectors on 2026-09-07 returned 0 findings, so a finding here is a
+        # new defect and blocks.
+        run: python3 tools/maintainer/check_cli_claims.py --slug ${{ matrix.skill.name }}
+
+      - name: Hand-fix ledger intact (this skill)
+        # Hard gate: if this skill carries a skills/<slug>/handfixes.json ledger,
+        # assert every recorded connector hand-fix marker is still present. A
+        # cli-printing-press reprint can silently clobber edits to generated
+        # files (go test stays green); this turns that into a loud failure.
+        # No-op for skills without a ledger. See docs/reprint-survival.md.
+        run: python3 tools/maintainer/check_handfixes.py --slug ${{ matrix.skill.name }}
+
+      - name: No default-denied MCP tool (this skill)
+        # Hard gate: boot this skill's MCP server over stdio and call the tools
+        # the tenant-gate middleware wraps in-process, asserting none answers a
+        # gate refusal. Issue #249 shipped three connectors where 6 tools each
+        # were dead while build, vet, go test, the security gate and tools/list
+        # were all green - only tools/call could see it. Needs no credentials
+        # and runs in about a second on a warm build cache.
+        run: python3 tools/maintainer/check_mcp_gate.py --slug ${{ matrix.skill.name }}
+
+      - name: Doctor reports a verdict that tracks reality (this skill)
+        # Hard gate: build this skill's CLI and run `doctor --json` against a
+        # local stub HTTP server in four states - healthy, expired credential,
+        # a base URL where every API path 404s, and the connector's own shipped
+        # placeholder default. Assert doctor never reports a healthy verdict in
+        # a state that is provably broken, and never tells a correctly
+        # credentialled operator they are broken without naming the variable
+        # that fixes it.
+        #
+        # Issue #282: `cipp-cli doctor` printed an identical all-green report
+        # for a wrong base URL, a correct config, and a token rejected with 401
+        # on every call; `zammad-cli doctor` printed every row green - including
+        # "Credentials: ok" - against its own placeholder host with the literal
+        # token "totally-bogus-token", and exited 0 under --fail-on error.
+        # 41 of 65 connectors never probed the credential at all.
+        #
+        # Needs no vendor credentials and no network: the stub binds 127.0.0.1
+        # and the fixture config carries a literal auth_header.
+        run: python3 tools/maintainer/check_doctor_truth.py --slug ${{ matrix.skill.name }}
+

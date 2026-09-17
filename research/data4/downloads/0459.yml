@@ -1,0 +1,62 @@
+﻿name: Cursor Cloud Agent Task
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt to send to Cursor Agent'
+        required: true
+        type: string
+  push:
+    paths:
+      - 'tasks/*.txt'
+
+jobs:
+  run-cursor-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: Require CURSOR_API_KEY
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          if [ -z "$CURSOR_API_KEY" ]; then
+            echo "CURSOR_API_KEY is not set. Skipping Cursor agent."
+            echo "skip=true" >> "$GITHUB_ENV"
+          else
+            echo "skip=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout repo
+        if: env.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: env.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: env.skip != 'true'
+        run: pip install requests
+
+      - name: Run Cursor automation (manual trigger)
+        if: env.skip != 'true' && github.event_name == 'workflow_dispatch'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GITHUB_REPO_URL: https://github.com/${{ github.repository }}
+          PROMPT: ${{ github.event.inputs.prompt }}
+        run: python cursor_automation.py "$PROMPT"
+
+      - name: Run Cursor automation (from tasks/ file)
+        if: env.skip != 'true' && github.event_name == 'push'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GITHUB_REPO_URL: https://github.com/${{ github.repository }}
+        run: |
+          shopt -s nullglob
+          for f in tasks/*.txt; do
+            echo "=== Running task: $f ==="
+            python cursor_automation.py "$(cat "$f")"
+          done
