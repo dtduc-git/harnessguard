@@ -253,6 +253,16 @@ def test_mcp_tool_permission_tokens_ignored() -> None:
     assert mcp_launch_packages(text) == []
 
 
+def test_mcp_expression_tokens_ignored() -> None:
+    from harnessguard.facts import mcp_launch_packages
+
+    text = (
+        'claude_args: \'--mcp-config {"mcpServers": {"x": {"command": "npx", '
+        '"args": ["-y", "mcp-remote@latest", "${{ secrets.mcpUrl }}/sse"]}}}\''
+    )
+    assert mcp_launch_packages(text) == ["mcp-remote@latest"]
+
+
 def test_secretless_agent_callee_not_flagged() -> None:
     result = _scan("clean-repo")
     chains = [f for f in result.findings if f.workflow.name == "reusable-open-caller.yml"]

@@ -343,6 +343,11 @@ def build_section(
         "directly comparable with pass 1 — compare rule shares, not absolute counts."
     )
     lines.append(
+        "- The MCP queries deliberately over-sample agent workflows that configure "
+        "MCP servers: the HG010 share describes this query-selected sample, not the "
+        "population of agent workflows."
+    )
+    lines.append(
         "- The MCP queries select files that *mention* MCP configuration even when no "
         "agent runs in them; only files with a detected agent step are counted."
     )

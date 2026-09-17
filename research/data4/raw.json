@@ -1,6 +1,6 @@
 {
   "sample": {
-    "generatedAt": "2026-09-17T11:17:52.723061+00:00",
+    "generatedAt": "2026-09-17T11:22:27.712047+00:00",
     "perQuery": {
       "mcpServers path:.github/workflows": 85,
       "mcp-config path:.github/workflows": 61,
@@ -139,7 +139,7 @@
           "severity": "medium",
           "job": "claude",
           "step": "Run Claude Code",
-          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-sequential-thinking'; unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },
@@ -389,7 +389,7 @@
           "severity": "medium",
           "job": "claude",
           "step": "Run Claude Code",
-          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-sequential-thinking'; unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },
@@ -511,7 +511,8 @@
       "hasAgent": true,
       "guarded": false,
       "rules": [
-        "HG005"
+        "HG005",
+        "HG010"
       ],
       "findings": [
         {
@@ -520,6 +521,13 @@
           "job": "auto-review",
           "step": "Auto review PR",
           "message": "Agent step can execute commands or reach the network (git/gh write command, shell tool grant). Prefer a narrow tool allowlist; egress is the third leg of the Rule of Two."
+        },
+        {
+          "rule": "HG010",
+          "severity": "medium",
+          "job": "auto-review",
+          "step": "Auto review PR",
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-sequential-thinking'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },
@@ -1068,7 +1076,7 @@
           "severity": "medium",
           "job": "claude",
           "step": "Run Claude Code",
-          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package 'mcp__sequential-thinking__sequentialthinking'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-sequential-thinking'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },
@@ -1215,7 +1223,7 @@
           "severity": "medium",
           "job": "claude",
           "step": "Run Claude Code",
-          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-sequential-thinking'; unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },
@@ -1455,7 +1463,7 @@
           "severity": "medium",
           "job": "claude",
           "step": "Run Claude Code",
-          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-sequential-thinking'; unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },
@@ -1603,7 +1611,7 @@
           "severity": "medium",
           "job": "claude",
           "step": "Run Claude Code",
-          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-sequential-thinking'; unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },
@@ -1820,8 +1828,18 @@
       "untrustedEvents": [],
       "hasAgent": true,
       "guarded": false,
-      "rules": [],
-      "findings": []
+      "rules": [
+        "HG010"
+      ],
+      "findings": [
+        {
+          "rule": "HG010",
+          "severity": "medium",
+          "job": "invoke",
+          "step": "Run Gemini CLI",
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-github'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+        }
+      ]
     },
     {
       "repo": "Hive-Academy/Anubis-MCP",
@@ -1937,7 +1955,7 @@
           "severity": "medium",
           "job": "claude",
           "step": "Run Claude Code",
-          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-sequential-thinking'; unpinned MCP server package 'ols-mcp'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },
@@ -2782,7 +2800,7 @@
           "severity": "medium",
           "job": "debug",
           "step": "Run Claude Debugger",
-          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@playwright/mcp@latest'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
+          "message": "Agent step configures MCP servers insecurely: unpinned MCP server package '@modelcontextprotocol/server-postgres'; unpinned MCP server package '@playwright/mcp@latest'. Pin MCP server packages to immutable versions (OWASP MCP04 supply chain) and use TLS or loopback endpoints for MCP traffic."
         }
       ]
     },

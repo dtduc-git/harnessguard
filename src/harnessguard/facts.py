@@ -84,6 +84,11 @@ MCP_TOKEN_RE = re.compile(r"[@A-Za-z0-9][\w@./-]*")
 #: Plaintext HTTP endpoint that is not loopback.
 PLAINTEXT_URL_RE = re.compile(r"http://(?!localhost\b|127\.0\.0\.1\b|\[::1\])", re.IGNORECASE)
 
+#: Expression namespaces that can look like package names (``secrets.mcpUrl``).
+EXPRESSION_ROOTS = frozenset(
+    {"secrets", "vars", "env", "inputs", "github", "steps", "needs", "matrix", "runner", "job"}
+)
+
 
 def _dump(value: Any) -> str:
     try:
@@ -283,6 +288,8 @@ def mcp_launch_packages(text: str) -> list[str]:
                 if "://" in token or "__" in token or token.endswith((".json", ".yaml", ".yml")):
                     continue
                 if not any(char.islower() for char in token):
+                    continue
+                if token.split(".", 1)[0].lower() in EXPRESSION_ROOTS:
                     continue
                 if token.startswith("@"):
                     if _looks_like_mcp(token):
