@@ -39,6 +39,7 @@ AGENT_RUN_PATTERNS = (
     r"(?i)\b(claude|gemini|codex)\b[^\n]{0,60}(--print|--prompt|--dangerously-skip-permissions|-p\b)",
     r"(?i)\bopencode\b[^\n]*\brun\b",
     r"(?i)\baider\b",
+    r"(?i)\bcursor-agent\b[^\n]{0,40}(--print|--prompt|-p\b)",
 )
 
 #: Attacker-controllable event fields interpolated via expressions.

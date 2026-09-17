@@ -219,6 +219,13 @@ def test_pinned_and_loopback_mcp_not_flagged() -> None:
     assert not [f for f in result.findings if f.rule_id == "HG010"]
 
 
+def test_cursor_agent_cli_detected() -> None:
+    from harnessguard.facts import Step, is_agent_step
+
+    assert is_agent_step(Step(name="run", raw={"run": 'cursor-agent -p "$(cat prompt.txt)"'}))
+    assert not is_agent_step(Step(name="run", raw={"run": "cursor-agent models"}))
+
+
 def test_secretless_agent_callee_not_flagged() -> None:
     result = _scan("clean-repo")
     chains = [f for f in result.findings if f.workflow.name == "reusable-open-caller.yml"]
